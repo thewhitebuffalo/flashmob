@@ -5,7 +5,7 @@ use flashmob::sld::{self, Diagram};
 use flashmob::study::{self, Studies, StudyOutput};
 use flashmob::tcc::{self, TccPlot};
 
-pub fn launch() -> eframe::Result<()> {
+pub fn launch(project: Option<std::path::PathBuf>) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1360.0, 860.0])
@@ -23,7 +23,7 @@ pub fn launch() -> eframe::Result<()> {
                 font.family = egui::FontFamily::Monospace;
             }
             cc.egui_ctx.set_global_style(style);
-            Ok(Box::new(App::new()))
+            Ok(Box::new(App::new(project)))
         }),
     )
 }
@@ -49,19 +49,36 @@ enum Tab {
 }
 
 impl App {
-    fn new() -> Self {
-        let project = Project::sample();
-        let results = study::run(&project, Studies::all()).ok();
-        Self {
-            project,
-            results,
+    fn new(path: Option<std::path::PathBuf>) -> Self {
+        let opened = path.as_ref().and_then(|path| {
+            std::fs::read_to_string(path)
+                .map_err(|err| err.to_string())
+                .and_then(|text| flashmob::exec::load_project(&text))
+                .ok()
+                .map(|project| (path.clone(), project))
+        });
+        let failed = path.filter(|_| opened.is_none());
+        let mut app = Self {
+            project: Project::sample(),
+            results: None,
             tab: Tab::Sld,
             selected: None,
             status: "Sample plant is loaded. Short circuit and arc flash are on the one-line.".into(),
             show_warnings: false,
             zoom: 1.0,
             tcc_kv: 0.48,
+        };
+        if let Some((path, project)) = opened {
+            app.project = project;
+            app.run_study();
+            app.status = format!("Opened {}. {}", path.display(), app.status);
+        } else if let Some(path) = failed {
+            app.status = format!("Could not open {}", path.display());
+            app.run_study();
+        } else {
+            app.run_study();
         }
+        app
     }
 
     fn run_study(&mut self) {

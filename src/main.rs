@@ -30,7 +30,10 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Open the macOS study window.
-    Gui,
+    Gui {
+        /// Project JSON to open. Omit to start with the built-in sample.
+        project: Option<PathBuf>,
+    },
     /// Print the JSON contract: project shape, exec commands, and a sample.
     Schema,
     /// Print the built-in sample project as JSON.
@@ -96,7 +99,7 @@ enum Command {
 
 fn main() -> ExitCode {
     match Cli::parse().command {
-        Command::Gui => gui(),
+        Command::Gui { project } => gui(project),
         Command::Schema => emit(&exec::schema(), false),
         Command::Sample { output, compact } => {
             let value = serde_json::to_value(Project::sample()).expect("sample serializes");
@@ -176,10 +179,10 @@ fn main() -> ExitCode {
     }
 }
 
-fn gui() -> ExitCode {
+fn gui(project: Option<PathBuf>) -> ExitCode {
     #[cfg(feature = "gui")]
     {
-        match ui::launch() {
+        match ui::launch(project) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => fail(&err.to_string()),
         }
