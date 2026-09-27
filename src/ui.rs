@@ -211,9 +211,27 @@ impl App {
         let diagram = sld::diagram(&self.project, &results);
         ui.horizontal(|ui| {
             ui.label("Zoom");
-            ui.add(egui::Slider::new(&mut self.zoom, 0.6..=1.6));
+            ui.add(egui::Slider::new(&mut self.zoom, 0.2..=4.0).logarithmic(true));
         });
-        egui::ScrollArea::both().show(ui, |ui| {
+        let view = ui.available_rect_before_wrap();
+        let pointer = ui.input(|i| i.pointer.hover_pos());
+        let zoom_delta = ui.input(|i| i.zoom_delta());
+        let scroll_id = ui.make_persistent_id("sld_scroll");
+        if pointer.is_some_and(|pos| view.contains(pos)) && (zoom_delta - 1.0).abs() > 0.001 {
+            let old = self.zoom;
+            let new = (old * zoom_delta).clamp(0.2, 4.0);
+            if let Some(pos) = pointer {
+                if let Some(mut state) = egui::containers::scroll_area::State::load(ui.ctx(), scroll_id) {
+                    let local = pos - view.min;
+                    let factor = new / old;
+                    state.offset = (state.offset + local) * factor - local;
+                    state.offset = state.offset.max(Vec2::ZERO);
+                    state.store(ui.ctx(), scroll_id);
+                }
+            }
+            self.zoom = new;
+        }
+        egui::ScrollArea::both().id_salt("sld_scroll").show(ui, |ui| {
             let size = Vec2::new(diagram.width as f32 * self.zoom, diagram.height as f32 * self.zoom);
             let (rect, response) = ui.allocate_exact_size(size, Sense::click());
             let painter = ui.painter_at(rect);
