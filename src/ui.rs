@@ -34,6 +34,7 @@ struct App {
     tab: Tab,
     selected: Option<String>,
     status: String,
+    show_warnings: bool,
     zoom: f32,
     tcc_kv: f64,
 }
@@ -57,6 +58,7 @@ impl App {
             tab: Tab::Sld,
             selected: None,
             status: "Sample plant is loaded. Short circuit and arc flash are on the one-line.".into(),
+            show_warnings: false,
             zoom: 1.0,
             tcc_kv: 0.48,
         }
@@ -68,10 +70,42 @@ impl App {
                 let ms = results.elapsed_ms;
                 let n = results.warnings.len();
                 self.status = format!("Ran in {ms:.1} ms. {n} warnings.");
+                if n == 0 {
+                    self.show_warnings = false;
+                }
                 self.results = Some(results);
             }
             Err(err) => self.status = err,
         }
+    }
+
+    fn warnings_window(&mut self, ctx: &egui::Context) {
+        if !self.show_warnings {
+            return;
+        }
+        let warnings = self.results.as_ref().map(|r| r.warnings.clone()).unwrap_or_default();
+        if warnings.is_empty() {
+            self.show_warnings = false;
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("WARNINGS")
+            .anchor(Align2::LEFT_BOTTOM, [8.0, -40.0])
+            .collapsible(false)
+            .resizable(true)
+            .default_width(560.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(RichText::new(format!("{} ITEM{}", warnings.len(), if warnings.len() == 1 { "" } else { "S" })).color(color("#FFB300")));
+                ui.separator();
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    for warning in &warnings {
+                        ui.label(RichText::new(warning.to_uppercase()).color(color("#E2E8F0")));
+                        ui.add_space(6.0);
+                    }
+                });
+            });
+        self.show_warnings = open;
     }
 }
 
@@ -125,8 +159,19 @@ impl eframe::App for App {
             });
         });
         egui::Panel::bottom("status").show(ui, |ui| {
-            ui.label(RichText::new(self.status.to_uppercase()).color(color("#94A3B8")));
+            ui.horizontal(|ui| {
+                let n = self.results.as_ref().map(|r| r.warnings.len()).unwrap_or(0);
+                if n > 0 {
+                    let label = format!("{n} WARNING{}", if n == 1 { "" } else { "S" });
+                    let text = RichText::new(label).strong().color(color("#FFB300"));
+                    if ui.button(text).clicked() {
+                        self.show_warnings = !self.show_warnings;
+                    }
+                }
+                ui.label(RichText::new(self.status.to_uppercase()).color(color("#94A3B8")));
+            });
         });
+        self.warnings_window(ui.ctx());
         egui::Panel::right("inspector").default_size(300.0).show(ui, |ui| {
             self.inspector(ui);
         });
