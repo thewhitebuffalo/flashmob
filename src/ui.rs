@@ -36,8 +36,9 @@ struct App {
     status: String,
     show_warnings: bool,
     zoom: f32,
-    /// Visible one-line window, in diagram coordinates. Pinch changes this, not the panel size.
-    scene_rect: Rect,
+    /// Top-left of the diagram, in points inside the fixed one-line panel.
+    pan: Vec2,
+    fit_view: bool,
     tcc_kv: f64,
 }
 
@@ -68,7 +69,8 @@ impl App {
             status: "Sample plant is loaded. Short circuit and arc flash are on the one-line.".into(),
             show_warnings: false,
             zoom: 1.0,
-            scene_rect: Rect::ZERO,
+            pan: Vec2::ZERO,
+            fit_view: true,
             tcc_kv: 0.48,
         };
         if let Some((path, project)) = opened {
@@ -145,7 +147,7 @@ impl eframe::App for App {
                 if ui.button("Sample").clicked() {
                     self.project = Project::sample();
                     self.selected = None;
-                    self.scene_rect = Rect::ZERO;
+                    self.fit_view = true;
                     self.run_study();
                 }
                 if ui.button("Open").clicked() {
@@ -213,36 +215,38 @@ impl App {
             return;
         };
         let diagram = sld::diagram(&self.project, &results);
-        let view = ui.available_rect_before_wrap();
-        ui.painter().rect_filled(view, 0.0, color("#0A0C10"));
-        let mut scale = if self.scene_rect.width() > 1.0 && self.scene_rect.height() > 1.0 {
-            (view.width() / self.scene_rect.width()).min(view.height() / self.scene_rect.height())
-        } else {
-            self.zoom
-        };
         ui.horizontal(|ui| {
             ui.label("Zoom");
-            if ui.add(egui::Slider::new(&mut scale, 0.05..=8.0).logarithmic(true)).changed()
-                && self.scene_rect.width() > 1.0
-                && self.scene_rect.height() > 1.0
-            {
-                let center = self.scene_rect.center();
-                self.scene_rect = Rect::from_center_size(center, view.size() / scale);
-            }
+            ui.add(egui::Slider::new(&mut self.zoom, 0.05..=8.0).logarithmic(true));
         });
-        let scene_view = ui.available_rect_before_wrap();
-        ui.painter().rect_filled(scene_view, 0.0, color("#0A0C10"));
-        egui::Scene::new()
-            .zoom_range(0.05..=8.0)
-            .max_inner_size(Vec2::new(diagram.width as f32 + 64.0, diagram.height as f32 + 64.0))
-            .drag_pan_buttons(egui::DragPanButtons::SECONDARY | egui::DragPanButtons::MIDDLE)
-            .show(ui, &mut self.scene_rect, |ui| {
-            let size = Vec2::new(diagram.width as f32, diagram.height as f32);
-            let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-            let painter = ui.painter_at(rect);
-            painter.rect_filled(rect, 0.0, color("#0A0C10"));
-            let origin = rect.min;
-            let z = 1.0;
+        let view = ui.available_rect_before_wrap();
+        let (rect, response) = ui.allocate_exact_size(view.size(), Sense::click_and_drag());
+        if self.fit_view && diagram.width > 1.0 && diagram.height > 1.0 {
+            let fit = (rect.width() / diagram.width as f32).min(rect.height() / diagram.height as f32);
+            self.zoom = fit.clamp(0.05, 8.0);
+            let content = Vec2::new(diagram.width as f32, diagram.height as f32) * self.zoom;
+            self.pan = (rect.size() - content) * 0.5;
+            self.fit_view = false;
+        }
+        let zoom_delta = ui.input(|i| i.zoom_delta());
+        if response.hovered() && (zoom_delta - 1.0).abs() > 0.001 {
+            if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                let old = self.zoom;
+                let new = (old * zoom_delta).clamp(0.05, 8.0);
+                let local = pos - rect.min;
+                let diagram_pt = (local - self.pan) / old;
+                self.pan = local - diagram_pt * new;
+                self.zoom = new;
+            }
+        }
+        if response.hovered() {
+            self.pan += ui.input(|i| i.smooth_scroll_delta);
+        }
+        let mut painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0.0, color("#0A0C10"));
+        painter.set_clip_rect(rect);
+        let origin = rect.min + self.pan;
+        let z = self.zoom;
             let map = |x: f64, y: f64| origin + Vec2::new(x as f32, y as f32) * z;
             let grid = Stroke::new(1.0, color("#334155"));
             let mut gx = origin.x;
@@ -303,10 +307,6 @@ impl App {
             for bus in &diagram.buses {
                 draw_bus(&painter, bus, origin, z, self.selected.as_deref() == Some(&bus.id));
             }
-        });
-        if self.scene_rect.width() > 1.0 && self.scene_rect.height() > 1.0 {
-            self.zoom = (scene_view.width() / self.scene_rect.width()).min(scene_view.height() / self.scene_rect.height());
-        }
     }
 
     fn flow(&self, ui: &mut egui::Ui) {
@@ -458,7 +458,7 @@ impl App {
                 Ok(project) => {
                     self.project = project;
                     self.selected = None;
-                    self.scene_rect = Rect::ZERO;
+                    self.fit_view = true;
                     self.run_study();
                 }
                 Err(err) => self.status = err,
