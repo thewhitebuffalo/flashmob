@@ -88,7 +88,7 @@ enum Command {
         #[arg(long = "device")]
         device: Vec<String>,
     },
-    /// Write SKM Data Exchange XML, CSV, tab-delimited, and Revit schedule files.
+    /// Write an engineering data package for mapping (PTW import unverified).
     ExportSkm {
         path: PathBuf,
         /// Folder for the export, or an .xml file path.
@@ -109,6 +109,7 @@ fn main() -> ExitCode {
             Ok(project) => {
                 let errors = project.validate();
                 emit(&serde_json::json!({"ok": errors.is_empty(), "errors": errors}), false)
+                    .max_code(if errors.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) })
             }
             Err(err) => fail(&err),
         },

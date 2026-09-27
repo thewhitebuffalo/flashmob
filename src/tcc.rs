@@ -43,7 +43,7 @@ pub fn plot(project: &Project, study: Option<&StudyOutput>, ref_kv: Option<f64>,
     let ref_kv = ref_kv.unwrap_or_else(|| {
         devices.iter().filter_map(|d| project.bus(&d.bus).map(|b| b.kv)).fold(f64::MAX, f64::min)
     });
-    if ref_kv <= 0.0 {
+    if !ref_kv.is_finite() || ref_kv <= 0.0 {
         return Err("reference voltage must be positive".into());
     }
     let mut curves = Vec::new();
@@ -52,6 +52,7 @@ pub fn plot(project: &Project, study: Option<&StudyOutput>, ref_kv: Option<f64>,
     for (n, device) in devices.iter().enumerate() {
         let kv = project.bus(&device.bus).map(|b| b.kv).unwrap_or(ref_kv);
         let points = sample_curve(&device.curve, kv, ref_kv);
+        if points.is_empty() { continue; }
         if let Some((lo, _)) = points.first() {
             i_min = i_min.min(*lo);
         }
@@ -64,9 +65,7 @@ pub fn plot(project: &Project, study: Option<&StudyOutput>, ref_kv: Option<f64>,
             points,
         });
     }
-    if !i_min.is_finite() {
-        i_min = 10.0;
-    }
+    if curves.is_empty() { return Err("no plottable curve: selected devices have no usable settings".into()); }
     i_min = (i_min * 0.7).max(1.0);
     i_max = (i_max * 1.4).max(i_min * 10.0);
 
@@ -103,6 +102,9 @@ pub fn plot(project: &Project, study: Option<&StudyOutput>, ref_kv: Option<f64>,
         }
     }
 
+    if !i_min.is_finite() || !i_max.is_finite() || i_min <= 0.0 || i_max <= i_min {
+        return Err("invalid TCC axis bounds: finite positive ordered bounds required".into());
+    }
     Ok(TccPlot {
         title: project.name.clone(),
         ref_kv,
@@ -141,7 +143,7 @@ fn sample_curve(curve: &CurveSpec, device_kv: f64, ref_kv: f64) -> Vec<(f64, f64
     probes
         .into_iter()
         .filter_map(|amps| trip_time(curve, amps).map(|time| (amps * scale, time)))
-        .filter(|(_, time)| time.is_finite() && *time > 0.0)
+        .filter(|(amp, time)| amp.is_finite() && *amp > 0.0 && time.is_finite() && *time > 0.0)
         .collect()
 }
 
@@ -179,17 +181,6 @@ pub fn to_svg(plot: &TccPlot) -> String {
         title = esc(&plot.title),
         note = esc(&plot.note),
     );
-    let decades = |lo: f64, hi: f64| {
-        let mut v = Vec::new();
-        let mut d = 10_f64.powf(lo.log10().floor());
-        while d <= hi * 1.001 {
-            if d >= lo * 0.999 {
-                v.push(d);
-            }
-            d *= 10.0;
-        }
-        v
-    };
     for amp in decades(plot.i_min, plot.i_max) {
         let x = x_of(plot, amp, left, width);
         s.push_str(&format!(
@@ -328,4 +319,13 @@ mod tests {
         assert!(csv.contains("MCC main"));
         assert!(plot.curves.iter().all(|c| c.points.len() > 5));
     }
+}
+
+/// A bounded enumeration, including when external callers construct an invalid plot.
+pub fn decades(lo: f64, hi: f64) -> Vec<f64> {
+    if !lo.is_finite() || !hi.is_finite() || lo <= 0.0 || hi <= lo { return Vec::new(); }
+    let first = lo.log10().floor() as i32;
+    let last = hi.log10().ceil() as i32;
+    (first.max(-323)..=last.min(308)).map(|e| 10_f64.powi(e))
+        .filter(|d| d.is_finite() && *d >= lo && *d <= hi).collect()
 }

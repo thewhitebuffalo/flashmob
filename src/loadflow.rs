@@ -71,7 +71,7 @@ pub fn solve(project: &Project) -> Result<LoadflowResult, String> {
     let n = model.index.n;
     let sbase = project.s_base_mva;
     let mut spec = vec![
-        Spec { kind: Kind::Pq, v: 1.0, ang: 0.0, p: 0.0, q: 0.0, qmin: -1e9, qmax: 1e9 };
+        Spec { kind: Kind::Pq, v: 1.0, ang: 0.0, p: 0.0, q: 0.0, qmin: 0.0, qmax: 0.0 };
         n
     ];
 
@@ -85,12 +85,8 @@ pub fn solve(project: &Project) -> Result<LoadflowResult, String> {
             spec[i].kind = Kind::Pv;
             spec[i].v = source.v_pu;
             spec[i].p += source.p_mw / sbase;
-            if let Some(q) = source.qmin_mvar {
-                spec[i].qmin = q / sbase;
-            }
-            if let Some(q) = source.qmax_mvar {
-                spec[i].qmax = q / sbase;
-            }
+            spec[i].qmin += source.qmin_mvar.unwrap_or(f64::NEG_INFINITY) / sbase;
+            spec[i].qmax += source.qmax_mvar.unwrap_or(f64::INFINITY) / sbase;
         }
     }
     for load in &project.loads {
@@ -106,6 +102,9 @@ pub fn solve(project: &Project) -> Result<LoadflowResult, String> {
         spec[i].q -= kvar / (sbase * 1000.0);
     }
 
+    let demand: Vec<f64> = spec.iter().map(|s| -s.q).collect();
+    let pv: Vec<bool> = spec.iter().map(|s| s.kind == Kind::Pv).collect();
+    let mut limited = vec![0i8; n];
     let mut v: Vec<f64> = spec.iter().map(|s| s.v).collect();
     let mut ang: Vec<f64> = spec.iter().map(|s| s.ang).collect();
     let mut converged = false;
@@ -113,15 +112,9 @@ pub fn solve(project: &Project) -> Result<LoadflowResult, String> {
     let mut max_mismatch = f64::MAX;
     let mut message = None;
 
-    for iter in 1..=30 {
+    for iter in 1..=100 {
         iterations = iter;
         let (p, q) = injections(&model.loadflow, &v, &ang);
-        for (s, q_calc) in spec.iter_mut().zip(&q) {
-            if s.kind == Kind::Pv && (*q_calc > s.qmax || *q_calc < s.qmin) {
-                s.q = q_calc.clamp(s.qmin, s.qmax);
-                s.kind = Kind::Pq;
-            }
-        }
         let (ang_idx, v_idx, nunk) = unknowns(&spec);
         max_mismatch = 0.0;
         if nunk == 0 {
@@ -139,7 +132,30 @@ pub fn solve(project: &Project) -> Result<LoadflowResult, String> {
                 max_mismatch = max_mismatch.max(mismatch[row].abs());
             }
         }
-        if max_mismatch < 1e-8 {
+        // Fixed physical MW/Mvar tolerance makes convergence independent of MVA base.
+        if max_mismatch < 1e-8 / sbase {
+            // Change the active set only after solving the current equations.
+            // A bound can be released if the resulting voltage contradicts it.
+            let mut changed = false;
+            for i in 0..n {
+                if !pv[i] { continue; }
+                if spec[i].kind == Kind::Pv {
+                    let qgen = q[i] + demand[i];
+                    if qgen > spec[i].qmax + 1e-8 / sbase || qgen < spec[i].qmin - 1e-8 / sbase {
+                        limited[i] = if qgen > spec[i].qmax { 1 } else { -1 };
+                        spec[i].q = qgen.clamp(spec[i].qmin, spec[i].qmax) - demand[i];
+                        spec[i].kind = Kind::Pq;
+                        changed = true;
+                    }
+                } else if (limited[i] == 1 && v[i] > spec[i].v + 1e-7)
+                    || (limited[i] == -1 && v[i] < spec[i].v - 1e-7) {
+                    spec[i].kind = Kind::Pv;
+                    v[i] = spec[i].v;
+                    limited[i] = 0;
+                    changed = true;
+                }
+            }
+            if changed { continue; }
             converged = true;
             break;
         }

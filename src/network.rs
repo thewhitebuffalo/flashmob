@@ -131,9 +131,12 @@ pub struct SystemModel {
     pub zero: Net,
     pub branches: Vec<BranchStamp>,
     pub warnings: Vec<String>,
+    pub energized: Vec<bool>,
 }
 
 pub fn build(project: &Project) -> Result<SystemModel, String> {
+    let errors = project.validate();
+    if !errors.is_empty() { return Err(errors.join("; ")); }
     let index = Index::build(project)?;
     let n = index.n;
     let mut loadflow = SparseY::new(n);
@@ -181,23 +184,34 @@ pub fn build(project: &Project) -> Result<SystemModel, String> {
         pos.shunt(i, y1);
         neg.shunt(i, y1);
         let z0 = Cplx::new(z1.re * source.r0_over_r1, z1.im * source.x0_over_x1);
-        if let Some(y0) = z0.inv() {
-            zero.shunt(i, y0);
-        }
+        let y0 = z0.inv().ok_or_else(|| format!("source {}: invalid zero-sequence impedance", source.id))?;
+        zero.shunt(i, y0);
     }
+
+    // Only utility/generator sources energize islands; passive shunts and motors do not.
+    let mut supply = Net::new(n);
+    supply.edges = pos.edges.clone();
+    for source in &project.sources { supply.shunt[index.of(&source.bus)?] = true; }
+    let energized = reaches_shunt(&supply);
 
     for motor in &project.motors {
         let i = index.of(&motor.bus)?;
+        if !energized[i] { continue; }
         let kw = motor.hp * 0.746 / motor.efficiency;
         let kva = kw / motor.pf;
-        let x = motor.x_subtransient_pu * (project.s_base_mva / (kva / 1000.0));
-        let r = x / motor.xr.max(0.1);
+        let x = motor.x_subtransient_pu * (project.s_base_mva / (kva / 1000.0)) * (motor.kv / index.kv[i]).powi(2);
+        let r = x / motor.xr;
         let y = Cplx::new(r, x).inv().ok_or_else(|| format!("motor '{}' has zero impedance", motor.id))?;
         pos.shunt(i, y);
         neg.shunt(i, y);
     }
 
-    Ok(SystemModel { index, loadflow, pos, neg, zero, branches, warnings })
+    for y in [&loadflow, &pos.y, &neg.y, &zero.y] {
+        if y.rows().iter().flatten().any(|(_, v)| !v.re.is_finite() || !v.im.is_finite()) {
+            return Err("non-finite network admittance (check impedances and voltage bases)".into());
+        }
+    }
+    Ok(SystemModel { index, loadflow, pos, neg, zero, branches, warnings, energized })
 }
 
 fn stamp_branch(project: &Project, index: &Index, branch: &Branch, warnings: &mut Vec<String>) -> Result<BranchStamp, String> {
@@ -217,14 +231,14 @@ fn stamp_branch(project: &Project, index: &Index, branch: &Branch, warnings: &mu
             let b = Cplx::new(0.0, b_siemens * zb / 2.0);
             let q = Quad { yff: y + b, yft: -y, ytf: -y, ytt: y + b };
             let (r0, x0) = if r0_ohm.abs() < 1e-12 && x0_ohm.abs() < 1e-12 {
-                (3.0 * r_ohm, 3.0 * x_ohm)
+                { warnings.push(format!("line {}: R0=3R1 and X0=3X1 assumed", branch.id)); (3.0 * r_ohm, 3.0 * x_ohm) }
             } else {
                 (*r0_ohm, *x0_ohm)
             };
-            let zero = match Cplx::new(r0 / zb, x0 / zb).inv() {
-                Some(y0) => ZeroStamp::Series(Quad { yff: y0 + b, yft: -y0, ytf: -y0, ytt: y0 + b }),
-                None => ZeroStamp::Open,
-            };
+            if *b_siemens != 0.0 { warnings.push(format!("line {}: zero-sequence charging omitted; B0 was not supplied", branch.id)); }
+            let y0 = Cplx::new(r0 / zb, x0 / zb).inv()
+                .ok_or_else(|| format!("line {}: zero or non-finite zero-sequence impedance", branch.id))?;
+            let zero = ZeroStamp::Series(Quad { yff: y0, yft: -y0, ytf: -y0, ytt: y0 });
             Ok(BranchStamp {
                 from: i,
                 to: j,
@@ -235,7 +249,7 @@ fn stamp_branch(project: &Project, index: &Index, branch: &Branch, warnings: &mu
                 rating_kva: None,
             })
         }
-        BranchKind::Transformer { kva, z_percent, xr, hv_kv, lv_kv, connection, tap_percent, x0_over_x1 } => {
+        BranchKind::Transformer { kva, z_percent, xr, hv_kv, lv_kv, connection, tap_percent, x0_over_x1, r0_over_r1 } => {
             let from_rated = nearest(index.kv[i], *hv_kv, *lv_kv);
             let to_rated = nearest(index.kv[j], *hv_kv, *lv_kv);
             if (from_rated - to_rated).abs() < 1e-9 {
@@ -244,22 +258,27 @@ fn stamp_branch(project: &Project, index: &Index, branch: &Branch, warnings: &mu
                     branch.name, from_rated
                 ));
             }
-            let z_mag = (z_percent / 100.0) * (project.s_base_mva / (kva / 1000.0)) * (from_rated / index.kv[i]).powi(2);
+            // Tap is a change to HV winding turns, independent of branch orientation.
+            let tap = 1.0 + tap_percent / 100.0;
+            let from_turns = from_rated * if from_rated == *hv_kv { tap } else { 1.0 };
+            let to_turns = to_rated * if to_rated == *hv_kv { tap } else { 1.0 };
+            let z_mag = (z_percent / 100.0) * (project.s_base_mva / (kva / 1000.0)) * (to_turns / index.kv[j]).powi(2);
             let z1 = Cplx::from_mag_xr(z_mag, *xr);
             let y1 = z1.inv().ok_or_else(|| format!("transformer '{}' has zero impedance", branch.id))?;
-            let a_mag = (1.0 + tap_percent / 100.0) * (index.kv[i] / from_rated) * (to_rated / index.kv[j]);
+            let a_mag = (from_turns / index.kv[i]) * (index.kv[j] / to_turns);
             let phi = match connection {
                 XfmrConn::Dyn => 30.0_f64.to_radians(),
                 XfmrConn::Ynd => -30.0_f64.to_radians(),
                 XfmrConn::Ynyn | XfmrConn::Dd => 0.0,
             };
-            let positive = quad(y1, Cplx::from_polar(a_mag, phi));
-            let negative = quad(y1, Cplx::from_polar(a_mag, -phi));
-            let z0 = z1 * *x0_over_x1;
+            let positive = quad(y1, Cplx::from_polar(a_mag, phi))?;
+            let negative = quad(y1, Cplx::from_polar(a_mag, -phi))?;
+            let z0 = Cplx::new(z1.re * r0_over_r1, z1.im * x0_over_x1);
+            if z0.inv().is_none() { return Err(format!("transformer {}: zero or non-finite zero-sequence impedance", branch.id)); }
             let zero = match (connection, z0.inv()) {
                 (XfmrConn::Dyn, Some(y0)) => ZeroStamp::Shunt { bus_is_from: false, y: y0 },
-                (XfmrConn::Ynd, Some(y0)) => ZeroStamp::Shunt { bus_is_from: true, y: y0 },
-                (XfmrConn::Ynyn, Some(y0)) => ZeroStamp::Series(quad(y0, Cplx::real(a_mag))),
+                (XfmrConn::Ynd, Some(y0)) => ZeroStamp::Shunt { bus_is_from: true, y: y0 * (1.0 / a_mag.powi(2)) },
+                (XfmrConn::Ynyn, Some(y0)) => ZeroStamp::Series(quad(y0, Cplx::real(a_mag))?),
                 _ => ZeroStamp::Open,
             };
             Ok(BranchStamp {
@@ -275,14 +294,15 @@ fn stamp_branch(project: &Project, index: &Index, branch: &Branch, warnings: &mu
     }
 }
 
-fn quad(y: Cplx, a: Cplx) -> Quad {
+fn quad(y: Cplx, a: Cplx) -> Result<Quad, String> {
+    if a.inv().is_none() { return Err("zero or non-finite transformer ratio".into()); }
     let a2 = a.re * a.re + a.im * a.im;
-    Quad {
+    Ok(Quad {
         yff: y * (1.0 / a2),
         yft: -(y / a.conj()),
         ytf: -(y / a),
         ytt: y,
-    }
+    })
 }
 
 fn nearest(bus_kv: f64, hv: f64, lv: f64) -> f64 {

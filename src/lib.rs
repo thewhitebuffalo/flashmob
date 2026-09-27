@@ -17,3 +17,6 @@ mod cplx;
 mod linalg;
 mod network;
 mod solve;
+
+#[cfg(test)]
+mod regression;

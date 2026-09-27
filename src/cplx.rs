@@ -45,7 +45,7 @@ impl Cplx {
 
     pub fn inv(self) -> Option<Self> {
         let d = self.re * self.re + self.im * self.im;
-        if d < 1e-30 {
+        if !d.is_finite() || d == 0.0 {
             None
         } else {
             Some(Self {
@@ -116,6 +116,6 @@ impl Mul<f64> for Cplx {
 impl Div for Cplx {
     type Output = Self;
     fn div(self, rhs: Self) -> Self {
-        self * rhs.inv().unwrap_or(Self::ZERO)
+        self * rhs.inv().expect("complex division by zero or non-finite impedance")
     }
 }

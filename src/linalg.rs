@@ -3,16 +3,19 @@ use faer::sparse::{SparseColMat, Triplet};
 
 /// Solve `A x = b` with a sparse LU factorization. Duplicate triplets are summed.
 pub fn solve_sparse(n: usize, triplets: &[(usize, usize, f64)], b: &[f64]) -> Result<Vec<f64>, String> {
-    if n == 0 {
-        return Ok(Vec::new());
+    if triplets.iter().any(|&(r, c, v)| r >= n || c >= n || !v.is_finite()) || b.iter().any(|v| !v.is_finite()) {
+        return Err("matrix or right-hand side contains invalid indices or non-finite values".into());
     }
     if b.len() != n {
         return Err("right-hand side length does not match the matrix".to_string());
     }
+    if n == 0 {
+        return Ok(Vec::new());
+    }
     let trips: Vec<Triplet<usize, usize, f64>> = triplets
         .iter()
         .copied()
-        .filter(|(_, _, v)| v.is_finite() && *v != 0.0)
+        .filter(|(_, _, v)| *v != 0.0)
         .map(|(r, c, v)| Triplet::new(r, c, v))
         .collect();
     if trips.is_empty() {
@@ -29,5 +32,6 @@ pub fn solve_sparse(n: usize, triplets: &[(usize, usize, f64)], b: &[f64]) -> Re
     for i in 0..n {
         out[i] = x[i];
     }
+    if out.iter().any(|v| !v.is_finite()) { return Err("non-finite linear solution".into()); }
     Ok(out)
 }

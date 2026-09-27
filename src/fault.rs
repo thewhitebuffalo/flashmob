@@ -9,6 +9,9 @@ use crate::solve::zth;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FaultResult {
     pub prefault: String,
+    pub prefault_requested: String,
+    pub valid: bool,
+    pub error: Option<String>,
     pub buses: Vec<BusFault>,
 }
 
@@ -23,6 +26,19 @@ pub struct BusFault {
     pub line_to_line: Option<FaultPoint>,
     pub line_to_line_ground: Option<FaultPoint>,
     pub note: Option<String>,
+    pub terminal_currents: Vec<TerminalCurrent>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TerminalCurrent {
+    pub branch_id: String,
+    pub from_a: f64,
+    pub to_a: f64,
+    /// Rectangular amperes, [real, imaginary]. Flat prefault neglects initial load flow.
+    pub from_prefault_a: [f64; 2],
+    pub to_prefault_a: [f64; 2],
+    pub from_increment_a: [f64; 2],
+    pub to_increment_a: [f64; 2],
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,7 +48,8 @@ pub struct FaultPoint {
     pub ib_ka: f64,
     pub ic_ka: f64,
     pub ig_ka: f64,
-    pub x_over_r: f64,
+    /// None denotes the purely inductive limit (infinite X/R).
+    pub x_over_r: Option<f64>,
     pub iec_peak_ka: f64,
     pub half_cycle_rms_ka: f64,
 }
@@ -40,14 +57,19 @@ pub struct FaultPoint {
 pub fn solve(project: &Project, loadflow: Option<&LoadflowResult>) -> Result<FaultResult, String> {
     let model = network::build(project)?;
     let n = model.index.n;
-    let (z1, map1) = reduced(&model.pos)?;
-    let (z2, map2) = reduced(&model.neg)?;
-    let (z0, map0) = reduced(&model.zero)?;
+    let (z1, map1) = reduced(&model.pos, &model.energized)?;
+    let (z2, map2) = reduced(&model.neg, &model.energized)?;
+    let (z0, map0) = reduced(&model.zero, &model.energized)?;
 
+    let requested = if project.prefault == Prefault::Loadflow { "loadflow" } else { "flat_1.0_pu" };
+    let lf_valid = loadflow.map_or(false, |lf| lf.converged && model.index.id_of.iter().all(|id|
+        lf.buses.iter().any(|b| b.id == *id && b.v_pu.is_finite() && b.v_pu > 0.0 && b.angle_deg.is_finite())));
+    let valid = project.prefault != Prefault::Loadflow || lf_valid;
+    let error = if valid { None } else { Some("requested loadflow prefault unavailable or unconverged; method used: none; fault and arc-flash results invalid".to_string()) };
     let mut prefault_v = vec![Cplx::real(1.0); n];
     let mut label = "flat_1.0_pu".to_string();
     if project.prefault == Prefault::Loadflow {
-        if let Some(lf) = loadflow.filter(|lf| lf.converged) {
+        if let Some(lf) = loadflow.filter(|_| lf_valid) {
             for bus in &lf.buses {
                 if let Ok(i) = model.index.of(&bus.id) {
                     prefault_v[i] = Cplx::from_polar(bus.v_pu, bus.angle_deg.to_radians());
@@ -55,45 +77,86 @@ pub fn solve(project: &Project, loadflow: Option<&LoadflowResult>) -> Result<Fau
             }
             label = "loadflow".into();
         } else {
-            label = "flat_1.0_pu_loadflow_unavailable".into();
+            label = "none".into();
         }
     }
 
     let mut buses = Vec::new();
     for i in 0..n {
+        if !valid || !model.energized[i] {
+            buses.push(BusFault {
+                id: model.index.id_of[i].clone(), name: model.index.name_of[i].clone(), kv: model.index.kv[i],
+                prefault_pu: 0.0, three_phase: None, line_to_ground: None, line_to_line: None, line_to_line_ground: None,
+                terminal_currents: Vec::new(),
+                note: Some(error.clone().unwrap_or_else(|| "unenergized island: no utility/generator source".into())),
+            });
+            continue;
+        }
         let v = prefault_v[i];
         let ibase = i_base_ka(model.index.kv[i], project.s_base_mva);
         let zz1 = zth(&z1, &map1, i)?;
         let zz2 = zth(&z2, &map2, i)?;
         let zz0 = zth(&z0, &map0, i)?;
         let mut note = None;
-        let three = zz1.map(|z| point(v / z, Cplx::ZERO, Cplx::ZERO, z, ibase));
+        let three = match zz1 {
+            Some(z) => { checked_impedance(z)?; Some(point(v / z, Cplx::ZERO, Cplx::ZERO, z, ibase)?) },
+            None => None,
+        };
         let line_line = match (zz1, zz2) {
             (Some(a), Some(b)) => {
+                checked_impedance(a + b)?;
                 let i1 = v / (a + b);
-                Some(point(i1, -i1, Cplx::ZERO, a + b, ibase))
+                Some(point(i1, -i1, Cplx::ZERO, a + b, ibase)?)
             }
             _ => None,
         };
         let (line_ground, double) = match (zz1, zz2, zz0) {
             (Some(a), Some(b), Some(c)) => {
+                checked_impedance(a + b + c)?;
+                checked_impedance(b + c)?;
                 let i1 = v / (a + b + c);
-                let lg = point(i1, i1, i1, a + b + c, ibase);
+                let lg = point(i1, i1, i1, a + b + c, ibase)?;
                 let zpar = (b * c) / (b + c);
+                checked_impedance(a + zpar)?;
                 let i1g = v / (a + zpar);
                 let i2 = -i1g * c / (b + c);
                 let i0 = -i1g * b / (b + c);
-                (Some(lg), Some(point(i1g, i2, i0, a + zpar, ibase)))
+                (Some(lg), Some(point(i1g, i2, i0, a + zpar, ibase)?))
             }
             (Some(a), Some(b), None) => {
                 note = Some("no zero-sequence path; ground fault current is zero".into());
+                checked_impedance(a + b)?;
                 let i1 = v / (a + b);
-                (Some(zero_point()), Some(point(i1, -i1, Cplx::ZERO, a + b, ibase)))
+                (Some(zero_point()), Some(point(i1, -i1, Cplx::ZERO, a + b, ibase)?))
             }
             _ => (None, None),
         };
         if three.is_none() {
             note = Some("bus is not connected to a source".into());
+        }
+        // Solve the voltage decrement caused by the fault current injection.
+        // LF prefault includes initial branch flow; flat prefault neglects initial load flow.
+        let mut terminal_currents = Vec::new();
+        if let (Some(k), Some(z)) = (map1[i], zz1) {
+            let mut inj = vec![Cplx::ZERO; z1.n];
+            inj[k] = v / z;
+            let drop = crate::solve::solve_y(&z1, &inj)?;
+            for (branch, stamp) in project.branches.iter().zip(&model.branches) {
+                let (Some(f), Some(t)) = (map1[stamp.from], map1[stamp.to]) else { continue };
+                let q = stamp.positive;
+                let bf = i_base_ka(model.index.kv[stamp.from], project.s_base_mva) * 1000.0;
+                let bt = i_base_ka(model.index.kv[stamp.to], project.s_base_mva) * 1000.0;
+                let pre_f = if project.prefault == Prefault::Loadflow { (q.yff * prefault_v[stamp.from] + q.yft * prefault_v[stamp.to]) * bf } else { Cplx::ZERO };
+                let pre_t = if project.prefault == Prefault::Loadflow { (q.ytf * prefault_v[stamp.from] + q.ytt * prefault_v[stamp.to]) * bt } else { Cplx::ZERO };
+                let inc_f = (q.yff * drop[f] + q.yft * drop[t]) * bf;
+                let inc_t = (q.ytf * drop[f] + q.ytt * drop[t]) * bt;
+                terminal_currents.push(TerminalCurrent {
+                    branch_id: branch.id.clone(),
+                    from_a: (pre_f - inc_f).abs(), to_a: (pre_t - inc_t).abs(),
+                    from_prefault_a: [pre_f.re, pre_f.im], to_prefault_a: [pre_t.re, pre_t.im],
+                    from_increment_a: [inc_f.re, inc_f.im], to_increment_a: [inc_t.re, inc_t.im],
+                });
+            }
         }
         buses.push(BusFault {
             id: model.index.id_of[i].clone(),
@@ -105,22 +168,23 @@ pub fn solve(project: &Project, loadflow: Option<&LoadflowResult>) -> Result<Fau
             line_to_line: line_line,
             line_to_line_ground: double,
             note,
+            terminal_currents,
         });
     }
-    Ok(FaultResult { prefault: label, buses })
+    Ok(FaultResult { prefault: label, prefault_requested: requested.into(), valid, error, buses })
 }
 
-fn reduced(net: &Net) -> Result<(crate::network::SparseY, Vec<Option<usize>>), String> {
-    let mask = network::reaches_shunt(net);
+fn reduced(net: &Net, energized: &[bool]) -> Result<(crate::network::SparseY, Vec<Option<usize>>), String> {
+    let mask: Vec<bool> = network::reaches_shunt(net).iter().zip(energized).map(|(a, b)| *a && *b).collect();
     Ok(network::reduce(&net.y, &mask))
 }
 
-fn point(i1: Cplx, i2: Cplx, i0: Cplx, zth: Cplx, ibase: f64) -> FaultPoint {
+fn point(i1: Cplx, i2: Cplx, i0: Cplx, zth: Cplx, ibase: f64) -> Result<FaultPoint, String> {
     let (ia, ib, ic) = phases(i0, i1, i2);
     let ig = i0 * 3.0;
     let sym = ia.abs().max(ib.abs()).max(ic.abs()) * ibase;
-    let (xr, peak, asym) = asymmetry(sym, zth);
-    FaultPoint {
+    let (xr, peak, asym) = asymmetry(sym, zth)?;
+    Ok(FaultPoint {
         symmetrical_ka: sym,
         ia_ka: ia.abs() * ibase,
         ib_ka: ib.abs() * ibase,
@@ -129,7 +193,7 @@ fn point(i1: Cplx, i2: Cplx, i0: Cplx, zth: Cplx, ibase: f64) -> FaultPoint {
         x_over_r: xr,
         iec_peak_ka: peak,
         half_cycle_rms_ka: asym,
-    }
+    })
 }
 
 fn zero_point() -> FaultPoint {
@@ -139,7 +203,7 @@ fn zero_point() -> FaultPoint {
         ib_ka: 0.0,
         ic_ka: 0.0,
         ig_ka: 0.0,
-        x_over_r: 0.0,
+        x_over_r: Some(0.0),
         iec_peak_ka: 0.0,
         half_cycle_rms_ka: 0.0,
     }
@@ -151,13 +215,28 @@ fn phases(i0: Cplx, i1: Cplx, i2: Cplx) -> (Cplx, Cplx, Cplx) {
     (i0 + i1 + i2, i0 + a2 * i1 + a * i2, i0 + a * i1 + a2 * i2)
 }
 
-fn asymmetry(i_sym: f64, z: Cplx) -> (f64, f64, f64) {
-    let r_over_x = if z.im.abs() < 1e-12 { 0.0 } else { (z.re / z.im).max(0.0) };
-    let xr = if z.re.abs() < 1e-12 { 1.0e6 } else { z.im / z.re };
+fn checked_impedance(z: Cplx) -> Result<(), String> {
+    if z.inv().is_none() { Err("zero or non-finite fault impedance denominator".into()) } else { Ok(()) }
+}
+
+fn asymmetry(i_sym: f64, z: Cplx) -> Result<(Option<f64>, f64, f64), String> {
+    // Remove relative roundoff from phase-shift stamps, not physical reactance.
+    let tol = z.abs() * 1e-12;
+    let z = Cplx::new(if z.re.abs() <= tol { 0.0 } else { z.re }, if z.im.abs() <= tol { 0.0 } else { z.im });
+    if !i_sym.is_finite() || i_sym < 0.0 || !z.re.is_finite() || !z.im.is_finite()
+        || z.re < 0.0 || z.im < 0.0 || z.abs() == 0.0 {
+        return Err("asymmetry requires finite nonnegative R and X and nonzero impedance".into());
+    }
+    if z.im == 0.0 {
+        return Ok((Some(0.0), std::f64::consts::SQRT_2 * i_sym, i_sym));
+    }
+    let r_over_x = z.re / z.im;
+    let xr = if z.re == 0.0 { None } else { Some(z.im / z.re) };
     let kappa = 1.02 + 0.98 * (-3.0 * r_over_x).exp();
     let peak = kappa * std::f64::consts::SQRT_2 * i_sym;
     let asym = i_sym * (1.0 + 2.0 * (-2.0 * std::f64::consts::PI * r_over_x).exp()).sqrt();
-    (xr, peak, asym)
+    if !peak.is_finite() || !asym.is_finite() { return Err("non-finite asymmetrical current".into()); }
+    Ok((xr, peak, asym))
 }
 
 #[cfg(test)]
@@ -214,6 +293,7 @@ mod tests {
                     connection: XfmrConn::Dyn,
                     tap_percent: 0.0,
                     x0_over_x1: 1.0,
+                    r0_over_r1: 1.0,
                 },
             }],
             sources: vec![Source {
@@ -245,5 +325,26 @@ mod tests {
         let gotg = lv.line_to_ground.as_ref().unwrap().symmetrical_ka;
         assert!((got3 - i3).abs() / i3 < 1e-4, "3P got {got3}, expected {i3}");
         assert!((gotg - ilg).abs() / ilg < 1e-4, "LG got {gotg}, expected {ilg}");
+    }
+}
+
+#[cfg(test)]
+mod asymmetry_regression {
+    use super::*;
+    #[test]
+    fn inductive_resistive_zero_and_invalid_limits() {
+        let (xr, peak, rms) = asymmetry(10.0, Cplx::new(0.0, 1.0)).unwrap();
+        assert_eq!(xr, None);
+        assert!((peak-20.0*2.0_f64.sqrt()).abs() < 1e-12);
+        assert!((rms-10.0*3.0_f64.sqrt()).abs() < 1e-12);
+        for x in [0.0, 1e-15] {
+            let (xr, peak, rms) = asymmetry(10.0, Cplx::new(1.0, x)).unwrap();
+            assert_eq!(xr, Some(0.0));
+            assert!((peak-10.0*2.0_f64.sqrt()).abs() < 1e-12);
+            assert_eq!(rms, 10.0);
+        }
+        for z in [Cplx::ZERO, Cplx::new(-1.0,1.0), Cplx::new(1.0,-1.0), Cplx::new(f64::NAN,1.0), Cplx::new(f64::INFINITY,1.0)] {
+            assert!(asymmetry(10.0,z).is_err());
+        }
     }
 }

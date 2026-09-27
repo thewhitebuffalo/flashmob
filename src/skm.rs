@@ -1,12 +1,5 @@
-//! Export a Flashmob model in the formats SKM Power*Tools accepts through
-//! Data Exchange: SKM XML, CSV, and tab-delimited text, plus a Revit
-//! electrical schedule the Revit–SKM importer can map.
-//!
-//! SKM does not publish the Data Exchange XSD. Element and column names
-//! follow the PTW Component Editor (Nominal System Voltage, Nominal kVA,
-//! %Z, X/R, connection, from bus, to bus) and the PTW V9 equipment-data
-//! fields (Equipment Type SWG/PNL/MCC/CBL/AIR, gap, working distance,
-//! electrode configuration).
+//! Engineering data package for mapping. No PTW version has been round-tripped.
+//! XML is a Flashmob representation, not an SKM schema or verified import format.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -35,6 +28,7 @@ impl SkmExport {
 pub fn export(project: &Project) -> SkmExport {
     let names = Names::new(project);
     let mut files = vec![
+        SkmFile { name: "project.json".into(), content: serde_json::to_string_pretty(project).expect("project serializes") },
         SkmFile { name: "project.xml".into(), content: xml(project, &names) },
         SkmFile { name: "buses.csv".into(), content: buses_csv(project, &names) },
         SkmFile { name: "cables.csv".into(), content: cables_csv(project, &names) },
@@ -107,7 +101,7 @@ fn xml(project: &Project, names: &Names) -> String {
     let mut body = String::new();
     body.push_str(&format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <SKMDataExchange Source=\"Flashmob\" Version=\"1.0\" Target=\"PTW Data Exchange\">\n\
+         <FlashmobEngineeringData Source=\"Flashmob\" Version=\"1.0\" Purpose=\"Engineering mapping\">\n\
          <Project Name=\"{}\" BaseMVA=\"{}\" FrequencyHz=\"60\" ArcDurationCapSec=\"{}\">\n\
          <Components>\n",
         xml_escape(&project.name),
@@ -171,7 +165,7 @@ fn xml(project: &Project, names: &Names) -> String {
                     ]),
                 ));
             }
-            BranchKind::Transformer { kva, z_percent, xr, hv_kv, lv_kv, connection, tap_percent, x0_over_x1 } => {
+            BranchKind::Transformer { kva, z_percent, xr, hv_kv, lv_kv, connection, tap_percent, x0_over_x1, r0_over_r1 } => {
                 let (pct_r, pct_x) = percent_rx(*z_percent, *xr);
                 let (pri, sec) = connections(*connection);
                 body.push_str(&format!(
@@ -190,6 +184,7 @@ fn xml(project: &Project, names: &Names) -> String {
                         ("PercentX", "%", fmt(pct_x)),
                         ("XR", "", fmt(*xr)),
                         ("X0OverX1", "", fmt(*x0_over_x1)),
+                        ("R0OverR1", "", fmt(*r0_over_r1)),
                         ("Tap", "%", fmt(*tap_percent)),
                     ]),
                 ));
@@ -232,6 +227,9 @@ fn xml(project: &Project, names: &Names) -> String {
                 ("TimeDial", "", td),
                 ("InstantaneousPickup", "A", inst),
                 ("InstantaneousTime", "s", inst_s),
+                ("ProtectedBranch", "", device.protected_branch.clone().unwrap_or_default()),
+                ("BreakerInterruptingTime", "s", device.breaker_interrupting_s.map(fmt).unwrap_or_default()),
+                ("FuseTotalClearingCurve", "", device.fuse_total_clearing.to_string()),
             ]),
         ));
     }
@@ -248,7 +246,7 @@ fn xml(project: &Project, names: &Names) -> String {
             xml_escape(&names.bus(&branch.to)),
         ));
     }
-    body.push_str("</Connections>\n</Project>\n</SKMDataExchange>\n");
+    body.push_str("</Connections>\n</Project>\n</FlashmobEngineeringData>\n");
     body
 }
 
@@ -347,10 +345,11 @@ fn transformers_csv(project: &Project, names: &Names) -> String {
         "PercentX",
         "XR",
         "X0OverX1",
+        "R0OverR1",
         "TapPercent",
     ]);
     for branch in &project.branches {
-        let BranchKind::Transformer { kva, z_percent, xr, hv_kv, lv_kv, connection, tap_percent, x0_over_x1 } = &branch.kind else {
+        let BranchKind::Transformer { kva, z_percent, xr, hv_kv, lv_kv, connection, tap_percent, x0_over_x1, r0_over_r1 } = &branch.kind else {
             continue;
         };
         let (pct_r, pct_x) = percent_rx(*z_percent, *xr);
@@ -370,6 +369,7 @@ fn transformers_csv(project: &Project, names: &Names) -> String {
             &fmt(pct_x),
             &fmt(*xr),
             &fmt(*x0_over_x1),
+            &fmt(*r0_over_r1),
             &fmt(*tap_percent),
         ]));
     }
@@ -427,10 +427,10 @@ fn motors_csv(project: &Project, names: &Names) -> String {
 }
 
 fn devices_csv(project: &Project, names: &Names) -> String {
-    let mut s = csv_line(&["Name", "Bus", "DeviceType", "Curve", "PickupA", "TimeDial", "InstantaneousPickupA", "InstantaneousTimeS"]);
+    let mut s = csv_line(&["Name", "Bus", "DeviceType", "Curve", "PickupA", "TimeDial", "InstantaneousPickupA", "InstantaneousTimeS", "ProtectedBranch", "BreakerInterruptingTimeS", "FuseTotalClearingCurve"]);
     for device in &project.devices {
         let (kind, curve, pickup, td, inst, inst_s) = device_fields(&device.curve);
-        s.push_str(&csv_line(&[&sanitize(&device.name), &names.bus(&device.bus), kind, &curve, &pickup, &td, &inst, &inst_s]));
+        s.push_str(&csv_line(&[&sanitize(&device.name), &names.bus(&device.bus), kind, &curve, &pickup, &td, &inst, &inst_s, device.protected_branch.as_deref().unwrap_or(""), &device.breaker_interrupting_s.map(fmt).unwrap_or_default(), &device.fuse_total_clearing.to_string()]));
     }
     s
 }
@@ -608,16 +608,15 @@ fn components_tab(project: &Project, names: &Names) -> String {
 fn import_notes(project: &Project) -> String {
     format!(
         "\
-Flashmob export for SKM Power*Tools Data Exchange
+Flashmob engineering data package for mapping
 Project: {name}
 
-SKM imports project data through the Data Exchange module as SKM XML, CSV,
-or tab-delimited text, and through the Autodesk Revit exchange. SKM does
-not publish the XML schema. These files use the PTW Component Editor field
-names and the PTW V9 equipment-data fields.
+This package has not been round-tripped through any Power*Tools version.
+It is not a verified PTW import. The XML is a Flashmob representation;
+no SKM XML schema or compatibility is claimed. An engineer must map and
+verify the data against the selected PTW version.
 
-In PTW, use Project > Import, or Data Exchange, and map the columns once:
-
+  project.json              complete Flashmob model, including all protection metadata
   project.xml               one file with every component and connection
   buses.csv                 NominalSystemVoltage in volts, IEEE 1584 enclosure
   cables.csv                R and X in ohms (ImpedanceUnit = ohm)

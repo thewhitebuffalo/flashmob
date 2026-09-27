@@ -58,6 +58,7 @@ pub enum Command {
         connection: XfmrConn,
         #[serde(default)] tap_percent: f64,
         #[serde(default = "one")] x0_over_x1: f64,
+        #[serde(default = "one")] r0_over_r1: f64,
     },
     AddLoad { id: String, #[serde(default)] name: String, bus: String, kw: f64, kvar: f64, #[serde(default)] basis: String },
     AddSource {
@@ -84,7 +85,7 @@ pub enum Command {
         #[serde(default = "default_xd")] x_subtransient_pu: f64,
         #[serde(default = "default_xr")] xr: f64,
     },
-    AddDevice { id: String, #[serde(default)] name: String, bus: String, curve: CurveSpec, #[serde(default)] basis: String },
+    AddDevice { id: String, #[serde(default)] name: String, bus: String, curve: CurveSpec, #[serde(default)] basis: String, #[serde(default)] protected_branch: Option<String>, #[serde(default)] breaker_interrupting_s: Option<f64>, #[serde(default)] fuse_total_clearing: bool },
     AddEquipment {
         id: String,
         #[serde(default)] name: String,
@@ -119,7 +120,7 @@ pub enum Command {
     Run { #[serde(default)] studies: Vec<String> },
     Sld,
     Tcc { #[serde(default)] ref_kv: Option<f64>, #[serde(default)] devices: Vec<String> },
-    /// Write the SKM Data Exchange folder. `output` is a directory, or an `.xml` path.
+    /// Write the engineering data package for mapping. `output` is a directory, or an `.xml` path.
     ExportSkm { #[serde(default)] output: Option<String> },
 }
 
@@ -198,6 +199,13 @@ fn apply_one(
     tcc_csv: &mut Option<String>,
     skm: &mut Option<crate::skm::SkmExport>,
 ) -> Result<(), String> {
+    if !matches!(command, Command::Sld | Command::Tcc { .. } | Command::ExportSkm { .. }) {
+        *results = None;
+        *sld_svg = None;
+        *tcc_svg = None;
+        *tcc_csv = None;
+        *skm = None;
+    }
     match command {
         Command::Sample => *project = Project::sample(),
         Command::Replace { project: next } => *project = next.clone(),
@@ -247,7 +255,7 @@ fn apply_one(
                 },
             });
         }
-        Command::AddTransformer { id, name, from, to, kva, z_percent, xr, hv_kv, lv_kv, connection, tap_percent, x0_over_x1 } => {
+        Command::AddTransformer { id, name, from, to, kva, z_percent, xr, hv_kv, lv_kv, connection, tap_percent, x0_over_x1, r0_over_r1 } => {
             fresh(id, project)?;
             project.branches.push(Branch {
                 id: id.clone(),
@@ -263,6 +271,7 @@ fn apply_one(
                     connection: *connection,
                     tap_percent: *tap_percent,
                     x0_over_x1: *x0_over_x1,
+                    r0_over_r1: *r0_over_r1,
                 },
             });
         }
@@ -302,9 +311,9 @@ fn apply_one(
                 xr: *xr,
             });
         }
-        Command::AddDevice { id, name, bus, curve, basis } => {
+        Command::AddDevice { id, name, bus, curve, basis, protected_branch, breaker_interrupting_s, fuse_total_clearing } => {
             fresh(id, project)?;
-            project.devices.push(Device { id: id.clone(), name: named(name, id), bus: bus.clone(), curve: curve.clone(), basis: basis.clone() });
+            project.devices.push(Device { id: id.clone(), name: named(name, id), bus: bus.clone(), curve: curve.clone(), basis: basis.clone(), protected_branch: protected_branch.clone(), breaker_interrupting_s: *breaker_interrupting_s, fuse_total_clearing: *fuse_total_clearing });
         }
         Command::AddEquipment { id, name, bus, electrode, gap_mm, distance_mm, height_mm, width_mm, depth_mm, upstream_device, clearing_s, basis } => {
             fresh(id, project)?;
@@ -366,7 +375,8 @@ fn apply_one(
 }
 
 fn ensure_study<'a>(project: &Project, results: &'a mut Option<StudyOutput>) -> Result<&'a StudyOutput, String> {
-    if results.is_none() {
+    if results.as_ref().map_or(true, |r| r.loadflow.is_none() || r.fault.is_none() || r.arc_flash.is_none() || r.coordination.is_none()) {
+        *results = None;
         *results = Some(study::run(project, Studies::all())?);
     }
     Ok(results.as_ref().unwrap())
@@ -481,7 +491,7 @@ pub fn schema() -> serde_json::Value {
             ]
         },
         "exec_response": ["ok", "error", "warnings", "project", "results", "sld_svg", "tcc_svg", "tcc_csv", "skm"],
-        "skm": "Data Exchange export: project.xml, per-component CSV, components.tab, and Revit panel/circuit schedules. See IMPORT.txt.",
+        "skm": "Engineering data package for mapping; PTW import unverified: project.xml, per-component CSV, components.tab, and Revit panel/circuit schedules. See IMPORT.txt.",
         "sld": "SVG single-line diagram. Each bus card shows nominal voltage, load-flow pu voltage, symmetrical 3P and LG fault current, and the governing IEEE 1584-2018 incident energy and arc-flash boundary.",
         "tcc": "SVG log-log time-current curve plus CSV points. Current is referred to ref_kv. Fault and arcing-current markers are included when a study has been run.",
         "electrodes": ["VCB", "VCBB", "HCB", "VOA", "HOA"],

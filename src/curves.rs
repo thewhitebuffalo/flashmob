@@ -1,10 +1,19 @@
 use crate::model::{CurveSpec, Device, IecKind, IeeeKind};
 
-/// Trip time in seconds at `amps`. None means the device does not trip.
+/// Relay/element operating time, not breaker total clearing. None means unavailable or no operation.
 pub fn trip_time(curve: &CurveSpec, amps: f64) -> Option<f64> {
     if !amps.is_finite() || amps <= 0.0 {
         return None;
     }
+    let incomplete_active_stage = match curve {
+        CurveSpec::Iec { inst_a, inst_s, .. } | CurveSpec::Ieee { inst_a, inst_s, .. } =>
+            inst_a.is_some_and(|p| amps >= p) && inst_s.is_none(),
+        CurveSpec::ThermalMagnetic { inst_a, inst_s, st_pickup_a, st_delay_s, .. } =>
+            (inst_a.is_some_and(|p| amps >= p) && inst_s.is_none()) ||
+            (st_pickup_a.is_some_and(|p| amps >= p) && st_delay_s.is_none()),
+        _ => false,
+    };
+    if incomplete_active_stage { return None; }
     match curve {
         CurveSpec::Iec { kind, pickup_a, tms, inst_a, inst_s } => {
             let thermal = if amps > *pickup_a && *pickup_a > 0.0 {
@@ -64,10 +73,18 @@ pub fn trip_time_device(device: &Device, amps: f64) -> Option<f64> {
     trip_time(&device.curve, amps)
 }
 
+/// Total clearing requires either an explicit fuse total-clearing curve or breaker time.
+pub fn clearing_time(device: &Device, amps: f64) -> Option<f64> {
+    let operating = trip_time_device(device, amps).filter(|t| t.is_finite() && *t > 0.0)?;
+    if device.fuse_total_clearing && device.breaker_interrupting_s.is_some() { return None; }
+    if device.fuse_total_clearing { Some(operating) }
+    else { device.breaker_interrupting_s.filter(|t| t.is_finite() && *t > 0.0).map(|t| operating + t).filter(|t| t.is_finite()) }
+}
+
 fn instant(amps: f64, pickup: Option<f64>, time: Option<f64>) -> Option<f64> {
     let pickup = pickup?;
     if amps >= pickup {
-        Some(time.unwrap_or(0.05))
+        time.filter(|t| t.is_finite() && *t > 0.0)
     } else {
         None
     }

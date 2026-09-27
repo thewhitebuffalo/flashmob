@@ -22,6 +22,7 @@ pub struct BusGlyph {
     pub fault_3p_ka: Option<f64>,
     pub fault_lg_ka: Option<f64>,
     pub arcs: Vec<ArcNote>,
+    pub arc_failures: Vec<String>,
     pub card_h: f64,
     pub source: bool,
 }
@@ -64,9 +65,10 @@ pub fn diagram(project: &Project, study: &StudyOutput) -> Diagram {
                 .as_ref()
                 .map(|rows| notes_for(rows, &bus.id))
                 .unwrap_or_default();
-            let card_h = 112.0 + arcs.len() as f64 * 30.0;
+            let arc_failures: Vec<String> = study.arc_flash_failures.iter().filter(|f| f.bus_id == bus.id).map(|f| format!("{}: {}", f.name, f.error)).collect();
+            let card_h = 112.0 + arcs.len() as f64 * 30.0 + if arc_failures.is_empty() { 0.0 } else { 20.0 };
             let fault = study.fault.as_ref().and_then(|f| f.buses.iter().find(|b| b.id == bus.id));
-            let flow = study.loadflow.as_ref().and_then(|lf| lf.buses.iter().find(|b| b.id == bus.id));
+            let flow = study.loadflow.as_ref().filter(|lf| lf.converged).and_then(|lf| lf.buses.iter().find(|b| b.id == bus.id));
             let v_pu = flow.map(|b| b.v_pu);
             let angle_deg = flow.map(|b| b.angle_deg);
             let source = project.sources.iter().any(|s| s.bus == bus.id);
@@ -83,6 +85,7 @@ pub fn diagram(project: &Project, study: &StudyOutput) -> Diagram {
                 fault_3p_ka: fault.and_then(|b| b.three_phase.as_ref().map(|p| p.symmetrical_ka)),
                 fault_lg_ka: fault.and_then(|b| b.line_to_ground.as_ref().map(|p| p.symmetrical_ka)),
                 arcs,
+                arc_failures,
                 card_h,
                 source,
             });
@@ -458,6 +461,11 @@ fn bus_svg(bus: &BusGlyph, focal: bool) -> String {
             ty,
             &format!("AFB {:.0} IN  {:.3} S{}", arc.afb_in, arc.time_s, if arc.assumed { "  ASSUMED" } else { "" }),
         ));
+    }
+    if !bus.arc_failures.is_empty() {
+        ty += 18.0;
+        body.push_str(&format!(r##"<g><title>{}</title>{}</g>"##,
+            esc(&bus.arc_failures.join("; ")), dat(left + 8.0, ty, "ARC FLASH FAILED")));
     }
     body
 }

@@ -87,6 +87,7 @@ impl App {
     }
 
     fn run_study(&mut self) {
+        self.results = None;
         match study::run(&self.project, Studies::all()) {
             Ok(results) => {
                 let ms = results.elapsed_ms;
@@ -320,6 +321,7 @@ impl App {
             lf.iterations,
             lf.max_mismatch_pu
         ));
+        if !lf.converged { return; }
         egui::Grid::new("flow").striped(true).show(ui, |ui| {
             ui.label(RichText::new("Bus").strong());
             ui.label(RichText::new("V pu").strong());
@@ -343,7 +345,8 @@ impl App {
             ui.label("No short-circuit result.");
             return;
         };
-        ui.label(format!("Prefault {}", fault.prefault));
+        ui.label(format!("Prefault requested: {}; used: {}", fault.prefault_requested, fault.prefault));
+        if !fault.valid { ui.label(fault.error.as_deref().unwrap_or("Invalid fault result")); return; }
         egui::Grid::new("fault").striped(true).show(ui, |ui| {
             for heading in ["Bus", "3P kA", "LG kA", "LL kA", "LLG kA", "X/R", "IEC peak"] {
                 ui.label(RichText::new(heading).strong());
@@ -355,7 +358,7 @@ impl App {
                 ui.label(ka(bus.line_to_ground.as_ref().map(|p| p.symmetrical_ka)));
                 ui.label(ka(bus.line_to_line.as_ref().map(|p| p.symmetrical_ka)));
                 ui.label(ka(bus.line_to_line_ground.as_ref().map(|p| p.symmetrical_ka)));
-                ui.label(bus.three_phase.as_ref().map(|p| format!("{:.1}", p.x_over_r)).unwrap_or_else(|| "—".into()));
+                ui.label(bus.three_phase.as_ref().map(|p| p.x_over_r.map(|v| format!("{v:.1}")).unwrap_or_else(|| "∞".into())).unwrap_or_else(|| "—".into()));
                 ui.label(ka(bus.three_phase.as_ref().map(|p| p.iec_peak_ka)));
                 ui.end_row();
             }
@@ -363,6 +366,9 @@ impl App {
     }
 
     fn arc(&self, ui: &mut egui::Ui) {
+        if let Some(out) = &self.results {
+            for f in &out.arc_flash_failures { ui.colored_label(color("#FFB300"), format!("FAILED — {}: {}", f.name, f.error)); }
+        }
         let Some(rows) = self.results.as_ref().and_then(|r| r.arc_flash.as_ref()) else {
             ui.label("No arc-flash result.");
             return;
@@ -396,9 +402,8 @@ impl App {
             ui.label("Run the study before drawing curves.");
             return;
         };
-        let Ok(plot) = tcc::plot(&self.project, Some(&results), Some(self.tcc_kv), &[]) else {
-            ui.label("Add a protective device to draw a time-current curve.");
-            return;
+        let plot = match tcc::plot(&self.project, Some(&results), Some(self.tcc_kv), &[]) {
+            Ok(p) => p, Err(e) => { ui.label(e); return; }
         };
         egui::ScrollArea::both().show(ui, |ui| {
             let (rect, _) = ui.allocate_exact_size(Vec2::new(980.0, 680.0), Sense::hover());
@@ -412,23 +417,26 @@ impl App {
             ui.label("Click a bus on the one-line. Each card shows three-phase and line-to-ground fault current, then the governing arc-flash energy.");
             return;
         };
+        let mut edited = false;
         let Some((name, kv)) = self.project.buses.iter_mut().find(|b| b.id == id).map(|bus| {
             ui.label(RichText::new(&bus.name).strong());
             ui.horizontal(|ui| {
                 ui.label("kV");
-                ui.add(egui::DragValue::new(&mut bus.kv).speed(0.01).range(0.05..=40.0));
+                edited |= ui.add(egui::DragValue::new(&mut bus.kv).speed(0.01).range(0.05..=40.0)).changed();
             });
             (bus.name.clone(), bus.kv)
         }) else {
             ui.label("That bus is no longer in the project.");
             return;
         };
+        if edited { self.results = None; self.status = "Results stale — model edited; run the study".into(); }
         if let Some(results) = &self.results {
+            for f in results.arc_flash_failures.iter().filter(|f| f.bus_id == id) { ui.label(format!("Arc flash FAILED: {}", f.error)); }
             if let Some(fault) = results.fault.as_ref().and_then(|f| f.buses.iter().find(|b| b.id == id)) {
                 ui.separator();
                 ui.label(RichText::new("Short circuit").strong());
                 if let Some(p) = &fault.three_phase {
-                    ui.label(format!("3P  {:.2} kA   X/R {:.1}   peak {:.2} kA", p.symmetrical_ka, p.x_over_r, p.iec_peak_ka));
+                    ui.label(format!("3P  {:.2} kA   X/R {}   peak {:.2} kA", p.symmetrical_ka, p.x_over_r.map(|v| format!("{v:.1}")).unwrap_or_else(|| "∞".into()), p.iec_peak_ka));
                 }
                 if let Some(p) = &fault.line_to_ground {
                     ui.label(format!("LG  {:.2} kA", p.symmetrical_ka));
@@ -506,9 +514,8 @@ impl App {
             self.run_study();
         }
         let Some(results) = &self.results else { return };
-        let Ok(plot) = tcc::plot(&self.project, Some(results), Some(self.tcc_kv), &[]) else {
-            self.status = "No devices to plot.".into();
-            return;
+        let plot = match tcc::plot(&self.project, Some(results), Some(self.tcc_kv), &[]) {
+            Ok(p) => p, Err(e) => { self.status = e; return; }
         };
         if let Some(path) = rfd::FileDialog::new().set_file_name("flashmob-tcc.svg").save_file() {
             self.status = write_status(&path, &tcc::to_svg(&plot));
@@ -580,6 +587,10 @@ fn draw_bus(painter: &egui::Painter, bus: &sld::BusGlyph, origin: Pos2, z: f32, 
             data,
         );
     }
+    if !bus.arc_failures.is_empty() {
+        y += 18.0;
+        painter.text(Pos2::new(x, y), Align2::LEFT_TOP, "ARC FLASH FAILED", FontId::monospace(11.0), color("#FFB300"));
+    }
 }
 
 fn bus_card(diagram: &Diagram, bus: &sld::BusGlyph, origin: Pos2, z: f32) -> Rect {
@@ -614,21 +625,13 @@ fn draw_tcc(ui: &egui::Ui, rect: Rect, plot: &TccPlot) {
         let t = ((time.log10() - plot.t_min.log10()) / (plot.t_max.log10() - plot.t_min.log10())) as f32;
         plot_rect.bottom() - t * plot_rect.height()
     };
-    let mut decade = 10_f64.powf(plot.i_min.log10().floor());
-    while decade <= plot.i_max {
-        if decade >= plot.i_min {
-            let x = x_of(decade);
-            painter.line_segment([Pos2::new(x, plot_rect.top()), Pos2::new(x, plot_rect.bottom())], Stroke::new(1.0, color("#334155")));
-        }
-        decade *= 10.0;
+    for decade in tcc::decades(plot.i_min, plot.i_max) {
+        let x = x_of(decade);
+        painter.line_segment([Pos2::new(x, plot_rect.top()), Pos2::new(x, plot_rect.bottom())], Stroke::new(1.0, color("#334155")));
     }
-    decade = 10_f64.powf(plot.t_min.log10().floor());
-    while decade <= plot.t_max {
-        if decade >= plot.t_min {
-            let y = y_of(decade);
-            painter.line_segment([Pos2::new(plot_rect.left(), y), Pos2::new(plot_rect.right(), y)], Stroke::new(1.0, color("#334155")));
-        }
-        decade *= 10.0;
+    for decade in tcc::decades(plot.t_min, plot.t_max) {
+        let y = y_of(decade);
+        painter.line_segment([Pos2::new(plot_rect.left(), y), Pos2::new(plot_rect.right(), y)], Stroke::new(1.0, color("#334155")));
     }
     for marker in &plot.markers {
         if marker.amps < plot.i_min || marker.amps > plot.i_max {

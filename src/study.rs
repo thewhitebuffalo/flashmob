@@ -47,6 +47,15 @@ pub struct StudyOutput {
     pub fault: Option<FaultResult>,
     pub arc_flash: Option<Vec<ArcRow>>,
     pub coordination: Option<Vec<CoordRow>>,
+    pub arc_flash_failures: Vec<ArcFailure>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ArcFailure {
+    pub equipment_id: String,
+    pub name: String,
+    pub bus_id: String,
+    pub error: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -73,6 +82,8 @@ pub struct ArcRow {
     pub energy_cal_cm2: f64,
     pub energy_min_cal_cm2: f64,
     pub governing_cal_cm2: f64,
+    pub afb_full_mm: f64,
+    pub afb_reduced_mm: f64,
     pub afb_in: f64,
     pub afb_mm: f64,
     pub governing: String,
@@ -93,6 +104,8 @@ pub struct CoordRow {
     pub curve: String,
     pub bolted_ka: Option<f64>,
     pub trip_at_bolted_s: Option<f64>,
+    pub total_clearing_s: Option<f64>,
+    pub note: String,
 }
 
 pub fn run(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
@@ -131,8 +144,9 @@ pub fn run(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
         None
     };
 
+    let mut arc_flash_failures = Vec::new();
     let arc_flash = if studies.arcflash {
-        Some(arc_flash(project, fault.as_ref().unwrap(), &mut warnings))
+        Some(arc_flash(project, fault.as_ref().unwrap(), &mut warnings, &mut arc_flash_failures))
     } else {
         None
     };
@@ -142,6 +156,7 @@ pub fn run(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
     } else {
         None
     };
+    if let Some(error) = fault.as_ref().and_then(|f| f.error.as_ref()) { warnings.push(error.clone()); }
     let mut seen = std::collections::HashSet::new();
     warnings.retain(|warning| seen.insert(warning.clone()));
 
@@ -158,24 +173,26 @@ pub fn run(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
         fault: if studies.fault { fault } else { None },
         arc_flash,
         coordination,
+        arc_flash_failures,
     })
 }
 
-fn arc_flash(project: &Project, fault: &FaultResult, warnings: &mut Vec<String>) -> Vec<ArcRow> {
+fn arc_flash(project: &Project, fault: &FaultResult, warnings: &mut Vec<String>, failures: &mut Vec<ArcFailure>) -> Vec<ArcRow> {
     let mut rows = Vec::new();
     for case in cases(project) {
+        let mut fail = |error: String| {
+            warnings.push(format!("{}: {error}", case.name));
+            failures.push(ArcFailure { equipment_id: case.id.clone(), name: case.name.clone(), bus_id: case.bus.clone(), error });
+        };
         let assumed = case.id.starts_with("assumed:") || case.basis == "assumed";
-        let Some(bus) = project.bus(&case.bus) else { continue };
-        let Some(bus_fault) = fault.buses.iter().find(|b| b.id == bus.id) else { continue };
+        let Some(bus) = project.bus(&case.bus) else { fail("unknown bus".into()); continue };
+        let Some(bus_fault) = fault.buses.iter().find(|b| b.id == bus.id) else { fail("missing fault result".into()); continue };
         let Some(bolted) = bus_fault.three_phase.as_ref().map(|p| p.symmetrical_ka) else {
-            warnings.push(format!("{} has no three-phase fault current", case.name));
+            fail(bus_fault.note.clone().unwrap_or_else(|| "no three-phase fault current".into()));
             continue;
         };
         if !(0.208..=15.0).contains(&bus.kv) {
-            warnings.push(format!(
-                "{} is {:.2} kV, outside the IEEE 1584-2018 range of 208 V to 15 kV",
-                case.name, bus.kv
-            ));
+            fail(format!("{:.2} kV is outside the IEEE 1584-2018 range of 208 V to 15 kV", bus.kv));
             continue;
         }
         let preview = IeeeInput {
@@ -193,12 +210,16 @@ fn arc_flash(project: &Project, fault: &FaultResult, warnings: &mut Vec<String>)
         let preview = match arcflash::calculate(&preview) {
             Ok(v) => v,
             Err(err) => {
-                warnings.push(format!("{}: {err}", case.name));
+                fail(err);
                 continue;
             }
         };
-        let full_clear = duration(project, &case, bus.kv, preview.i_arc_ka);
-        let min_clear = duration(project, &case, bus.kv, preview.i_arc_min_ka);
+        let full_clear = match duration(project, &case, bus_fault, preview.i_arc_ka) {
+            Ok(v) => v, Err(e) => { fail(e); continue; }
+        };
+        let min_clear = match duration(project, &case, bus_fault, preview.i_arc_min_ka) {
+            Ok(v) => v, Err(e) => { fail(e); continue; }
+        };
         let input = IeeeInput { time_s: full_clear.seconds, time_min_s: min_clear.seconds, ..preview_input(&case, bus.kv, bolted) };
         match arcflash::calculate(&input) {
             Ok(out) => {
@@ -227,6 +248,8 @@ fn arc_flash(project: &Project, fault: &FaultResult, warnings: &mut Vec<String>)
                     energy_cal_cm2: out.energy_cal_cm2,
                     energy_min_cal_cm2: out.energy_min_cal_cm2,
                     governing_cal_cm2: out.governing_cal_cm2,
+                    afb_full_mm: out.afb_full_mm,
+                    afb_reduced_mm: out.afb_reduced_mm,
                     afb_in: out.afb_in,
                     afb_mm: out.afb_mm,
                     governing: out.governing.into(),
@@ -237,7 +260,7 @@ fn arc_flash(project: &Project, fault: &FaultResult, warnings: &mut Vec<String>)
                     warnings: out.warnings,
                 });
             }
-            Err(err) => warnings.push(format!("{}: {err}", case.name)),
+            Err(err) => fail(err),
         }
     }
     rows
@@ -265,8 +288,7 @@ fn cases(project: &Project) -> Vec<ArcEquipment> {
             continue;
         }
         let (electrode, gap, distance, height, width, depth, label) = typical_equipment(bus.kv);
-        let on_bus: Vec<_> = project.devices.iter().filter(|d| d.bus == bus.id).collect();
-        let upstream = if on_bus.len() == 1 { Some(on_bus[0].id.clone()) } else { None };
+        let upstream = None;
         let name = if bus.name.is_empty() { bus.id.clone() } else { bus.name.clone() };
         cases.push(ArcEquipment {
             id: format!("assumed:{}", bus.id),
@@ -292,71 +314,46 @@ struct Clearing {
     note: String,
 }
 
-fn duration(project: &Project, case: &ArcEquipment, bus_kv: f64, i_ka: f64) -> Clearing {
+fn duration(project: &Project, case: &ArcEquipment, fault: &crate::fault::BusFault, i_ka: f64) -> Result<Clearing, String> {
     let cap = project.arc_duration_cap_s;
     let not_a_label = "This cap is not a field trip setting and is not for an arc-flash label.";
     if let Some(manual) = case.clearing_s {
-        return finish_clearing(manual, cap, &format!("manual clearing time of {manual:.3} s"), not_a_label);
+        return Ok(finish_clearing(manual, cap, &format!("manual total clearing time of {manual:.3} s"), not_a_label));
     }
-    let Some(id) = &case.upstream_device else {
-        return Clearing {
-            seconds: cap,
-            capped: true,
-            note: format!("Arc duration is the {cap:.1} s cap. No upstream device was collected. {not_a_label}"),
-        };
-    };
-    let Some(device) = project.device(id) else {
-        return Clearing {
-            seconds: cap,
-            capped: true,
-            note: format!("Arc duration is the {cap:.1} s cap. Upstream device {id} is missing. {not_a_label}"),
-        };
-    };
-    if let crate::model::CurveSpec::SettingsNotCollected { note } = &device.curve {
-        let detail = if note.trim().is_empty() {
-            "The device was collected but its trip settings were not.".to_string()
-        } else {
-            note.trim().to_string()
-        };
-        return Clearing {
-            seconds: cap,
-            capped: true,
-            note: format!("Arc duration is the {cap:.1} s cap. {detail} {not_a_label}"),
-        };
+    let id = case.upstream_device.as_ref().ok_or("no upstream device or manual total clearing time entered")?;
+    let device = project.device(id).ok_or("upstream device missing")?;
+    let bolted = fault.three_phase.as_ref().ok_or("fault current unavailable")?.symmetrical_ka;
+    let amps = device_current(project, device, fault, i_ka / bolted).ok_or("protected branch terminal current unavailable; enter protected_branch and terminal bus")?;
+    if !isolates_sources(project, device, &case.bus) {
+        return Err("opening the selected device does not isolate all utility/generator paths to the fault; a multi-device clearing study is required".into());
     }
-    let dev_kv = project.bus(&device.bus).map(|b| b.kv).unwrap_or(bus_kv);
-    let amps = i_ka * 1000.0 * bus_kv / dev_kv;
-    let assumed = if device.basis == "assumed" {
-        " The trip curve is an assumption, not a collected trip unit."
-    } else {
-        ""
-    };
-    match curves::trip_time(&device.curve, amps) {
-        Some(raw) if raw > cap => Clearing {
-            seconds: cap,
-            capped: true,
-            note: format!(
-                "Arc duration is the {cap:.1} s cap. Upstream device {} calculates {raw:.3} s at {amps:.0} A, which exceeds the cap. {not_a_label}{assumed}",
-                device.name
-            ),
-        },
-        Some(raw) => Clearing {
-            seconds: raw,
-            capped: false,
-            note: format!(
-                "Arc duration {raw:.3} s is the upstream device {} time at {amps:.0} A arcing current.{assumed}",
-                device.name
-            ),
-        },
-        None => Clearing {
-            seconds: cap,
-            capped: true,
-            note: format!(
-                "Arc duration is the {cap:.1} s cap. Upstream device {} does not clear {amps:.0} A. {not_a_label}{assumed}",
-                device.name
-            ),
-        },
+    let raw = curves::clearing_time(device, amps)
+        .ok_or("total clearing unavailable: enter operating settings and breaker interrupting time, or a fuse total-clearing curve; device may not operate at this current")?;
+    Ok(finish_clearing(raw, cap, &format!("total clearing time of {} at {amps:.0} A through its protected terminal (network terminal current; loadflow prefault includes initial branch flow)", device.name), not_a_label))
+}
+
+fn device_current(project: &Project, device: &crate::model::Device, fault: &crate::fault::BusFault, fraction: f64) -> Option<f64> {
+    let id = device.protected_branch.as_ref()?;
+    let branch = project.branches.iter().find(|b| b.id == *id)?;
+    let current = fault.terminal_currents.iter().find(|c| c.branch_id == *id)?;
+    let (pre, inc) = if device.bus == branch.from { (current.from_prefault_a, current.from_increment_a) }
+        else if device.bus == branch.to { (current.to_prefault_a, current.to_increment_a) }
+        else { return None; };
+    Some((pre[0] - fraction*inc[0]).hypot(pre[1] - fraction*inc[1]))
+}
+
+fn isolates_sources(project: &Project, device: &crate::model::Device, fault_bus: &str) -> bool {
+    let mut seen = std::collections::HashSet::from([fault_bus.to_string()]);
+    loop {
+        let old = seen.len();
+        for b in &project.branches {
+            if device.protected_branch.as_ref() == Some(&b.id) { continue; }
+            if seen.contains(&b.from) { seen.insert(b.to.clone()); }
+            if seen.contains(&b.to) { seen.insert(b.from.clone()); }
+        }
+        if old == seen.len() { break; }
     }
+    !project.sources.iter().any(|s| seen.contains(&s.bus))
 }
 
 fn finish_clearing(raw: f64, cap: f64, what: &str, not_a_label: &str) -> Clearing {
@@ -377,12 +374,11 @@ fn coordination(project: &Project, fault: &FaultResult) -> Vec<CoordRow> {
         .iter()
         .map(|device| {
             let kv = project.bus(&device.bus).map(|b| b.kv).unwrap_or(1.0);
-            let bolted = fault
-                .buses
-                .iter()
-                .find(|b| b.id == device.bus)
-                .and_then(|b| b.three_phase.as_ref().map(|p| p.symmetrical_ka));
-            let trip = bolted.and_then(|ka| curves::trip_time_device(device, ka * 1000.0));
+            let bus_fault = fault.buses.iter().find(|b| b.id == device.bus);
+            let amps = bus_fault.and_then(|b| device_current(project, device, b, 1.0));
+            let bolted = amps.map(|a| a / 1000.0);
+            let trip = amps.and_then(|a| curves::trip_time_device(device, a));
+            let total = amps.and_then(|a| curves::clearing_time(device, a));
             CoordRow {
                 device_id: device.id.clone(),
                 name: device.name.clone(),
@@ -391,6 +387,8 @@ fn coordination(project: &Project, fault: &FaultResult) -> Vec<CoordRow> {
                 curve: curve_label(&device.curve),
                 bolted_ka: bolted,
                 trip_at_bolted_s: trip,
+                total_clearing_s: total,
+                note: "Current is the protected branch terminal contribution for a fault at the device bus; operating and total-clearing times are separate. Unassigned terminals/times are unavailable.".into(),
             }
         })
         .collect()
@@ -423,7 +421,7 @@ pub fn text_report(project: &Project, out: &StudyOutput) -> String {
     lines.push("Buses".into());
     for bus in &project.buses {
         lines.push(format!("  {}", bus.name));
-        if let Some(lf) = out.loadflow.as_ref().and_then(|lf| lf.buses.iter().find(|row| row.id == bus.id)) {
+        if let Some(lf) = out.loadflow.as_ref().filter(|lf| lf.converged).and_then(|lf| lf.buses.iter().find(|row| row.id == bus.id)) {
             let angle = if (lf.angle_deg * 100.0).round() == 0.0 { 0.0 } else { lf.angle_deg };
             lines.push(format!("    Load flow  {:.3} pu  {angle:.2} deg", lf.v_pu));
         }
@@ -451,11 +449,19 @@ pub fn text_report(project: &Project, out: &StudyOutput) -> String {
                     "    IEEE 1584-2018  {:.2} cal/cm2  AFB {:.1} in  ({})",
                     row.governing_cal_cm2, row.afb_in, row.governing
                 ));
+                lines.push(format!("    AFB full {:.1} mm; reduced {:.1} mm; maximum {:.1} mm", row.afb_full_mm, row.afb_reduced_mm, row.afb_mm));
                 if row.assumed {
                     lines.push("    Enclosure gap, working distance, and electrode configuration are an assumption, not a field measurement.".into());
                 }
             }
         }
+    }
+    for failure in &out.arc_flash_failures {
+        lines.push(format!("Arc flash FAILED: {} ({}): {}", failure.name, failure.bus_id, failure.error));
+    }
+    if let Some(f) = &out.fault {
+        lines.push(format!("Prefault requested: {}; used: {}; valid: {}", f.prefault_requested, f.prefault, f.valid));
+        if let Some(error) = &f.error { lines.push(error.clone()); }
     }
     if !out.warnings.is_empty() {
         lines.push(String::new());
@@ -467,3 +473,19 @@ pub fn text_report(project: &Project, out: &StudyOutput) -> String {
     lines.join("\n")
 }
 
+
+#[cfg(test)]
+mod terminal_regression {
+    use super::*;
+    #[test]
+    fn reduced_arc_scales_fault_increment_but_preserves_prefault_flow() {
+        let p = Project::sample();
+        let mut f = fault::solve(&p, None).unwrap().buses.remove(1);
+        let t = f.terminal_currents.iter_mut().find(|t| t.branch_id == "t1").unwrap();
+        t.to_prefault_a = [30.0, 40.0];
+        t.to_increment_a = [-60.0, -80.0];
+        // At half fault injection, terminal current is (60+j80) A, magnitude 100 A.
+        let current = device_current(&p, &p.devices[0], &f, 0.5).unwrap();
+        assert!((current-100.0).abs() < 1e-12);
+    }
+}

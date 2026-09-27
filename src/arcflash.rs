@@ -53,6 +53,8 @@ pub struct IeeeOutput {
     pub governing: &'static str,
     pub governing_j_cm2: f64,
     pub governing_cal_cm2: f64,
+    pub afb_full_mm: f64,
+    pub afb_reduced_mm: f64,
     pub afb_mm: f64,
     pub afb_in: f64,
     pub warnings: Vec<String>,
@@ -60,6 +62,9 @@ pub struct IeeeOutput {
 
 pub fn calculate(input: &IeeeInput) -> Result<IeeeOutput, String> {
     let mut warnings = Vec::new();
+    if [input.voc_kv, input.ibf_ka, input.gap_mm, input.distance_mm, input.height_mm, input.width_mm, input.depth_mm, input.time_s, input.time_min_s].into_iter().any(|v| !v.is_finite() || v <= 0.0) {
+        return Err("all arc-flash inputs must be finite and positive".into());
+    }
     if !(0.208..=15.0).contains(&input.voc_kv) {
         return Err(format!(
             "IEEE 1584-2018 covers 0.208 kV to 15 kV; this case is {:.3} kV",
@@ -100,12 +105,11 @@ pub fn calculate(input: &IeeeInput) -> Result<IeeeOutput, String> {
     let enc = enclosure(input)?;
     let var_cf = variation_factor(input.electrode, input.voc_kv);
     let full = evaluate(input, input.time_s, false, enc.cf, var_cf)?;
-    let reduced = evaluate(input, input.time_min_s.max(1e-6), true, enc.cf, var_cf)?;
-    let (governing, gov_j, gov_mm) = if reduced.energy_j >= full.energy_j {
-        ("reduced_arcing", reduced.energy_j, reduced.afb_mm)
-    } else {
-        ("arcing", full.energy_j, full.afb_mm)
-    };
+    let reduced = evaluate(input, input.time_min_s, true, enc.cf, var_cf)?;
+    if [full.i_arc, reduced.i_arc, full.energy_j, reduced.energy_j, full.afb_mm, reduced.afb_mm].into_iter().any(|x| !x.is_finite() || x <= 0.0) {
+        return Err("non-finite or non-positive IEEE 1584 result".into());
+    }
+    let (governing, gov_j, boundary) = governing_cases(&full, &reduced);
 
     Ok(IeeeOutput {
         standard: "IEEE 1584-2018",
@@ -124,8 +128,10 @@ pub fn calculate(input: &IeeeInput) -> Result<IeeeOutput, String> {
         governing,
         governing_j_cm2: gov_j,
         governing_cal_cm2: gov_j / J_PER_CAL,
-        afb_mm: gov_mm,
-        afb_in: gov_mm / 25.4,
+        afb_full_mm: full.afb_mm,
+        afb_reduced_mm: reduced.afb_mm,
+        afb_mm: boundary,
+        afb_in: boundary / 25.4,
         warnings,
     })
 }
@@ -134,6 +140,13 @@ struct Case {
     i_arc: f64,
     energy_j: f64,
     afb_mm: f64,
+}
+
+fn governing_cases(full: &Case, reduced: &Case) -> (&'static str, f64, f64) {
+    let (name, energy) = if reduced.energy_j >= full.energy_j {
+        ("reduced_arcing", reduced.energy_j)
+    } else { ("arcing", full.energy_j) };
+    (name, energy, full.afb_mm.max(reduced.afb_mm))
 }
 
 struct Enclosure {
@@ -441,5 +454,30 @@ mod tests {
         close(out.i_arc_min_ka, 25.244, 0.002);
         close(out.energy_min_j_cm2, 53.156, 0.05);
         close(out.afb_mm, 2669.0, 2.0);
+    }
+}
+
+#[cfg(test)]
+mod boundary_regression {
+    use super::*;
+    #[test]
+    fn energy_and_boundary_govern_independently() {
+        // Distinct case rankings must survive aggregation, whichever case has higher energy.
+        let a = Case { i_arc: 10.0, energy_j: 20.0, afb_mm: 900.0 };
+        let b = Case { i_arc: 9.0, energy_j: 19.0, afb_mm: 1000.0 };
+        assert_eq!(governing_cases(&a, &b), ("arcing", 20.0, 1000.0));
+        assert_eq!(governing_cases(&b, &a), ("reduced_arcing", 20.0, 1000.0));
+    }
+    #[test]
+    fn both_boundaries_match_annex_d2_energy_distance_relation() {
+        let out = calculate(&IeeeInput { voc_kv: 0.48, ibf_ka: 45.0, gap_mm: 32.0,
+            distance_mm: 609.6, height_mm: 610.0, width_mm: 610.0, depth_mm: 254.0,
+            electrode: Electrode::VCB, time_s: 0.0613, time_min_s: 0.319 }).unwrap();
+        // D.2 energies in J/cm2, with VCB distance exponent -1.598 and 1.2 cal/cm2 boundary.
+        let full = 609.6 * (11.585_f64 / (1.2*4.184)).powf(1.0/1.598);
+        let reduced = 609.6 * (53.156_f64 / (1.2*4.184)).powf(1.0/1.598);
+        assert!((out.afb_full_mm-full).abs() < 2.0);
+        assert!((out.afb_reduced_mm-reduced).abs() < 2.0);
+        assert!((out.afb_mm-reduced).abs() < 2.0);
     }
 }

@@ -95,10 +95,13 @@ pub enum BranchKind {
         hv_kv: f64,
         lv_kv: f64,
         connection: XfmrConn,
+        /// HV winding turns change, independent of from/to orientation. Must exceed -100%.
         #[serde(default)]
         tap_percent: f64,
         #[serde(default = "default_x0")]
         x0_over_x1: f64,
+        #[serde(default = "default_one")]
+        r0_over_r1: f64,
     },
 }
 
@@ -180,6 +183,15 @@ pub struct Device {
     pub name: String,
     pub bus: String,
     pub curve: CurveSpec,
+    /// Branch protected at the terminal identified by `bus`. No location is inferred.
+    #[serde(default)]
+    pub protected_branch: Option<String>,
+    /// Relay/element operation must be followed by an entered breaker interruption time.
+    #[serde(default)]
+    pub breaker_interrupting_s: Option<f64>,
+    /// True only when the entered curve is a fuse total-clearing curve.
+    #[serde(default)]
+    pub fuse_total_clearing: bool,
     /// "collected" or "assumed". Empty means unspecified.
     #[serde(default)]
     pub basis: String,
@@ -261,7 +273,7 @@ pub struct ArcEquipment {
     pub depth_mm: f64,
     #[serde(default)]
     pub upstream_device: Option<String>,
-    /// Manual arc duration. When omitted, the upstream device curve is used.
+    /// Explicit total arc duration. Automatic clearing requires a located upstream device and total-clearing data.
     #[serde(default)]
     pub clearing_s: Option<f64>,
     /// "collected" or "assumed". Empty means unspecified.
@@ -372,6 +384,7 @@ impl Project {
                         connection: XfmrConn::Dyn,
                         tap_percent: 0.0,
                         x0_over_x1: 1.0,
+                        r0_over_r1: 1.0,
                     },
                 },
                 Branch {
@@ -422,6 +435,10 @@ impl Project {
             }],
             devices: vec![
                 Device {
+                    protected_branch: Some("t1".into()),
+                    // Explicit illustrative sample input; deserialization never supplies a time.
+                    breaker_interrupting_s: Some(0.08),
+                    fuse_total_clearing: false,
                     id: "brk-main".into(),
                     name: "MCC main".into(),
                     bus: "mcc".into(),
@@ -436,6 +453,10 @@ impl Project {
                     basis: String::new(),
                 },
                 Device {
+                    protected_branch: Some("feeder".into()),
+                    // Explicit illustrative sample input; deserialization never supplies a time.
+                    breaker_interrupting_s: Some(0.08),
+                    fuse_total_clearing: false,
                     id: "brk-feeder".into(),
                     name: "Panel feeder".into(),
                     bus: "pnl".into(),
@@ -606,7 +627,73 @@ impl Project {
                 }
             }
         }
+        self.validate_physical(&mut errors);
         errors
+    }
+
+    fn validate_physical(&self, errors: &mut Vec<String>) {
+        let positive = |x: f64| x.is_finite() && x > 0.0;
+        let nonnegative = |x: f64| x.is_finite() && x >= 0.0;
+        let mut check = |ok: bool, id: &str, what: &str| {
+            if !ok { errors.push(format!("{id}: invalid {what}")); }
+        };
+        check(positive(self.s_base_mva) && positive(self.arc_duration_cap_s), "project", "base or duration cap");
+        for b in &self.buses {
+            check(positive(b.kv) && b.shunt_kvar.is_finite(), &b.id, "bus voltage or shunt");
+            check(b.bracing_ka.map_or(true, positive) && b.main_rating_a.map_or(true, positive), &b.id, "equipment rating");
+        }
+        for b in &self.branches {
+            match b.kind {
+                BranchKind::Line { r_ohm, x_ohm, b_siemens, r0_ohm, x0_ohm, ampacity_a } => {
+                    check(nonnegative(r_ohm) && nonnegative(x_ohm) && positive(r_ohm.hypot(x_ohm))
+                        && b_siemens.is_finite() && nonnegative(r0_ohm) && nonnegative(x0_ohm)
+                        && ampacity_a.map_or(true, positive), &b.id, "line impedance or rating");
+                }
+                BranchKind::Transformer { kva, z_percent, xr, hv_kv, lv_kv, tap_percent, r0_over_r1, x0_over_x1, .. } => {
+                    check([kva, z_percent, hv_kv, lv_kv].into_iter().all(positive) && hv_kv > lv_kv
+                        && nonnegative(xr) && tap_percent.is_finite() && tap_percent > -100.0
+                        && nonnegative(r0_over_r1) && nonnegative(x0_over_x1)
+                        && (r0_over_r1 > 0.0 || xr * x0_over_x1 > 0.0), &b.id, "transformer impedance, winding voltage, or tap");
+                }
+            }
+        }
+        for s in &self.sources {
+            check(positive(s.mva_sc) && positive(s.v_pu) && nonnegative(s.xr)
+                && s.angle_deg.is_finite() && s.p_mw.is_finite()
+                && nonnegative(s.r0_over_r1) && nonnegative(s.x0_over_x1)
+                && (s.r0_over_r1 > 0.0 || s.xr * s.x0_over_x1 > 0.0), &s.id, "source impedance or voltage");
+            check(s.qmin_mvar.map_or(true, f64::is_finite) && s.qmax_mvar.map_or(true, f64::is_finite)
+                && s.qmin_mvar.unwrap_or(f64::NEG_INFINITY) <= s.qmax_mvar.unwrap_or(f64::INFINITY), &s.id, "reactive limits");
+            for other in self.sources.iter().filter(|o| o.bus == s.bus) {
+                check((other.v_pu - s.v_pu).abs() < 1e-8, &s.id, "conflicting voltage setpoints on one bus");
+            }
+        }
+        for l in &self.loads { check(l.kw.is_finite() && l.kvar.is_finite(), &l.id, "load"); }
+        for m in &self.motors {
+            check([m.hp, m.kv, m.pf, m.efficiency, m.x_subtransient_pu, m.xr].into_iter().all(positive)
+                && m.pf <= 1.0 && m.efficiency <= 1.0, &m.id, "motor ratings, reactance, or X/R");
+            // Allow customary nameplate/nominal differences (e.g. 460 V on 480 V).
+            check(self.bus(&m.bus).map_or(false, |b| (m.kv / b.kv - 1.0).abs() <= 0.10), &m.id, "motor voltage (must be within 10% of bus voltage)");
+        }
+        for d in &self.devices {
+            check(d.breaker_interrupting_s.map_or(true, positive) && !(d.fuse_total_clearing && d.breaker_interrupting_s.is_some()), &d.id, "clearing-time definition");
+            if let Some(id) = &d.protected_branch {
+                check(self.branches.iter().any(|b| b.id == *id && (b.from == d.bus || b.to == d.bus)), &d.id, "protected branch terminal");
+            }
+            let pair = |p: Option<f64>, t: Option<f64>| p.map_or(true, positive) && t.map_or(true, positive) && (t.is_none() || p.is_some());
+            let ok = match d.curve {
+                CurveSpec::Iec { pickup_a, tms, inst_a, inst_s, .. } => positive(pickup_a) && positive(tms) && pair(inst_a, inst_s),
+                CurveSpec::Ieee { pickup_a, td, inst_a, inst_s, .. } => positive(pickup_a) && positive(td) && pair(inst_a, inst_s),
+                CurveSpec::Definite { pickup_a, time_s } => positive(pickup_a) && positive(time_s),
+                CurveSpec::ThermalMagnetic { lt_pickup_a, lt_delay_s, st_pickup_a, st_delay_s, inst_a, inst_s } => positive(lt_pickup_a) && positive(lt_delay_s) && pair(st_pickup_a, st_delay_s) && pair(inst_a, inst_s),
+                CurveSpec::SettingsNotCollected { .. } => true,
+            };
+            check(ok, &d.id, "pickup or delay");
+        }
+        for e in &self.equipment {
+            check([e.gap_mm, e.distance_mm, e.height_mm, e.width_mm, e.depth_mm].into_iter().all(positive)
+                && e.clearing_s.map_or(true, positive), &e.id, "enclosure, gap, distance, or clearing time");
+        }
     }
 }
 
