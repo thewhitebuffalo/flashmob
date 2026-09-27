@@ -1,7 +1,7 @@
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 
 use flashmob::model::Project;
-use flashmob::sld::{self, Diagram};
+use flashmob::sld;
 use flashmob::study::{self, Studies, StudyOutput};
 use flashmob::tcc::{self, TccPlot};
 
@@ -216,12 +216,23 @@ impl App {
             return;
         };
         let diagram = sld::diagram(&self.project, &results);
+        let old_zoom = self.zoom;
+        let mut slider_changed = false;
         ui.horizontal(|ui| {
             ui.label("Zoom");
-            ui.add(egui::Slider::new(&mut self.zoom, 0.05..=8.0).logarithmic(true));
+            slider_changed = ui.add(egui::Slider::new(&mut self.zoom, 0.05..=8.0).logarithmic(true)).changed();
+            if ui.button("Fit").clicked() { self.fit_view = true; }
+            ui.label(match diagram_detail(self.zoom) {
+                DiagramDetail::Full => "Full detail",
+                DiagramDetail::Compact => "Summary · hover or select a bus for details",
+                DiagramDetail::Overview => "Overview · hover or select a bus for details",
+            });
         });
         let view = ui.available_rect_before_wrap();
         let (rect, response) = ui.allocate_exact_size(view.size(), Sense::click_and_drag());
+        if slider_changed {
+            self.pan = zoom_pan(self.pan, rect.size() * 0.5, old_zoom, self.zoom);
+        }
         if self.fit_view && diagram.width > 1.0 && diagram.height > 1.0 {
             let fit = (rect.width() / diagram.width as f32).min(rect.height() / diagram.height as f32);
             self.zoom = fit.clamp(0.05, 8.0);
@@ -232,82 +243,70 @@ impl App {
         let zoom_delta = ui.input(|i| i.zoom_delta());
         if response.hovered() && (zoom_delta - 1.0).abs() > 0.001 {
             if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                let old = self.zoom;
-                let new = (old * zoom_delta).clamp(0.05, 8.0);
-                let local = pos - rect.min;
-                let diagram_pt = (local - self.pan) / old;
-                self.pan = local - diagram_pt * new;
+                let new = (self.zoom * zoom_delta).clamp(0.05, 8.0);
+                self.pan = zoom_pan(self.pan, pos - rect.min, self.zoom, new);
                 self.zoom = new;
             }
-        }
-        if response.hovered() {
+        } else if response.hovered() {
+            // A pinch can also emit scroll events; do not apply those as a second pan.
             self.pan += ui.input(|i| i.smooth_scroll_delta);
         }
-        let mut painter = ui.painter_at(rect);
+        if response.dragged() {
+            self.pan += ui.input(|i| i.pointer.delta());
+        }
+        let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, color("#0A0C10"));
-        painter.set_clip_rect(rect);
         let origin = rect.min + self.pan;
         let z = self.zoom;
-            let map = |x: f64, y: f64| origin + Vec2::new(x as f32, y as f32) * z;
-            let grid = Stroke::new(1.0, color("#334155"));
-            let mut gx = origin.x;
-            while gx < rect.right() {
-                painter.line_segment([Pos2::new(gx, rect.top()), Pos2::new(gx, rect.bottom())], grid);
-                gx += 40.0 * z;
+        let map = |x: f64, y: f64| origin + Vec2::new(x as f32, y as f32) * z;
+        draw_diagram_grid(&painter, rect, origin, z);
+        let ink = color("#E2E8F0");
+        for branch in &diagram.branches {
+            let stroke = Stroke::new((2.0 * z).clamp(0.8, 2.0), ink);
+            let pts = branch.points();
+            for pair in pts.windows(2) {
+                painter.line_segment([map(pair[0].0, pair[0].1), map(pair[1].0, pair[1].1)], stroke);
             }
-            let mut gy = origin.y;
-            while gy < rect.bottom() {
-                painter.line_segment([Pos2::new(rect.left(), gy), Pos2::new(rect.right(), gy)], grid);
-                gy += 40.0 * z;
+            let (wx, wy) = branch.winding_at();
+            if branch.transformer {
+                painter.circle_stroke(map(wx, wy - 10.0), 12.0 * z, stroke);
+                painter.circle_stroke(map(wx, wy + 10.0), 12.0 * z, stroke);
             }
-            painter.text(
-                origin + Vec2::new(16.0, 8.0),
-                Align2::LEFT_TOP,
-                "ONE-LINE  IEEE 1584-2018  SYMMETRICAL RMS",
-                FontId::monospace(13.0),
-                color("#94A3B8"),
-            );
-            let ink = color("#E2E8F0");
-            for branch in &diagram.branches {
-                let stroke = Stroke::new(2.0, ink);
-                let pts = branch.points();
-                for pair in pts.windows(2) {
-                    painter.line_segment([map(pair[0].0, pair[0].1), map(pair[1].0, pair[1].1)], stroke);
-                }
-                let (wx, wy) = branch.winding_at();
-                if branch.transformer {
-                    painter.circle_stroke(map(wx, wy - 10.0), 12.0 * z, Stroke::new(1.5, ink));
-                    painter.circle_stroke(map(wx, wy + 10.0), 12.0 * z, Stroke::new(1.5, ink));
-                }
-                if branch.protector != "none" {
-                    let (dx, dy) = branch.device_at();
-                    let mark = map(dx, dy);
-                    let w = 14.0 * z;
-                    let h = if branch.protector == "switch" { 10.0 * z } else { 14.0 * z };
-                    let box_rect = Rect::from_center_size(mark, Vec2::new(w, h));
-                    painter.rect_stroke(box_rect, 0.0, Stroke::new(1.4, ink), egui::StrokeKind::Inside);
-                }
-                painter.text(
-                    map(wx + 20.0, wy),
-                    Align2::LEFT_CENTER,
-                    branch.name.to_uppercase(),
-                    FontId::monospace(10.0),
-                    color("#94A3B8"),
-                );
+            if branch.protector != "none" {
+                let (dx, dy) = branch.device_at();
+                let h = if branch.protector == "switch" { 10.0 } else { 14.0 };
+                let box_rect = Rect::from_center_size(map(dx, dy), Vec2::new(14.0, h) * z);
+                painter.rect_stroke(box_rect, 0.0, stroke, egui::StrokeKind::Inside);
             }
-            if response.clicked() {
-                self.selected = None;
-                if let Some(pointer) = response.hover_pos() {
-                    for bus in &diagram.buses {
-                        if bus_card(&diagram, bus, origin, z).contains(pointer) {
-                            self.selected = Some(bus.id.clone());
-                        }
-                    }
+            if diagram_detail(z) == DiagramDetail::Full {
+                let label = Rect::from_min_size(map(wx + 20.0, wy - 8.0), Vec2::new(140.0, 18.0) * z);
+                if !diagram.buses.iter().any(|bus| label.intersects(bus_card_at(bus, origin, z))) {
+                    paint_diagram_line(&painter, label, &branch.name.to_uppercase(), 10.0 * z, color("#94A3B8"));
                 }
             }
-            for bus in &diagram.buses {
-                draw_bus(&painter, bus, origin, z, self.selected.as_deref() == Some(&bus.id));
-            }
+        }
+        let hovered = response.hover_pos().and_then(|pointer| {
+            diagram.buses.iter().filter(|bus| bus_hit_rect(bus, origin, z).contains(pointer))
+                .min_by(|a, b| {
+                    let distance = |bus: &sld::BusGlyph| map(bus.x, bus.y).distance_sq(pointer);
+                    distance(a).total_cmp(&distance(b))
+                })
+        });
+        if response.clicked() { self.selected = hovered.map(|bus| bus.id.clone()); }
+        for bus in &diagram.buses {
+            draw_bus(&painter, bus, origin, z, self.selected.as_deref() == Some(&bus.id));
+        }
+        if let Some(bus) = hovered {
+            response.on_hover_ui_at_pointer(|ui| {
+                ui.strong(&bus.name);
+                ui.label(format!("{:.3} kV · 3P {} · LG {}", bus.kv, ka(bus.fault_3p_ka), ka(bus.fault_lg_ka)));
+                for arc in &bus.arcs {
+                    ui.label(format!("{}: {:.2} cal/cm² · AFB {:.1} in · {:.3} s", arc.name, arc.cal_cm2, arc.afb_in, arc.time_s));
+                }
+                for failure in &bus.arc_failures { ui.label(format!("Arc flash FAILED: {failure}")); }
+                ui.weak("Click to inspect this bus.");
+            });
+        }
     }
 
     fn flow(&self, ui: &mut egui::Ui) {
@@ -529,73 +528,105 @@ impl App {
     }
 }
 
-fn draw_bus(painter: &egui::Painter, bus: &sld::BusGlyph, origin: Pos2, z: f32, selected: bool) {
-    let a = origin + Vec2::new((bus.x - 80.0) as f32, bus.y as f32) * z;
-    let b = origin + Vec2::new((bus.x + 80.0) as f32, bus.y as f32) * z;
-    let ink = if selected { color("#00FF66") } else { color("#E2E8F0") };
-    if bus.source {
-        let c = origin + Vec2::new((bus.x - 112.0) as f32, bus.y as f32) * z;
-        painter.circle_stroke(c, 16.0 * z, Stroke::new(1.6, ink));
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiagramDetail { Overview, Compact, Full }
+
+fn diagram_detail(zoom: f32) -> DiagramDetail {
+    if zoom < 0.4 { DiagramDetail::Overview }
+    else if zoom < 0.95 { DiagramDetail::Compact }
+    else { DiagramDetail::Full }
+}
+
+fn zoom_pan(pan: Vec2, anchor: Vec2, old: f32, new: f32) -> Vec2 {
+    anchor - (anchor - pan) * (new / old)
+}
+
+/// The minor grid remains 24–48 screen points apart; alternating lines fade
+/// away before the next coarser level takes over. Iterate only the viewport.
+fn grid_lines(min: f32, max: f32, origin: f32, zoom: f32) -> Vec<(f32, f32)> {
+    if ![min, max, origin, zoom].iter().all(|v| v.is_finite()) || zoom <= 0.0 || max <= min {
+        return Vec::new();
     }
-    if selected {
-        let c = origin + Vec2::new(bus.x as f32, bus.y as f32) * z;
-        painter.circle_stroke(c, 8.0 * z, Stroke::new(2.5, color("#00FF66")));
-        painter.circle_stroke(c, 14.0 * z, Stroke::new(1.5, color("#00FF66")));
+    let base = 40.0 * zoom;
+    let spacing = base * 2.0_f32.powf((24.0 / base).log2().ceil());
+    let first = min + (origin - min).rem_euclid(spacing);
+    let parity = ((first - origin) / spacing).round().rem_euclid(2.0) as usize;
+    let fade = ((spacing - 24.0) / 24.0).clamp(0.0, 1.0);
+    let count = ((max - first) / spacing).floor().max(-1.0) as isize + 1;
+    (0..count).map(|n| (first + n as f32 * spacing, if (n as usize + parity) % 2 == 0 { 1.0 } else { fade })).collect()
+}
+
+fn draw_diagram_grid(painter: &egui::Painter, rect: Rect, origin: Pos2, zoom: f32) {
+    let grid = color("#334155");
+    for (x, alpha) in grid_lines(rect.left(), rect.right(), origin.x, zoom) {
+        let x = painter.round_to_pixel_center(x);
+        painter.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())], Stroke::new(1.0, grid.gamma_multiply(alpha * 0.6)));
     }
-    painter.line_segment([a, b], Stroke::new(4.0 * z.max(0.8), ink));
-    let card = bus_card_at(bus, origin, z);
-    painter.rect_stroke(
-        card,
-        0.0,
-        Stroke::new(if selected { 2.5 } else { 1.5 }, if selected { color("#00FF66") } else { color("#334155") }),
-        egui::StrokeKind::Inside,
-    );
-    let mut y = card.top() + 6.0;
-    let x = card.left() + 8.0;
-    let label = color(if selected { "#00FF66" } else { "#E2E8F0" });
-    let data = color("#94A3B8");
-    painter.text(Pos2::new(x, y), Align2::LEFT_TOP, bus.name.to_uppercase().replace(' ', "_"), FontId::monospace(13.0), label);
-    y += 16.0;
-    if selected {
-        painter.text(Pos2::new(x, y), Align2::LEFT_TOP, ">> FAULT LOCUS", FontId::monospace(12.0), color("#00FF66"));
-        y += 14.0;
-    }
-    let vpu = bus.v_pu.map(|v| format!("{v:.3}")).unwrap_or_else(|| "--".into());
-    let ang = bus.angle_deg.map(|v| format!("{v:.2}")).unwrap_or_else(|| "--".into());
-    painter.text(Pos2::new(x, y), Align2::LEFT_TOP, format!("V: {vpu} PU"), FontId::monospace(11.0), data);
-    y += 14.0;
-    painter.text(Pos2::new(x, y), Align2::LEFT_TOP, format!("ANG: {ang} DEG"), FontId::monospace(11.0), data);
-    y += 14.0;
-    painter.text(Pos2::new(x, y), Align2::LEFT_TOP, format!("I_SC: {}", ka(bus.fault_3p_ka)), FontId::monospace(11.0), data);
-    y += 14.0;
-    painter.text(Pos2::new(x, y), Align2::LEFT_TOP, format!("I_LG: {}", ka(bus.fault_lg_ka)), FontId::monospace(11.0), data);
-    for arc in &bus.arcs {
-        y += 14.0;
-        painter.text(
-            Pos2::new(x, y),
-            Align2::LEFT_TOP,
-            format!("{:.1} CAL/CM2", arc.cal_cm2),
-            FontId::monospace(11.0),
-            color(sld::energy_color(arc.cal_cm2)),
-        );
-        y += 14.0;
-        painter.text(
-            Pos2::new(x, y),
-            Align2::LEFT_TOP,
-            format!("AFB {:.0} IN  {:.3} S{}", arc.afb_in, arc.time_s, if arc.assumed { "  ASSUMED" } else { "" }),
-            FontId::monospace(11.0),
-            data,
-        );
-    }
-    if !bus.arc_failures.is_empty() {
-        y += 18.0;
-        painter.text(Pos2::new(x, y), Align2::LEFT_TOP, "ARC FLASH FAILED", FontId::monospace(11.0), color("#FFB300"));
+    for (y, alpha) in grid_lines(rect.top(), rect.bottom(), origin.y, zoom) {
+        let y = painter.round_to_pixel_center(y);
+        painter.line_segment([Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)], Stroke::new(1.0, grid.gamma_multiply(alpha * 0.6)));
     }
 }
 
-fn bus_card(diagram: &Diagram, bus: &sld::BusGlyph, origin: Pos2, z: f32) -> Rect {
-    let _ = diagram;
-    bus_card_at(bus, origin, z)
+/// Ellipsis and a local clip keep even very long equipment names inside their allotted row.
+fn paint_diagram_line(painter: &egui::Painter, rect: Rect, text: &str, size: f32, ink: Color32) {
+    if rect.width() <= 0.0 || rect.height() <= 0.0 { return; }
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), FontId::monospace(size), ink);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(rect.width());
+    let galley = painter.layout_job(job);
+    painter.with_clip_rect(rect.intersect(painter.clip_rect())).galley(rect.min, galley, ink);
+}
+
+fn draw_bus(painter: &egui::Painter, bus: &sld::BusGlyph, origin: Pos2, z: f32, selected: bool) {
+    let map = |x: f64, y: f64| origin + Vec2::new(x as f32, y as f32) * z;
+    let ink = if selected { color("#00FF66") } else { color("#E2E8F0") };
+    let stroke = Stroke::new((1.6 * z).clamp(0.8, 2.0), ink);
+    if bus.source { painter.circle_stroke(map(bus.x - 112.0, bus.y), 16.0 * z, stroke); }
+    if selected { painter.circle_stroke(map(bus.x, bus.y), (14.0 * z).max(4.0), Stroke::new(1.5, ink)); }
+    painter.line_segment([map(bus.x - 80.0, bus.y), map(bus.x + 80.0, bus.y)], Stroke::new((4.0 * z).clamp(1.0, 6.0), ink));
+    let detail = diagram_detail(z);
+    if detail == DiagramDetail::Overview { return; }
+    let card = bus_card_at(bus, origin, z);
+    if !card.intersects(painter.clip_rect()) { return; }
+    painter.rect_filled(card, 0.0, color("#0A0C10"));
+    painter.rect_stroke(card, 0.0, Stroke::new(if selected { 2.0 } else { 1.0 }, if selected { ink } else { color("#334155") }), egui::StrokeKind::Inside);
+    let padding = 8.0 * z;
+    let mut y = card.top() + 6.0 * z;
+    let width = (card.width() - 2.0 * padding).max(0.0);
+    let title_size = if detail == DiagramDetail::Compact { (13.0 * z).max(11.0) } else { 13.0 * z };
+    let mut line = |text: String, size: f32, color: Color32| {
+        let height = size * 1.25;
+        let row = Rect::from_min_size(Pos2::new(card.left() + padding, y), Vec2::new(width, height));
+        paint_diagram_line(&painter.with_clip_rect(card.shrink(2.0).intersect(painter.clip_rect())), row, &text, size, color);
+        y += height;
+    };
+    line(bus.name.to_uppercase().replace(' ', "_"), title_size, ink);
+    if detail == DiagramDetail::Compact {
+        let summary = if !bus.arc_failures.is_empty() { "ARC FAILED".to_owned() } else { format!("3P {}", ka(bus.fault_3p_ka)) };
+        line(summary, 10.0, if bus.arc_failures.is_empty() { color("#94A3B8") } else { color("#FFB300") });
+        return;
+    }
+    let data = color("#94A3B8");
+    let size = 11.0 * z;
+    // Selection is conveyed by the border, without inserting a row into the card.
+    let vpu = bus.v_pu.map(|v| format!("{v:.3}")).unwrap_or_else(|| "--".into());
+    let ang = bus.angle_deg.map(|v| format!("{v:.2}")).unwrap_or_else(|| "--".into());
+    line(format!("V: {vpu} PU"), size, data);
+    line(format!("ANG: {ang} DEG"), size, data);
+    line(format!("I_SC: {}", ka(bus.fault_3p_ka)), size, data);
+    line(format!("I_LG: {}", ka(bus.fault_lg_ka)), size, data);
+    for arc in &bus.arcs {
+        line(format!("{:.1} CAL/CM2", arc.cal_cm2), size, color(sld::energy_color(arc.cal_cm2)));
+        line(format!("AFB {:.0} IN  {:.3} S{}", arc.afb_in, arc.time_s, if arc.assumed { " ASSUMED" } else { "" }), size, data);
+    }
+    if !bus.arc_failures.is_empty() { line("ARC FLASH FAILED".into(), size, color("#FFB300")); }
+}
+
+fn bus_hit_rect(bus: &sld::BusGlyph, origin: Pos2, z: f32) -> Rect {
+    let center = origin + Vec2::new(bus.x as f32, bus.y as f32) * z;
+    let symbol = Rect::from_center_size(center, Vec2::new((160.0 * z).max(10.0), (24.0 * z).max(10.0)));
+    if diagram_detail(z) == DiagramDetail::Overview { symbol }
+    else { symbol.union(bus_card_at(bus, origin, z)) }
 }
 
 fn bus_card_at(bus: &sld::BusGlyph, origin: Pos2, z: f32) -> Rect {
@@ -715,5 +746,80 @@ fn write_status(path: &std::path::Path, text: &str) -> String {
     match std::fs::write(path, text) {
         Ok(()) => format!("Wrote {}", path.display()),
         Err(err) => err.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use super::*;
+
+    #[test]
+    fn grid_is_viewport_bounded_and_covers_both_sides_of_the_origin() {
+        for zoom in [0.05, 0.1, 0.399, 0.4, 0.6, 0.95, 1.0, 4.0, 8.0] {
+            for origin in [-1_000_000.0, -333.0, 500.0, 1_000_000.0] {
+                let lines = grid_lines(100.0, 1100.0, origin, zoom);
+                assert!(lines.len() <= 43 && lines.len() >= 20);
+                assert!(lines.first().unwrap().0 < 148.01);
+                assert!(lines.last().unwrap().0 > 1051.99);
+                assert!(lines.iter().all(|(x, alpha)| *x >= 100.0 && *x <= 1100.0 && (0.0..=1.0).contains(alpha)));
+                for pair in lines.windows(2) {
+                    assert!((24.0-0.01..=48.0+0.01).contains(&(pair[1].0-pair[0].0)));
+                }
+            }
+        }
+        assert!(grid_lines(0.0, 100.0, f32::INFINITY, 1.0).is_empty());
+    }
+
+    #[test]
+    fn pinch_keeps_the_diagram_point_under_the_pointer() {
+        let pan = Vec2::new(-400.0, 137.0);
+        let pointer = Vec2::new(522.0, 241.0);
+        for new in [0.05, 0.4, 0.95, 2.0, 8.0] {
+            let result = zoom_pan(pan, pointer, 1.3, new);
+            let before = (pointer - pan) / 1.3;
+            let after = (pointer - result) / new;
+            assert!((before-after).length() < 0.002);
+        }
+    }
+
+    #[test]
+    fn painted_bus_labels_do_not_overlap_or_escape_cards_at_any_zoom() {
+        let project = Project::sample();
+        let results = study::run(&project, Studies::all()).unwrap();
+        let mut bus = sld::diagram(&project, &results).buses[1].clone();
+        bus.x = 0.0; bus.y = 30.0;
+        bus.name = "A very long equipment name that must be truncated inside the card".into();
+        let arc = bus.arcs[0].clone();
+        bus.arcs = vec![arc; 4];
+        bus.arc_failures = vec!["missing data".into()];
+        bus.card_h = 112.0 + 4.0*30.0 + 20.0;
+        for z in [0.05, 0.2, 0.399, 0.4, 0.65, 0.949, 0.95, 1.0, 2.0, 8.0] {
+            for selected in [false, true] {
+                let ctx = egui::Context::default();
+                let origin = Pos2::new(150.0, 100.0);
+                let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::splat(5000.0));
+                let input = egui::RawInput { screen_rect: Some(viewport), ..Default::default() };
+                let mut output = ctx.run_ui(input, |ui| draw_bus(ui.painter(), &bus, origin, z, selected));
+                // This headless geometry test intentionally does not upload font textures.
+                output.textures_delta.clear();
+                let mut rows = Vec::new();
+                for clipped in &output.shapes {
+                    if let egui::epaint::Shape::Text(text) = &clipped.shape {
+                        let visible = text.visual_bounding_rect().intersect(clipped.clip_rect);
+                        assert!(bus_card_at(&bus, origin, z).contains_rect(visible), "text escapes at zoom {z}");
+                        assert!(text.galley.rows.len() <= 1, "text wraps at zoom {z}");
+                        if visible.is_positive() { rows.push(visible); }
+                    }
+                }
+                if z < 0.4 { assert!(rows.is_empty()); }
+                else {
+                    assert!(!rows.is_empty());
+                    if z < 0.95 { assert_eq!(rows.len(), 2); }
+                    for pair in rows.windows(2) {
+                        assert!(pair[0].bottom() <= pair[1].top(), "overlapping labels at zoom {z}: {pair:?}");
+                    }
+                }
+            }
+        }
     }
 }
