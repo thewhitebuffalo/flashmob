@@ -48,19 +48,17 @@ pub struct BranchGlyph {
     pub protector: String,
 }
 
-const COL: f64 = 320.0;
-const ROW: f64 = 250.0;
+const PITCH_X: f64 = 420.0;
 
 pub fn diagram(project: &Project, study: &StudyOutput) -> Diagram {
-    let layers = layers(project);
+    let placed = place_by_voltage(project, study);
     let mut buses = Vec::new();
-    let mut max_x: f64 = 240.0;
+    let mut max_x: f64 = 480.0;
     let mut max_y: f64 = 180.0;
-    for (col, layer) in layers.iter().enumerate() {
-        for (row, &idx) in layer.iter().enumerate() {
-            let bus = &project.buses[idx];
-            let x = 180.0 + col as f64 * COL;
-            let y = 150.0 + row as f64 * ROW;
+    for idx in 0..project.buses.len() {
+        let bus = &project.buses[idx];
+        let (x, y) = placed[idx];
+        {
             let arcs = study
                 .arc_flash
                 .as_ref()
@@ -72,8 +70,8 @@ pub fn diagram(project: &Project, study: &StudyOutput) -> Diagram {
             let v_pu = flow.map(|b| b.v_pu);
             let angle_deg = flow.map(|b| b.angle_deg);
             let source = project.sources.iter().any(|s| s.bus == bus.id);
-            max_x = max_x.max(x + 180.0);
-            max_y = max_y.max(y + card_h + 40.0);
+            max_x = max_x.max(x + 320.0);
+            max_y = max_y.max(y + card_h + 24.0);
             buses.push(BusGlyph {
                 id: bus.id.clone(),
                 name: if bus.name.is_empty() { bus.id.clone() } else { bus.name.clone() },
@@ -99,9 +97,9 @@ pub fn diagram(project: &Project, study: &StudyOutput) -> Diagram {
         branches.push(BranchGlyph {
             id: branch.id.clone(),
             name: branch.name.clone(),
-            x1: a.x + 70.0,
+            x1: a.x,
             y1: a.y,
-            x2: b.x - 70.0,
+            x2: b.x,
             y2: b.y,
             transformer,
             protector,
@@ -129,53 +127,111 @@ fn notes_for(rows: &[ArcRow], bus: &str) -> Vec<ArcNote> {
         .collect()
 }
 
-fn layers(project: &Project) -> Vec<Vec<usize>> {
+/// Highest nominal voltage on the top row, lowest on the bottom.
+/// Buses on one voltage share a row and sit under the bus that feeds them.
+fn place_by_voltage(project: &Project, study: &StudyOutput) -> Vec<(f64, f64)> {
     let n = project.buses.len();
+    let mut at = vec![(260.0, 100.0); n];
     if n == 0 {
-        return Vec::new();
+        return at;
     }
+    let mut rows: Vec<(i64, Vec<usize>)> = Vec::new();
+    for (i, bus) in project.buses.iter().enumerate() {
+        let key = (bus.kv * 1000.0).round() as i64;
+        if let Some(row) = rows.iter_mut().find(|(k, _)| *k == key) {
+            row.1.push(i);
+        } else {
+            rows.push((key, vec![i]));
+        }
+    }
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut upstream = vec![None; n];
     let mut index = std::collections::HashMap::new();
     for (i, bus) in project.buses.iter().enumerate() {
         index.insert(bus.id.as_str(), i);
     }
-    let mut adj = vec![Vec::new(); n];
     for branch in &project.branches {
-        if let (Some(&a), Some(&b)) = (index.get(branch.from.as_str()), index.get(branch.to.as_str())) {
-            adj[a].push(b);
-            adj[b].push(a);
-        }
-    }
-    let root = project
-        .sources
-        .iter()
-        .find(|s| s.is_slack)
-        .and_then(|s| index.get(s.bus.as_str()).copied())
-        .unwrap_or(0);
-    let mut depth = vec![None; n];
-    let mut queue = std::collections::VecDeque::from([root]);
-    depth[root] = Some(0);
-    while let Some(i) = queue.pop_front() {
-        let d = depth[i].unwrap();
-        for &j in &adj[i] {
-            if depth[j].is_none() {
-                depth[j] = Some(d + 1);
-                queue.push_back(j);
+        if let (Some(&from), Some(&to)) = (index.get(branch.from.as_str()), index.get(branch.to.as_str())) {
+            if project.buses[from].kv + 1e-6 >= project.buses[to].kv {
+                upstream[to] = Some(from);
             }
         }
     }
-    let max_d = depth.iter().filter_map(|d| *d).max().unwrap_or(0);
-    let mut layers = vec![Vec::new(); max_d + 1];
-    let mut orphans = Vec::new();
-    for i in 0..n {
-        match depth[i] {
-            Some(d) => layers[d].push(i),
-            None => orphans.push(i),
+    let mut y = 100.0;
+    for (_, members) in &rows {
+        let mut order = members.clone();
+        order.sort_by(|&a, &b| {
+            let ax = upstream[a].map(|u| at[u].0).unwrap_or(0.0);
+            let bx = upstream[b].map(|u| at[u].0).unwrap_or(0.0);
+            ax.partial_cmp(&bx).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b))
+        });
+        let mut raw = Vec::with_capacity(order.len());
+        let mut cursor = 0;
+        while cursor < order.len() {
+            let parent = upstream[order[cursor]];
+            let mut end = cursor + 1;
+            while end < order.len() && upstream[order[end]] == parent {
+                end += 1;
+            }
+            let count = (end - cursor) as f64;
+            let center = parent.map(|p| at[p].0).unwrap_or(260.0 + (cursor as f64) * PITCH_X);
+            let start = center - (count - 1.0) * PITCH_X / 2.0;
+            for k in 0..(end - cursor) {
+                raw.push(start + k as f64 * PITCH_X);
+            }
+            cursor = end;
+        }
+        for i in 1..raw.len() {
+            if raw[i] < raw[i - 1] + PITCH_X {
+                raw[i] = raw[i - 1] + PITCH_X;
+            }
+        }
+        let shift = if raw.first().copied().unwrap_or(260.0) < 260.0 {
+            260.0 - raw[0]
+        } else {
+            0.0
+        };
+        let mut row_card: f64 = 80.0;
+        for (k, &idx) in order.iter().enumerate() {
+            let arcs = study.arc_flash.as_ref().map(|rows| rows.iter().filter(|r| r.bus_id == project.buses[idx].id).count()).unwrap_or(0);
+            row_card = row_card.max(112.0 + arcs as f64 * 30.0);
+            at[idx] = (raw[k] + shift, y);
+        }
+        y += row_card + 80.0;
+    }
+    at
+}
+
+impl BranchGlyph {
+    /// Orthogonal feeder, dropping from the upper bus toward the lower one.
+    pub fn points(&self) -> Vec<(f64, f64)> {
+        if (self.y1 - self.y2).abs() < 2.0 {
+            let bridge = self.y1 - 36.0;
+            vec![(self.x1, self.y1), (self.x1, bridge), (self.x2, bridge), (self.x2, self.y2)]
+        } else {
+            let mid_y = (self.y1 + self.y2) / 2.0;
+            vec![(self.x1, self.y1), (self.x1, mid_y), (self.x2, mid_y), (self.x2, self.y2)]
         }
     }
-    if !orphans.is_empty() {
-        layers.push(orphans);
+
+    pub fn device_at(&self) -> (f64, f64) {
+        if (self.y1 - self.y2).abs() < 2.0 {
+            ((self.x1 + self.x2) / 2.0, self.y1 - 36.0)
+        } else if self.y2 >= self.y1 {
+            (self.x1, self.y1 + 26.0)
+        } else {
+            (self.x1, self.y1 - 26.0)
+        }
     }
-    layers
+
+    pub fn winding_at(&self) -> (f64, f64) {
+        if (self.y1 - self.y2).abs() < 2.0 {
+            ((self.x1 + self.x2) / 2.0, self.y1 - 28.0)
+        } else {
+            let mid_y = (self.y1 + self.y2) / 2.0;
+            (self.x1, (self.y1 + mid_y) / 2.0)
+        }
+    }
 }
 
 pub fn to_svg(diagram: &Diagram) -> String {
@@ -210,29 +266,24 @@ pub fn to_svg(diagram: &Diagram) -> String {
         title = esc(&diagram.title.to_uppercase()),
     );
     for branch in &diagram.branches {
-        let mid_x = (branch.x1 + branch.x2) / 2.0;
-        let mid_y = (branch.y1 + branch.y2) / 2.0;
-        s.push_str(&format!(
-            r##"<polyline class="fm-branch-line" points="{x1:.1},{y1:.1} {mx:.1},{y1:.1} {mx:.1},{y2:.1} {x2:.1},{y2:.1}"/>"##,
-            x1 = branch.x1,
-            y1 = branch.y1,
-            mx = mid_x,
-            y2 = branch.y2,
-            x2 = branch.x2,
-        ));
+        let pts = branch.points();
+        let coords: Vec<String> = pts.iter().map(|(x, y)| format!("{x:.1},{y:.1}")).collect();
+        s.push_str(&format!(r##"<polyline class="fm-branch-line" points="{}"/>"##, coords.join(" ")));
+        let (dx, dy) = branch.device_at();
         if branch.protector == "breaker" {
-            s.push_str(&breaker_symbol(branch.x1 + 18.0, branch.y1));
+            s.push_str(&breaker_symbol(dx, dy));
         } else if branch.protector == "switch" {
-            s.push_str(&switch_symbol(branch.x1 + 18.0, branch.y1));
+            s.push_str(&switch_symbol(dx, dy));
         }
+        let (wx, wy) = branch.winding_at();
         if branch.transformer {
-            s.push_str(&transformer_symbol(mid_x, mid_y));
+            s.push_str(&transformer_symbol(wx, wy));
         }
         let label = short_label(&branch.name);
         s.push_str(&format!(
-            r##"<text x="{x:.1}" y="{y:.1}" text-anchor="middle" class="fm-text-dat">{name}</text>"##,
-            x = mid_x + 14.0,
-            y = mid_y,
+            r##"<text x="{x:.1}" y="{y:.1}" class="fm-text-dat">{name}</text>"##,
+            x = wx + 20.0,
+            y = wy,
             name = esc(&label.to_uppercase()),
         ));
     }
@@ -342,11 +393,11 @@ fn bus_svg(bus: &BusGlyph, focal: bool) -> String {
     let y = bus.y;
     let mut body = String::new();
     if bus.source {
-        body.push_str(&utility_symbol(x - 96.0, y));
+        body.push_str(&utility_symbol(x - 112.0, y));
         body.push_str(&format!(
             r##"<line x1="{x1:.1}" y1="{y:.1}" x2="{x2:.1}" y2="{y:.1}" class="fm-branch-line"/>"##,
-            x1 = x - 80.0,
-            x2 = x - 70.0,
+            x1 = x - 96.0,
+            x2 = x - 80.0,
         ));
     }
     if focal {
@@ -356,14 +407,14 @@ fn bus_svg(bus: &BusGlyph, focal: bool) -> String {
     }
     body.push_str(&format!(
         r##"<line x1="{x1:.1}" y1="{y:.1}" x2="{x2:.1}" y2="{y:.1}" class="fm-bus-bar"/>"##,
-        x1 = x - 70.0,
-        x2 = x + 70.0,
+        x1 = x - 80.0,
+        x2 = x + 80.0,
     ));
-    let top = y + 18.0;
-    let left = x - 84.0;
+    let top = y - 16.0;
+    let left = x + 96.0;
     let box_class = if focal { "fm-focal-node" } else { "fm-border" };
     body.push_str(&format!(
-        r##"<rect x="{left:.1}" y="{top:.1}" width="188" height="{h:.1}" class="{box_class}"/>"##,
+        r##"<rect x="{left:.1}" y="{top:.1}" width="210" height="{h:.1}" class="{box_class}"/>"##,
         h = bus.card_h,
     ));
     let mut ty = top + 16.0;
@@ -460,5 +511,10 @@ mod tests {
         assert!(svg.contains("data-symbol=\"transformer\""));
         assert!(svg.contains("data-symbol=\"breaker\""));
         assert!(svg.contains("data-symbol=\"utility\""));
+        let drawing = diagram(&project, &study);
+        let util = drawing.buses.iter().find(|b| b.id == "util").unwrap();
+        let mcc = drawing.buses.iter().find(|b| b.id == "mcc").unwrap();
+        assert!(util.kv > mcc.kv);
+        assert!(util.y < mcc.y, "utility y {} should be above mcc y {}", util.y, mcc.y);
     }
 }

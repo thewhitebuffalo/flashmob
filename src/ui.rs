@@ -179,29 +179,26 @@ impl App {
             );
             let ink = color("#E2E8F0");
             for branch in &diagram.branches {
-                let x1 = branch.x1;
-                let y1 = branch.y1;
-                let x2 = branch.x2;
-                let y2 = branch.y2;
-                let mx = (x1 + x2) / 2.0;
-                let my = (y1 + y2) / 2.0;
                 let stroke = Stroke::new(2.0, ink);
-                painter.line_segment([map(x1, y1), map(mx, y1)], stroke);
-                painter.line_segment([map(mx, y1), map(mx, y2)], stroke);
-                painter.line_segment([map(mx, y2), map(x2, y2)], stroke);
+                let pts = branch.points();
+                for pair in pts.windows(2) {
+                    painter.line_segment([map(pair[0].0, pair[0].1), map(pair[1].0, pair[1].1)], stroke);
+                }
+                let (wx, wy) = branch.winding_at();
                 if branch.transformer {
-                    painter.circle_stroke(map(mx, my - 10.0), 12.0 * z, Stroke::new(1.5, ink));
-                    painter.circle_stroke(map(mx, my + 10.0), 12.0 * z, Stroke::new(1.5, ink));
+                    painter.circle_stroke(map(wx, wy - 10.0), 12.0 * z, Stroke::new(1.5, ink));
+                    painter.circle_stroke(map(wx, wy + 10.0), 12.0 * z, Stroke::new(1.5, ink));
                 }
                 if branch.protector != "none" {
-                    let mark = map(x1 + 18.0, y1);
+                    let (dx, dy) = branch.device_at();
+                    let mark = map(dx, dy);
                     let w = 14.0 * z;
                     let h = if branch.protector == "switch" { 10.0 * z } else { 14.0 * z };
                     let box_rect = Rect::from_center_size(mark, Vec2::new(w, h));
                     painter.rect_stroke(box_rect, 0.0, Stroke::new(1.4, ink), egui::StrokeKind::Inside);
                 }
                 painter.text(
-                    map(mx + 14.0, my),
+                    map(wx + 20.0, wy),
                     Align2::LEFT_CENTER,
                     branch.name.to_uppercase(),
                     FontId::monospace(10.0),
@@ -437,11 +434,11 @@ impl App {
 }
 
 fn draw_bus(painter: &egui::Painter, bus: &sld::BusGlyph, origin: Pos2, z: f32, selected: bool) {
-    let a = origin + Vec2::new((bus.x - 70.0) as f32, bus.y as f32) * z;
-    let b = origin + Vec2::new((bus.x + 70.0) as f32, bus.y as f32) * z;
+    let a = origin + Vec2::new((bus.x - 80.0) as f32, bus.y as f32) * z;
+    let b = origin + Vec2::new((bus.x + 80.0) as f32, bus.y as f32) * z;
     let ink = if selected { color("#00FF66") } else { color("#E2E8F0") };
     if bus.source {
-        let c = origin + Vec2::new((bus.x - 96.0) as f32, bus.y as f32) * z;
+        let c = origin + Vec2::new((bus.x - 112.0) as f32, bus.y as f32) * z;
         painter.circle_stroke(c, 16.0 * z, Stroke::new(1.6, ink));
     }
     if selected {
@@ -457,7 +454,7 @@ fn draw_bus(painter: &egui::Painter, bus: &sld::BusGlyph, origin: Pos2, z: f32, 
         Stroke::new(if selected { 2.5 } else { 1.5 }, if selected { color("#00FF66") } else { color("#334155") }),
         egui::StrokeKind::Inside,
     );
-    let mut y = card.top() + 4.0;
+    let mut y = card.top() + 6.0;
     let x = card.left() + 8.0;
     let label = color(if selected { "#00FF66" } else { "#E2E8F0" });
     let data = color("#94A3B8");
@@ -502,8 +499,8 @@ fn bus_card(diagram: &Diagram, bus: &sld::BusGlyph, origin: Pos2, z: f32) -> Rec
 }
 
 fn bus_card_at(bus: &sld::BusGlyph, origin: Pos2, z: f32) -> Rect {
-    let top = origin + Vec2::new((bus.x - 84.0) as f32, (bus.y + 16.0) as f32) * z;
-    Rect::from_min_size(top, Vec2::new(168.0, bus.card_h as f32) * z)
+    let top = origin + Vec2::new((bus.x + 96.0) as f32, (bus.y - 16.0) as f32) * z;
+    Rect::from_min_size(top, Vec2::new(210.0, bus.card_h as f32) * z)
 }
 
 fn draw_tcc(ui: &egui::Ui, rect: Rect, plot: &TccPlot) {
