@@ -231,7 +231,11 @@ impl App {
             }
             self.zoom = new;
         }
-        egui::ScrollArea::both().id_salt("sld_scroll").show(ui, |ui| {
+        ui.painter().rect_filled(view, 0.0, color("#0A0C10"));
+        egui::ScrollArea::both()
+            .id_salt("sld_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
             let size = Vec2::new(diagram.width as f32 * self.zoom, diagram.height as f32 * self.zoom);
             let (rect, response) = ui.allocate_exact_size(size, Sense::click());
             let painter = ui.painter_at(rect);
