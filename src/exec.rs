@@ -1,0 +1,529 @@
+use serde::{Deserialize, Serialize};
+
+use crate::model::{ArcEquipment, Branch, BranchKind, Bus, CurveSpec, Device, Electrode, Load, Motor, Project, Source, XfmrConn};
+use crate::sld::{self, Diagram};
+use crate::study::{self, Studies, StudyOutput};
+use crate::tcc::{self, TccPlot};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecRequest {
+    #[serde(default)]
+    pub project: Option<Project>,
+    pub commands: Vec<Command>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Command {
+    Sample,
+    Replace { project: Project },
+    AddBus {
+        id: String,
+        #[serde(default)] name: String,
+        kv: f64,
+        #[serde(default)] shunt_kvar: f64,
+        #[serde(default)] bracing_ka: Option<f64>,
+        #[serde(default)] main_rating_a: Option<f64>,
+    },
+    AddAssumption { id: String, statement: String },
+    SetOptions {
+        #[serde(default)] name: Option<String>,
+        #[serde(default)] s_base_mva: Option<f64>,
+        #[serde(default)] arc_duration_cap_s: Option<f64>,
+        #[serde(default)] prefault: Option<crate::model::Prefault>,
+    },
+    AddLine {
+        id: String,
+        #[serde(default)] name: String,
+        from: String,
+        to: String,
+        r_ohm: f64,
+        x_ohm: f64,
+        #[serde(default)] b_siemens: f64,
+        #[serde(default)] r0_ohm: f64,
+        #[serde(default)] x0_ohm: f64,
+        #[serde(default)] ampacity_a: Option<f64>,
+    },
+    AddTransformer {
+        id: String,
+        #[serde(default)] name: String,
+        from: String,
+        to: String,
+        kva: f64,
+        z_percent: f64,
+        xr: f64,
+        hv_kv: f64,
+        lv_kv: f64,
+        connection: XfmrConn,
+        #[serde(default)] tap_percent: f64,
+        #[serde(default = "one")] x0_over_x1: f64,
+    },
+    AddLoad { id: String, #[serde(default)] name: String, bus: String, kw: f64, kvar: f64, #[serde(default)] basis: String },
+    AddSource {
+        id: String,
+        #[serde(default)] name: String,
+        bus: String,
+        #[serde(default = "one")] v_pu: f64,
+        #[serde(default)] angle_deg: f64,
+        mva_sc: f64,
+        xr: f64,
+        #[serde(default = "one")] x0_over_x1: f64,
+        #[serde(default = "one")] r0_over_r1: f64,
+        #[serde(default)] is_slack: bool,
+        #[serde(default)] p_mw: f64,
+    },
+    AddMotor {
+        id: String,
+        #[serde(default)] name: String,
+        bus: String,
+        hp: f64,
+        kv: f64,
+        #[serde(default = "default_pf")] pf: f64,
+        #[serde(default = "default_eff")] efficiency: f64,
+        #[serde(default = "default_xd")] x_subtransient_pu: f64,
+        #[serde(default = "default_xr")] xr: f64,
+    },
+    AddDevice { id: String, #[serde(default)] name: String, bus: String, curve: CurveSpec, #[serde(default)] basis: String },
+    AddEquipment {
+        id: String,
+        #[serde(default)] name: String,
+        bus: String,
+        electrode: Electrode,
+        gap_mm: f64,
+        distance_mm: f64,
+        height_mm: f64,
+        width_mm: f64,
+        depth_mm: f64,
+        #[serde(default)] upstream_device: Option<String>,
+        #[serde(default)] clearing_s: Option<f64>,
+        #[serde(default)] basis: String,
+    },
+    Remove { id: String },
+    SetBus {
+        id: String,
+        #[serde(default)] name: Option<String>,
+        #[serde(default)] kv: Option<f64>,
+        #[serde(default)] shunt_kvar: Option<f64>,
+        #[serde(default)] bracing_ka: Option<f64>,
+        #[serde(default)] main_rating_a: Option<f64>,
+    },
+    SetSource {
+        id: String,
+        #[serde(default)] mva_sc: Option<f64>,
+        #[serde(default)] xr: Option<f64>,
+        #[serde(default)] v_pu: Option<f64>,
+        #[serde(default)] x0_over_x1: Option<f64>,
+        #[serde(default)] is_slack: Option<bool>,
+    },
+    Run { #[serde(default)] studies: Vec<String> },
+    Sld,
+    Tcc { #[serde(default)] ref_kv: Option<f64>, #[serde(default)] devices: Vec<String> },
+    /// Write the SKM Data Exchange folder. `output` is a directory, or an `.xml` path.
+    ExportSkm { #[serde(default)] output: Option<String> },
+}
+
+fn one() -> f64 { 1.0 }
+fn default_pf() -> f64 { 0.85 }
+fn default_eff() -> f64 { 0.94 }
+fn default_xd() -> f64 { 0.17 }
+fn default_xr() -> f64 { 6.0 }
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ExecResponse {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub warnings: Vec<String>,
+    pub project: Project,
+    pub results: Option<StudyOutput>,
+    pub sld_svg: Option<String>,
+    pub tcc_svg: Option<String>,
+    pub tcc_csv: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skm: Option<crate::skm::SkmExport>,
+}
+
+pub fn exec_request(json: &str) -> ExecResponse {
+    let request: ExecRequest = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(err) => {
+            return ExecResponse {
+                ok: false,
+                error: Some(format!("could not read the request: {err}")),
+                warnings: Vec::new(),
+                project: Project::default(),
+                results: None,
+                sld_svg: None,
+                tcc_svg: None,
+                tcc_csv: None,
+                skm: None,
+            };
+        }
+    };
+    apply(request.project.unwrap_or_default(), &request.commands)
+}
+
+pub fn apply(mut project: Project, commands: &[Command]) -> ExecResponse {
+    let mut results = None;
+    let mut sld_svg = None;
+    let mut tcc_svg = None;
+    let mut tcc_csv = None;
+    let mut skm = None;
+    for (n, command) in commands.iter().enumerate() {
+        let step = apply_one(&mut project, command, &mut results, &mut sld_svg, &mut tcc_svg, &mut tcc_csv, &mut skm);
+        if let Err(err) = step {
+            return ExecResponse {
+                ok: false,
+                error: Some(format!("command {n} ({}) : {err}", op_name(command))),
+                warnings: Vec::new(),
+                project,
+                results,
+                sld_svg,
+                tcc_svg,
+                tcc_csv,
+                skm,
+            };
+        }
+    }
+    let warnings = results.as_ref().map(|r| r.warnings.clone()).unwrap_or_default();
+    ExecResponse { ok: true, error: None, warnings, project, results, sld_svg, tcc_svg, tcc_csv, skm }
+}
+
+fn apply_one(
+    project: &mut Project,
+    command: &Command,
+    results: &mut Option<StudyOutput>,
+    sld_svg: &mut Option<String>,
+    tcc_svg: &mut Option<String>,
+    tcc_csv: &mut Option<String>,
+    skm: &mut Option<crate::skm::SkmExport>,
+) -> Result<(), String> {
+    match command {
+        Command::Sample => *project = Project::sample(),
+        Command::Replace { project: next } => *project = next.clone(),
+        Command::AddBus { id, name, kv, shunt_kvar, bracing_ka, main_rating_a } => {
+            fresh(id, project)?;
+            project.buses.push(Bus {
+                id: id.clone(),
+                name: named(name, id),
+                kv: *kv,
+                shunt_kvar: *shunt_kvar,
+                bracing_ka: *bracing_ka,
+                main_rating_a: *main_rating_a,
+            });
+        }
+        Command::AddAssumption { id, statement } => {
+            fresh(id, project)?;
+            project.assumptions.push(crate::model::Assumption { id: id.clone(), statement: statement.clone() });
+        }
+        Command::SetOptions { name, s_base_mva, arc_duration_cap_s, prefault } => {
+            if let Some(name) = name {
+                project.name = name.clone();
+            }
+            if let Some(base) = s_base_mva {
+                project.s_base_mva = *base;
+            }
+            if let Some(cap) = arc_duration_cap_s {
+                project.arc_duration_cap_s = *cap;
+            }
+            if let Some(prefault) = prefault {
+                project.prefault = *prefault;
+            }
+        }
+        Command::AddLine { id, name, from, to, r_ohm, x_ohm, b_siemens, r0_ohm, x0_ohm, ampacity_a } => {
+            fresh(id, project)?;
+            project.branches.push(Branch {
+                id: id.clone(),
+                name: named(name, id),
+                from: from.clone(),
+                to: to.clone(),
+                kind: BranchKind::Line {
+                    r_ohm: *r_ohm,
+                    x_ohm: *x_ohm,
+                    b_siemens: *b_siemens,
+                    r0_ohm: *r0_ohm,
+                    x0_ohm: *x0_ohm,
+                    ampacity_a: *ampacity_a,
+                },
+            });
+        }
+        Command::AddTransformer { id, name, from, to, kva, z_percent, xr, hv_kv, lv_kv, connection, tap_percent, x0_over_x1 } => {
+            fresh(id, project)?;
+            project.branches.push(Branch {
+                id: id.clone(),
+                name: named(name, id),
+                from: from.clone(),
+                to: to.clone(),
+                kind: BranchKind::Transformer {
+                    kva: *kva,
+                    z_percent: *z_percent,
+                    xr: *xr,
+                    hv_kv: *hv_kv,
+                    lv_kv: *lv_kv,
+                    connection: *connection,
+                    tap_percent: *tap_percent,
+                    x0_over_x1: *x0_over_x1,
+                },
+            });
+        }
+        Command::AddLoad { id, name, bus, kw, kvar, basis } => {
+            fresh(id, project)?;
+            project.loads.push(Load { id: id.clone(), name: named(name, id), bus: bus.clone(), kw: *kw, kvar: *kvar, basis: basis.clone() });
+        }
+        Command::AddSource { id, name, bus, v_pu, angle_deg, mva_sc, xr, x0_over_x1, r0_over_r1, is_slack, p_mw } => {
+            fresh(id, project)?;
+            project.sources.push(Source {
+                id: id.clone(),
+                name: named(name, id),
+                bus: bus.clone(),
+                v_pu: *v_pu,
+                angle_deg: *angle_deg,
+                mva_sc: *mva_sc,
+                xr: *xr,
+                x0_over_x1: *x0_over_x1,
+                r0_over_r1: *r0_over_r1,
+                is_slack: *is_slack,
+                p_mw: *p_mw,
+                qmin_mvar: None,
+                qmax_mvar: None,
+            });
+        }
+        Command::AddMotor { id, name, bus, hp, kv, pf, efficiency, x_subtransient_pu, xr } => {
+            fresh(id, project)?;
+            project.motors.push(Motor {
+                id: id.clone(),
+                name: named(name, id),
+                bus: bus.clone(),
+                hp: *hp,
+                kv: *kv,
+                pf: *pf,
+                efficiency: *efficiency,
+                x_subtransient_pu: *x_subtransient_pu,
+                xr: *xr,
+            });
+        }
+        Command::AddDevice { id, name, bus, curve, basis } => {
+            fresh(id, project)?;
+            project.devices.push(Device { id: id.clone(), name: named(name, id), bus: bus.clone(), curve: curve.clone(), basis: basis.clone() });
+        }
+        Command::AddEquipment { id, name, bus, electrode, gap_mm, distance_mm, height_mm, width_mm, depth_mm, upstream_device, clearing_s, basis } => {
+            fresh(id, project)?;
+            project.equipment.push(ArcEquipment {
+                id: id.clone(),
+                name: named(name, id),
+                bus: bus.clone(),
+                electrode: *electrode,
+                gap_mm: *gap_mm,
+                distance_mm: *distance_mm,
+                height_mm: *height_mm,
+                width_mm: *width_mm,
+                depth_mm: *depth_mm,
+                upstream_device: upstream_device.clone(),
+                clearing_s: *clearing_s,
+                basis: basis.clone(),
+            });
+        }
+        Command::Remove { id } => remove(project, id)?,
+        Command::SetBus { id, name, kv, shunt_kvar, bracing_ka, main_rating_a } => {
+            let bus = project.buses.iter_mut().find(|b| b.id == *id).ok_or_else(|| format!("no bus '{id}'"))?;
+            if let Some(name) = name { bus.name = name.clone(); }
+            if let Some(kv) = kv { bus.kv = *kv; }
+            if let Some(q) = shunt_kvar { bus.shunt_kvar = *q; }
+            if let Some(ka) = bracing_ka { bus.bracing_ka = Some(*ka); }
+            if let Some(amps) = main_rating_a { bus.main_rating_a = Some(*amps); }
+        }
+        Command::SetSource { id, mva_sc, xr, v_pu, x0_over_x1, is_slack } => {
+            let source = project.sources.iter_mut().find(|s| s.id == *id).ok_or_else(|| format!("no source '{id}'"))?;
+            if let Some(v) = mva_sc { source.mva_sc = *v; }
+            if let Some(v) = xr { source.xr = *v; }
+            if let Some(v) = v_pu { source.v_pu = *v; }
+            if let Some(v) = x0_over_x1 { source.x0_over_x1 = *v; }
+            if let Some(v) = is_slack { source.is_slack = *v; }
+        }
+        Command::Run { studies } => {
+            let which = Studies::parse(studies)?;
+            *results = Some(study::run(project, which)?);
+        }
+        Command::Sld => {
+            let study = ensure_study(project, results)?;
+            *sld_svg = Some(sld::to_svg(&sld::diagram(project, study)));
+        }
+        Command::Tcc { ref_kv, devices } => {
+            let study = ensure_study(project, results)?;
+            let drawn = tcc::plot(project, Some(study), *ref_kv, devices)?;
+            *tcc_svg = Some(tcc::to_svg(&drawn));
+            *tcc_csv = Some(tcc::to_csv(&drawn));
+        }
+        Command::ExportSkm { output } => {
+            let exported = crate::skm::export(project);
+            if let Some(path) = output {
+                crate::skm::write_dir(project, std::path::Path::new(path))?;
+            }
+            *skm = Some(exported);
+        }
+    }
+    Ok(())
+}
+
+fn ensure_study<'a>(project: &Project, results: &'a mut Option<StudyOutput>) -> Result<&'a StudyOutput, String> {
+    if results.is_none() {
+        *results = Some(study::run(project, Studies::all())?);
+    }
+    Ok(results.as_ref().unwrap())
+}
+
+fn fresh(id: &str, project: &Project) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("id is empty".into());
+    }
+    if project.ids().iter().any(|existing| *existing == id) {
+        return Err(format!("id '{id}' is already used"));
+    }
+    Ok(())
+}
+
+fn named(name: &str, id: &str) -> String {
+    if name.is_empty() { id.to_string() } else { name.to_string() }
+}
+
+fn remove(project: &mut Project, id: &str) -> Result<(), String> {
+    let mut deps = Vec::new();
+    for branch in &project.branches {
+        if branch.from == id || branch.to == id {
+            deps.push(format!("branch {}", branch.id));
+        }
+    }
+    for item in &project.loads {
+        if item.bus == id { deps.push(format!("load {}", item.id)); }
+    }
+    for item in &project.sources {
+        if item.bus == id { deps.push(format!("source {}", item.id)); }
+    }
+    for item in &project.motors {
+        if item.bus == id { deps.push(format!("motor {}", item.id)); }
+    }
+    for item in &project.devices {
+        if item.bus == id { deps.push(format!("device {}", item.id)); }
+    }
+    for item in &project.equipment {
+        if item.bus == id || item.upstream_device.as_deref() == Some(id) {
+            deps.push(format!("equipment {}", item.id));
+        }
+    }
+    if !deps.is_empty() {
+        return Err(format!("'{id}' is still used by {}", deps.join(", ")));
+    }
+    let before = project.ids().len();
+    project.buses.retain(|x| x.id != id);
+    project.branches.retain(|x| x.id != id);
+    project.loads.retain(|x| x.id != id);
+    project.sources.retain(|x| x.id != id);
+    project.motors.retain(|x| x.id != id);
+    project.devices.retain(|x| x.id != id);
+    project.equipment.retain(|x| x.id != id);
+    project.assumptions.retain(|x| x.id != id);
+    if project.ids().len() == before {
+        return Err(format!("no object with id '{id}'"));
+    }
+    Ok(())
+}
+
+fn op_name(command: &Command) -> &'static str {
+    match command {
+        Command::Sample => "sample",
+        Command::Replace { .. } => "replace",
+        Command::AddBus { .. } => "add_bus",
+        Command::AddAssumption { .. } => "add_assumption",
+        Command::SetOptions { .. } => "set_options",
+        Command::AddLine { .. } => "add_line",
+        Command::AddTransformer { .. } => "add_transformer",
+        Command::AddLoad { .. } => "add_load",
+        Command::AddSource { .. } => "add_source",
+        Command::AddMotor { .. } => "add_motor",
+        Command::AddDevice { .. } => "add_device",
+        Command::AddEquipment { .. } => "add_equipment",
+        Command::Remove { .. } => "remove",
+        Command::SetBus { .. } => "set_bus",
+        Command::SetSource { .. } => "set_source",
+        Command::Run { .. } => "run",
+        Command::Sld => "sld",
+        Command::Tcc { .. } => "tcc",
+        Command::ExportSkm { .. } => "export_skm",
+    }
+}
+
+pub fn schema() -> serde_json::Value {
+    serde_json::json!({
+        "tool": "flashmob",
+        "protocol": "exec-v1",
+        "headless": true,
+        "stdout": "JSON only. Do not expect prompts.",
+        "studies": ["loadflow", "fault", "arcflash", "coordination"],
+        "arc_flash_standard": "IEEE 1584-2018",
+        "commands": {
+            "schema": "flashmob schema",
+            "sample": "flashmob sample",
+            "validate": "flashmob validate project.json",
+            "run": "flashmob run project.json",
+            "exec": "flashmob exec request.json    # or stdin",
+            "sld": "flashmob sld project.json -o diagram.svg",
+            "tcc": "flashmob tcc project.json -o curves.svg --csv curves.csv --ref-kv 0.48",
+            "export_skm": "flashmob export-skm project.json -o skm-export"
+        },
+        "exec_request": {
+            "project": "optional project object; omit to start empty",
+            "commands": [
+                {"op": "sample"},
+                {"op": "run", "studies": ["loadflow", "fault", "arcflash", "coordination"]},
+                {"op": "sld"},
+                {"op": "tcc", "ref_kv": 0.48, "devices": []},
+                {"op": "export_skm", "output": "skm-export"}
+            ]
+        },
+        "exec_response": ["ok", "error", "warnings", "project", "results", "sld_svg", "tcc_svg", "tcc_csv", "skm"],
+        "skm": "Data Exchange export: project.xml, per-component CSV, components.tab, and Revit panel/circuit schedules. See IMPORT.txt.",
+        "sld": "SVG single-line diagram. Each bus card shows nominal voltage, load-flow pu voltage, symmetrical 3P and LG fault current, and the governing IEEE 1584-2018 incident energy and arc-flash boundary.",
+        "tcc": "SVG log-log time-current curve plus CSV points. Current is referred to ref_kv. Fault and arcing-current markers are included when a study has been run.",
+        "electrodes": ["VCB", "VCBB", "HCB", "VOA", "HOA"],
+        "transformer_connections": ["dyn", "ynd", "ynyn", "dd"],
+        "sample_project": serde_json::to_value(Project::sample()).unwrap(),
+    })
+}
+
+pub fn load_project(text: &str) -> Result<Project, String> {
+    serde_json::from_str(text).map_err(|err| format!("could not read the project: {err}"))
+}
+
+pub fn draw_sld(project: &Project, study: &StudyOutput) -> (Diagram, String) {
+    let diagram = sld::diagram(project, study);
+    let svg = sld::to_svg(&diagram);
+    (diagram, svg)
+}
+
+pub fn draw_tcc(project: &Project, study: &StudyOutput, ref_kv: Option<f64>, devices: &[String]) -> Result<(TccPlot, String, String), String> {
+    let plot = tcc::plot(project, Some(study), ref_kv, devices)?;
+    let svg = tcc::to_svg(&plot);
+    let csv = tcc::to_csv(&plot);
+    Ok((plot, svg, csv))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn headless_exec_returns_studies_sld_and_tcc() {
+        let response = exec_request(r#"{"commands":[{"op":"sample"},{"op":"run"},{"op":"sld"},{"op":"tcc","ref_kv":0.48}]}"#);
+        assert!(response.ok, "{:?}", response.error);
+        let results = response.results.unwrap();
+        assert!(results.loadflow.unwrap().converged);
+        assert!(results.fault.unwrap().buses.len() == 3);
+        let arcs = results.arc_flash.unwrap();
+        assert!(arcs.iter().any(|r| r.bus_id == "mcc" && r.standard == "IEEE 1584-2018"));
+        let svg = response.sld_svg.unwrap();
+        assert!(svg.contains("MCC-1") && svg.contains("kA") && svg.contains("CAL/CM2"));
+        let tcc = response.tcc_svg.unwrap();
+        assert!(tcc.contains("MCC main") && tcc.contains("<path"));
+        assert!(response.tcc_csv.unwrap().contains("time_s"));
+    }
+}

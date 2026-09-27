@@ -1,0 +1,23 @@
+[package]
+name = "flashmob"
+version = "0.1.0"
+edition = "2021"
+description = "Load flow, short circuit, coordination, and IEEE 1584-2018 arc flash studies"
+license = "MIT"
+readme = "README.md"
+
+[features]
+default = ["gui"]
+gui = ["dep:eframe", "dep:rfd"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+faer = "0.24"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+eframe = { version = "0.36", optional = true }
+rfd = { version = "0.15", optional = true }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
