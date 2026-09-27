@@ -36,6 +36,8 @@ struct App {
     status: String,
     show_warnings: bool,
     zoom: f32,
+    /// Visible one-line window, in diagram coordinates. Pinch changes this, not the panel size.
+    scene_rect: Rect,
     tcc_kv: f64,
 }
 
@@ -66,6 +68,7 @@ impl App {
             status: "Sample plant is loaded. Short circuit and arc flash are on the one-line.".into(),
             show_warnings: false,
             zoom: 1.0,
+            scene_rect: Rect::ZERO,
             tcc_kv: 0.48,
         };
         if let Some((path, project)) = opened {
@@ -142,6 +145,7 @@ impl eframe::App for App {
                 if ui.button("Sample").clicked() {
                     self.project = Project::sample();
                     self.selected = None;
+                    self.scene_rect = Rect::ZERO;
                     self.run_study();
                 }
                 if ui.button("Open").clicked() {
@@ -209,39 +213,36 @@ impl App {
             return;
         };
         let diagram = sld::diagram(&self.project, &results);
+        let view = ui.available_rect_before_wrap();
+        ui.painter().rect_filled(view, 0.0, color("#0A0C10"));
+        let mut scale = if self.scene_rect.width() > 1.0 && self.scene_rect.height() > 1.0 {
+            (view.width() / self.scene_rect.width()).min(view.height() / self.scene_rect.height())
+        } else {
+            self.zoom
+        };
         ui.horizontal(|ui| {
             ui.label("Zoom");
-            ui.add(egui::Slider::new(&mut self.zoom, 0.2..=4.0).logarithmic(true));
-        });
-        let view = ui.available_rect_before_wrap();
-        let pointer = ui.input(|i| i.pointer.hover_pos());
-        let zoom_delta = ui.input(|i| i.zoom_delta());
-        let scroll_id = ui.make_persistent_id("sld_scroll");
-        if pointer.is_some_and(|pos| view.contains(pos)) && (zoom_delta - 1.0).abs() > 0.001 {
-            let old = self.zoom;
-            let new = (old * zoom_delta).clamp(0.2, 4.0);
-            if let Some(pos) = pointer {
-                if let Some(mut state) = egui::containers::scroll_area::State::load(ui.ctx(), scroll_id) {
-                    let local = pos - view.min;
-                    let factor = new / old;
-                    state.offset = (state.offset + local) * factor - local;
-                    state.offset = state.offset.max(Vec2::ZERO);
-                    state.store(ui.ctx(), scroll_id);
-                }
+            if ui.add(egui::Slider::new(&mut scale, 0.05..=8.0).logarithmic(true)).changed()
+                && self.scene_rect.width() > 1.0
+                && self.scene_rect.height() > 1.0
+            {
+                let center = self.scene_rect.center();
+                self.scene_rect = Rect::from_center_size(center, view.size() / scale);
             }
-            self.zoom = new;
-        }
-        ui.painter().rect_filled(view, 0.0, color("#0A0C10"));
-        egui::ScrollArea::both()
-            .id_salt("sld_scroll")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-            let size = Vec2::new(diagram.width as f32 * self.zoom, diagram.height as f32 * self.zoom);
+        });
+        let scene_view = ui.available_rect_before_wrap();
+        ui.painter().rect_filled(scene_view, 0.0, color("#0A0C10"));
+        egui::Scene::new()
+            .zoom_range(0.05..=8.0)
+            .max_inner_size(Vec2::new(diagram.width as f32 + 64.0, diagram.height as f32 + 64.0))
+            .drag_pan_buttons(egui::DragPanButtons::SECONDARY | egui::DragPanButtons::MIDDLE)
+            .show(ui, &mut self.scene_rect, |ui| {
+            let size = Vec2::new(diagram.width as f32, diagram.height as f32);
             let (rect, response) = ui.allocate_exact_size(size, Sense::click());
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, 0.0, color("#0A0C10"));
             let origin = rect.min;
-            let z = self.zoom;
+            let z = 1.0;
             let map = |x: f64, y: f64| origin + Vec2::new(x as f32, y as f32) * z;
             let grid = Stroke::new(1.0, color("#334155"));
             let mut gx = origin.x;
@@ -291,7 +292,7 @@ impl App {
             }
             if response.clicked() {
                 self.selected = None;
-                if let Some(pointer) = response.interact_pointer_pos() {
+                if let Some(pointer) = response.hover_pos() {
                     for bus in &diagram.buses {
                         if bus_card(&diagram, bus, origin, z).contains(pointer) {
                             self.selected = Some(bus.id.clone());
@@ -303,6 +304,9 @@ impl App {
                 draw_bus(&painter, bus, origin, z, self.selected.as_deref() == Some(&bus.id));
             }
         });
+        if self.scene_rect.width() > 1.0 && self.scene_rect.height() > 1.0 {
+            self.zoom = (scene_view.width() / self.scene_rect.width()).min(scene_view.height() / self.scene_rect.height());
+        }
     }
 
     fn flow(&self, ui: &mut egui::Ui) {
@@ -454,6 +458,7 @@ impl App {
                 Ok(project) => {
                     self.project = project;
                     self.selected = None;
+                    self.scene_rect = Rect::ZERO;
                     self.run_study();
                 }
                 Err(err) => self.status = err,
