@@ -416,8 +416,9 @@ fn scenario_envelope(project: &Project, normal: &StudyOutput, studies: Studies) 
 
 fn arc_flash(project: &Project, loadflow: Option<&LoadflowResult>, fault: &FaultResult, protection: &[crate::protection::Protection], warnings: &mut Vec<String>, failures: &mut Vec<ArcFailure>) -> Vec<ArcRow> {
     let mut rows = Vec::new();
-    let mut decrement_cache = DecrementFaultCache::default();
-    for case in cases(project, protection) {
+    let equipment_cases = cases(project, protection);
+    let mut decrement_cache = DecrementFaultCache::for_cases(project, &equipment_cases);
+    for case in equipment_cases {
         let mut fail = |error: String| {
             warnings.push(format!("{}: {error}", case.name));
             failures.push(ArcFailure { equipment_id: case.id.clone(), name: case.name.clone(), bus_id: case.bus.clone(), error });
@@ -434,19 +435,8 @@ fn arc_flash(project: &Project, loadflow: Option<&LoadflowResult>, fault: &Fault
             fail(format!("{:.2} kV is outside the IEEE 1584-2018 range of 208 V to 15 kV", bus.kv));
             continue;
         }
-        let preview = IeeeInput {
-            voc_kv: bus.kv,
-            ibf_ka: bolted,
-            gap_mm: case.gap_mm,
-            distance_mm: case.distance_mm,
-            height_mm: case.height_mm,
-            width_mm: case.width_mm,
-            depth_mm: case.depth_mm,
-            electrode: case.electrode,
-            time_s: 0.1,
-            time_min_s: 0.1,
-        };
-        let preview = match arcflash::calculate(&preview) {
+        let template = preview_input(&case, bus.kv, bolted);
+        let preview = match arcflash::calculate(&template) {
             Ok(v) => v,
             Err(err) => {
                 fail(err);
@@ -457,14 +447,16 @@ fn arc_flash(project: &Project, loadflow: Option<&LoadflowResult>, fault: &Fault
         let full_clear = match if decrement_source_ids.is_empty() {
             duration(project, &case, bus_fault, preview.i_arc_ka, protection)
         } else {
-            decrement_duration(project, &case, bus_fault, preview.i_arc_ka, protection)
+            decrement_duration(project, loadflow, &case, bus_fault, preview.i_arc_ka, protection,
+                &template, false, &decrement_source_ids, &mut decrement_cache)
         } {
             Ok(v) => v, Err(e) => { fail(e); continue; }
         };
         let min_clear = match if decrement_source_ids.is_empty() {
             duration(project, &case, bus_fault, preview.i_arc_min_ka, protection)
         } else {
-            decrement_duration(project, &case, bus_fault, preview.i_arc_min_ka, protection)
+            decrement_duration(project, loadflow, &case, bus_fault, preview.i_arc_min_ka, protection,
+                &template, true, &decrement_source_ids, &mut decrement_cache)
         } {
             Ok(v) => v, Err(e) => { fail(e); continue; }
         };
@@ -527,22 +519,169 @@ fn arc_flash(project: &Project, loadflow: Option<&LoadflowResult>, fault: &Fault
     rows
 }
 
-/// A sampled generator-current curve says nothing about a relay's memory,
-/// reset, or fuse melting behavior. Use a duration entered for this operating
-/// case; never silently reuse the time obtained from the initial current.
-fn decrement_duration(project: &Project, equipment: &ArcEquipment, fault: &crate::fault::BusFault, i_ka: f64, protection: &crate::protection::Protection) -> Result<Clearing, String> {
+/// Advance each entered relay element using the current at its protected
+/// terminal, sampled from the full network as the source strengths change.
+/// The breaker interruption time starts only after a relay element operates.
+fn decrement_duration(project: &Project, loadflow: Option<&LoadflowResult>, equipment: &ArcEquipment,
+    fault: &crate::fault::BusFault, i_ka: f64, protection: &crate::protection::Protection,
+    template: &IeeeInput, reduced: bool, decrement_source_ids: &[String],
+    cache: &mut DecrementFaultCache) -> Result<Clearing, String> {
     if equipment.clearing_s.is_some() {
         return duration(project, equipment, fault, i_ka, protection);
     }
-    if let Some(seconds) = equipment.fallback_duration_s {
+    let fallback = |reason: String| -> Result<Clearing, String> {
+        let Some(seconds) = equipment.fallback_duration_s else { return Err(reason) };
         let mut clear = finish_clearing(seconds, project.arc_duration_cap_s,
-            &format!("entered assumed exposure duration of {seconds:.3} s with source-current decrement"),
+            &format!("authorized assumed exposure fallback of {seconds:.3} s with source-current decrement"),
             "This cap is not a field trip setting and is not for an arc-flash label.");
         clear.assumed = true;
-        clear.note.push_str(" Protective-device clearing under time-varying current has not been established.");
-        return Ok(clear);
+        clear.note.push_str(&format!(" {reason}. {} No device clearing time is inferred from this assumption.", protection.detail));
+        Ok(clear)
+    };
+    let Some(id) = equipment.upstream_device.as_ref() else { return fallback(protection.detail.clone()) };
+    let device = project.device(id).ok_or("upstream device missing")?;
+    if let Some(branch) = device.protected_branch.as_deref()
+        .and_then(|id| project.branches.iter().find(|branch| branch.id == id)) {
+        if !project.branch_closed(branch) {
+            return fallback(format!("selected upstream device '{}' is on open branch '{}' in this operating case", device.id, branch.id));
+        }
     }
-    Err("source-current decrement is supplied, but protective-device clearing under time-varying current is unresolved; enter clearing_s or an explicit fallback_duration_s for this operating case".into())
+    if !isolates_sources(project, device, &equipment.bus) {
+        return Err("opening the selected device does not isolate all utility/generator paths to the fault; a multi-device clearing study is required".into());
+    }
+    if device.fuse_total_clearing {
+        return fallback(format!("upstream device {} [{}] has a fuse total-clearing curve; its melt and arcing history cannot be inferred from a time-varying relay model", device.name, device.id));
+    }
+    let Some(interrupting_s) = device.breaker_interrupting_s else {
+        return fallback(format!("upstream device {} [{}] lacks breaker interruption time", device.name, device.id));
+    };
+    let mut relay = match curves::DynamicRelay::new(&device.curve) {
+        Ok(relay) => relay,
+        Err(error) => return fallback(format!("upstream device {} [{}]: {error}", device.name, device.id)),
+    };
+    let bolted = fault.three_phase.as_ref().ok_or("fault current unavailable")?.symmetrical_ka;
+    let Some(mut prior_amps) = device_current(project, device, fault, i_ka / bolted) else {
+        return fallback(format!("protected branch terminal current unavailable for upstream device {} [{}]; enter protected_branch and terminal bus", device.name, device.id));
+    };
+    let current_case = if reduced { "reduced" } else { "full" };
+    let finish_trip = |trip_s: f64, reset_occurred: bool| -> Result<Clearing, String> {
+        let raw = trip_s + interrupting_s;
+        if raw > project.arc_duration_cap_s {
+            return fallback(format!("{} [{}] trips at {trip_s:.3} s, but entered breaker interruption extends total clearing to {raw:.3} s beyond the {:.3} s study cap",
+                device.name, device.id, project.arc_duration_cap_s));
+        }
+        let mut clear = finish_clearing(raw, project.arc_duration_cap_s,
+            &format!("{} [{}] {current_case}-arcing-current relay trip at {trip_s:.3} s plus entered breaker interruption of {interrupting_s:.3} s", device.name, device.id),
+            "This cap is not a field trip setting and is not for an arc-flash label.");
+        if reset_occurred {
+            clear.assumed = true;
+            clear.note.push_str(" Relay progress was reset immediately when sampled current fell below pickup; verify the device reset setting.");
+        }
+        Ok(clear)
+    };
+    let mut sampled_amps = |time_s: f64| -> Result<f64, String> {
+        let sampled = cache.sample_at(project, loadflow, &equipment.bus, time_s)?;
+        let input = IeeeInput { ibf_ka: sampled.bolted_ka, ..template.clone() };
+        let arcing = arcflash::calculate(&input)
+            .map_err(|error| format!("time-varying arcing current at {time_s:.3} s: {error}"))?;
+        let i_arc_ka = if reduced { arcing.i_arc_min_ka } else { arcing.i_arc_ka };
+        device_current_from_terminals(project, device, &sampled.terminal_currents,
+            i_arc_ka / sampled.bolted_ka)
+            .ok_or_else(|| format!("protected branch terminal current unavailable for upstream device {} [{}] at {time_s:.3} s", device.name, device.id))
+    };
+    let mut interval_start_s = 0.0;
+    let mut prior_sample_s = 0.0;
+    let mut slices = 0;
+    while project.arc_duration_cap_s - interval_start_s > 1e-12 {
+        if slices >= 10_000 {
+            return Err("source-current decrement interval exceeds 10,000 slices; reduce the arc duration or provide a shorter exposure limit".into());
+        }
+        let end_s = next_decrement_end(project, decrement_source_ids, interval_start_s, project.arc_duration_cap_s);
+        let midpoint_s = interval_start_s + (end_s - interval_start_s) / 2.0;
+        let amps = sampled_amps(midpoint_s)?;
+        match advance_relay_over_ramp(&mut relay, prior_amps, amps, midpoint_s - prior_sample_s) {
+            Ok(Some(within_s)) => return finish_trip(prior_sample_s + within_s, relay.reset_occurred()),
+            Ok(None) => {},
+            Err(error) => return fallback(format!("upstream device {} [{}]: {error}", device.name, device.id)),
+        }
+        prior_sample_s = midpoint_s;
+        prior_amps = amps;
+        if project.sources.iter().filter(|source| decrement_source_ids.contains(&source.id))
+            .any(|source| source.decrement_curve.iter().any(|point| (point.time_s - end_s).abs() < 1e-12)) {
+            // Preserve a profile's change of slope, including a brief peak
+            // from generator excitation, instead of interpolating across it.
+            let amps = sampled_amps(end_s)?;
+            match advance_relay_over_ramp(&mut relay, prior_amps, amps, end_s - prior_sample_s) {
+                Ok(Some(within_s)) => return finish_trip(prior_sample_s + within_s, relay.reset_occurred()),
+                Ok(None) => {},
+                Err(error) => return fallback(format!("upstream device {} [{}]: {error}", device.name, device.id)),
+            }
+            prior_sample_s = end_s;
+            prior_amps = amps;
+        }
+        interval_start_s = end_s;
+        slices += 1;
+    }
+    // The final half-slice can contain a trip or a pickup dropout. Sample the
+    // actual study cap so it is never extrapolated from the last midpoint.
+    if project.arc_duration_cap_s - prior_sample_s > 1e-12 {
+        let amps = sampled_amps(project.arc_duration_cap_s)?;
+        match advance_relay_over_ramp(&mut relay, prior_amps, amps, project.arc_duration_cap_s - prior_sample_s) {
+            Ok(Some(within_s)) => return finish_trip(prior_sample_s + within_s, relay.reset_occurred()),
+            Ok(None) => {},
+            Err(error) => return fallback(format!("upstream device {} [{}]: {error}", device.name, device.id)),
+        }
+    }
+    fallback(format!("upstream device {} [{}] did not trip within the {:.3} s study cap under the sampled {} arcing-current profile; total clearing is unresolved",
+        device.name, device.id, project.arc_duration_cap_s, if reduced { "reduced" } else { "full" }))
+}
+
+/// Interpolate between adjacent network-current samples and split at each
+/// entered element pickup. A stage only accrues the portion of a slice above
+/// its pickup; a midpoint alone could otherwise falsely complete a short delay.
+fn advance_relay_over_ramp(relay: &mut curves::DynamicRelay, start_amps: f64, end_amps: f64,
+    duration_s: f64) -> Result<Option<f64>, String> {
+    if !start_amps.is_finite() || !end_amps.is_finite() || !duration_s.is_finite() || duration_s <= 0.0 {
+        return Err("sampled relay current or interval is invalid".into());
+    }
+    let mut fractions = vec![0.0, 1.0];
+    for pickup in relay.pickup_thresholds() {
+        if (start_amps - pickup) * (end_amps - pickup) < 0.0 {
+            fractions.push((pickup - start_amps) / (end_amps - start_amps));
+        }
+    }
+    fractions.sort_by(f64::total_cmp);
+    let mut elapsed_s = 0.0;
+    for pair in fractions.windows(2) {
+        let width_s = duration_s * (pair[1] - pair[0]);
+        let midpoint_fraction = (pair[0] + pair[1]) / 2.0;
+        let amps = start_amps + (end_amps - start_amps) * midpoint_fraction;
+        if let Some(within_s) = relay.advance(amps, width_s)? {
+            return Ok(Some(elapsed_s + within_s));
+        }
+        elapsed_s += width_s;
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod relay_ramp_regression {
+    use super::advance_relay_over_ramp;
+    use crate::{curves::DynamicRelay, model::CurveSpec};
+
+    #[test]
+    fn pickup_crossing_does_not_falsely_complete_a_short_definite_delay() {
+        let curve = CurveSpec::Definite { pickup_a: 100.0, time_s: 0.008 };
+        let mut relay = DynamicRelay::new(&curve).unwrap();
+        // Pickup lasts only 5.03 ms; treating the 100.5 A midpoint as a
+        // constant 10 ms would incorrectly claim an 8 ms trip.
+        assert_eq!(advance_relay_over_ramp(&mut relay, 200.0, 1.0, 0.010).unwrap(), None);
+        assert!(relay.reset_occurred());
+
+        let mut fast = DynamicRelay::new(&CurveSpec::Definite { pickup_a: 100.0, time_s: 0.004 }).unwrap();
+        let trip = advance_relay_over_ramp(&mut fast, 200.0, 1.0, 0.010).unwrap().unwrap();
+        assert!((trip - 0.004).abs() < 1e-12, "trip at {trip}");
+    }
 }
 
 fn calculate_decrement_arc(project: &Project, loadflow: Option<&LoadflowResult>, bus_id: &str, input: &IeeeInput, decrement_source_ids: &[String], cache: &mut DecrementFaultCache) -> Result<arcflash::IeeeOutput, String> {
@@ -595,17 +734,36 @@ fn curved_sources_reaching(project: &Project, bus_id: &str) -> Vec<String> {
 
 const DECREMENT_STEP_S: f64 = 0.01;
 
-#[derive(Default)]
 struct DecrementFaultCache {
     /// One network solve at each sampled time serves every arc-equipment item
     /// and both the full and reduced-current integrations in this case.
-    bolted_by_time: std::collections::HashMap<u64, std::collections::HashMap<String, f64>>,
+    faults_by_time: std::collections::HashMap<u64, std::collections::HashMap<String, SampledBusFault>>,
+    /// Retain only terminal currents used by equipment's selected device.
+    protected_branches_by_bus: std::collections::HashMap<String, std::collections::HashSet<String>>,
+}
+
+struct SampledBusFault {
+    bolted_ka: f64,
+    terminal_currents: Vec<crate::fault::TerminalCurrent>,
 }
 
 impl DecrementFaultCache {
-    fn bolted_at(&mut self, project: &Project, loadflow: Option<&LoadflowResult>, bus_id: &str, midpoint_s: f64) -> Result<f64, String> {
+    fn for_cases(project: &Project, cases: &[ArcEquipment]) -> Self {
+        let mut protected_branches_by_bus: std::collections::HashMap<String, std::collections::HashSet<String>> = std::collections::HashMap::new();
+        for equipment in cases {
+            let branch = equipment.upstream_device.as_deref()
+                .and_then(|id| project.device(id))
+                .and_then(|device| device.protected_branch.as_ref());
+            if let Some(branch) = branch {
+                protected_branches_by_bus.entry(equipment.bus.clone()).or_default().insert(branch.clone());
+            }
+        }
+        Self { faults_by_time: std::collections::HashMap::new(), protected_branches_by_bus }
+    }
+
+    fn sample_at(&mut self, project: &Project, loadflow: Option<&LoadflowResult>, bus_id: &str, midpoint_s: f64) -> Result<&SampledBusFault, String> {
         let key = midpoint_s.to_bits();
-        if !self.bolted_by_time.contains_key(&key) {
+        if !self.faults_by_time.contains_key(&key) {
             let mut snapshot = project.clone();
             for source in snapshot.sources.iter_mut().filter(|source| source.in_service && !source.decrement_curve.is_empty()) {
                 let ratio = source.decrement_ratio_at(midpoint_s);
@@ -615,13 +773,24 @@ impl DecrementFaultCache {
             if !sampled_fault.valid {
                 return Err(sampled_fault.error.unwrap_or_else(|| "time-varying fault result is invalid".into()));
             }
-            let bolted_by_bus = sampled_fault.buses.into_iter().filter_map(|bus| {
-                bus.three_phase.map(|point| (bus.id, point.symmetrical_ka))
+            let faults_by_bus = sampled_fault.buses.into_iter().filter_map(|bus| {
+                let terminals = bus.terminal_currents.into_iter()
+                    .filter(|terminal| self.protected_branches_by_bus.get(&bus.id)
+                        .is_some_and(|branches| branches.contains(&terminal.branch_id)))
+                    .collect();
+                bus.three_phase.map(|point| (bus.id, SampledBusFault {
+                    bolted_ka: point.symmetrical_ka,
+                    terminal_currents: terminals,
+                }))
             }).collect();
-            self.bolted_by_time.insert(key, bolted_by_bus);
+            self.faults_by_time.insert(key, faults_by_bus);
         }
-        self.bolted_by_time[&key].get(bus_id).copied()
+        self.faults_by_time[&key].get(bus_id)
             .ok_or_else(|| format!("no three-phase fault current at bus '{bus_id}' during decrement profile"))
+    }
+
+    fn bolted_at(&mut self, project: &Project, loadflow: Option<&LoadflowResult>, bus_id: &str, midpoint_s: f64) -> Result<f64, String> {
+        Ok(self.sample_at(project, loadflow, bus_id, midpoint_s)?.bolted_ka)
     }
 }
 
@@ -632,15 +801,7 @@ fn decrement_segments(project: &Project, loadflow: Option<&LoadflowResult>, bus_
         if segments.len() >= 10_000 {
             return Err("source-current decrement interval exceeds 10,000 slices; reduce the arc duration or provide a shorter exposure limit".into());
         }
-        let mut end_s = (time_s + DECREMENT_STEP_S).min(duration_s);
-        // The derivative of an entered profile changes at a recorded point.
-        // Keep each such point as an integration boundary.
-        for source in project.sources.iter().filter(|source| decrement_source_ids.contains(&source.id)) {
-            if let Some(next) = source.decrement_curve.iter()
-                .find(|point| point.time_s > time_s + 1e-12 && point.time_s < end_s - 1e-12) {
-                end_s = next.time_s;
-            }
-        }
+        let end_s = next_decrement_end(project, decrement_source_ids, time_s, duration_s);
         let width_s = end_s - time_s;
         let midpoint_s = time_s + width_s / 2.0;
         let bolted = cache.bolted_at(project, loadflow, bus_id, midpoint_s)?;
@@ -648,6 +809,19 @@ fn decrement_segments(project: &Project, loadflow: Option<&LoadflowResult>, bus_
         time_s = end_s;
     }
     Ok(segments)
+}
+
+fn next_decrement_end(project: &Project, decrement_source_ids: &[String], time_s: f64, duration_s: f64) -> f64 {
+    let mut end_s = (time_s + DECREMENT_STEP_S).min(duration_s);
+    // A recorded profile point is an integration boundary for both relay
+    // operation and incident energy.
+    for source in project.sources.iter().filter(|source| decrement_source_ids.contains(&source.id)) {
+        if let Some(next) = source.decrement_curve.iter()
+            .find(|point| point.time_s > time_s + 1e-12 && point.time_s < end_s - 1e-12) {
+            end_s = next.time_s;
+        }
+    }
+    end_s
 }
 
 fn preview_input(case: &ArcEquipment, kv: f64, bolted: f64) -> IeeeInput {
@@ -742,9 +916,14 @@ fn duration(project: &Project, case: &ArcEquipment, fault: &crate::fault::BusFau
 }
 
 fn device_current(project: &Project, device: &crate::model::Device, fault: &crate::fault::BusFault, fraction: f64) -> Option<f64> {
+    device_current_from_terminals(project, device, &fault.terminal_currents, fraction)
+}
+
+fn device_current_from_terminals(project: &Project, device: &crate::model::Device,
+    terminals: &[crate::fault::TerminalCurrent], fraction: f64) -> Option<f64> {
     let id = device.protected_branch.as_ref()?;
     let branch = project.branches.iter().find(|b| b.id == *id)?;
-    let current = fault.terminal_currents.iter().find(|c| c.branch_id == *id)?;
+    let current = terminals.iter().find(|c| c.branch_id == *id)?;
     let (pre, inc) = if device.bus == branch.from { (current.from_prefault_a, current.from_increment_a) }
         else if device.bus == branch.to { (current.to_prefault_a, current.to_increment_a) }
         else { return None; };
