@@ -154,6 +154,11 @@ pub struct Source {
     #[serde(default)]
     pub angle_deg: f64,
     pub mva_sc: f64,
+    /// Optional symmetrical three-phase short-circuit current profile at this
+    /// source's terminals. Ratios are relative to the initial `mva_sc` value.
+    /// An empty profile retains a constant source strength.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decrement_curve: Vec<DecrementPoint>,
     pub xr: f64,
     #[serde(default = "default_one")]
     pub x0_over_x1: f64,
@@ -168,6 +173,34 @@ pub struct Source {
     pub qmin_mvar: Option<f64>,
     #[serde(default)]
     pub qmax_mvar: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecrementPoint {
+    /// Seconds after fault inception; the first point must be at zero.
+    pub time_s: f64,
+    /// Symmetrical RMS current divided by the time-zero current.
+    pub current_ratio: f64,
+}
+
+impl Source {
+    /// Interpolate a supplied generator decrement profile in elapsed time and
+    /// hold the endpoint values outside its recorded interval. Validation
+    /// ensures the first point is (0 s, 1.0) and all ratios stay positive.
+    pub fn decrement_ratio_at(&self, time_s: f64) -> f64 {
+        if !time_s.is_finite() { return f64::NAN; }
+        let Some(first) = self.decrement_curve.first() else { return 1.0 };
+        if time_s <= first.time_s { return first.current_ratio; }
+        for pair in self.decrement_curve.windows(2) {
+            let [start, end] = pair else { unreachable!() };
+            if time_s <= end.time_s {
+                let fraction = (time_s - start.time_s) / (end.time_s - start.time_s);
+                return start.current_ratio + fraction * (end.current_ratio - start.current_ratio);
+            }
+        }
+        self.decrement_curve.last().unwrap().current_ratio
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -509,6 +542,7 @@ impl Project {
                 v_pu: 1.0,
                 angle_deg: 0.0,
                 mva_sc: 250.0,
+                decrement_curve: Vec::new(),
                 xr: 12.0,
                 x0_over_x1: 1.5,
                 r0_over_r1: 1.0,
@@ -760,6 +794,19 @@ impl Project {
             need_bus(&x.bus, &format!("source {}", x.id), &mut errors);
             if x.mva_sc <= 0.0 || x.xr < 0.0 || x.v_pu <= 0.0 {
                 errors.push(format!("source {} has a non-positive strength or voltage", x.id));
+            }
+            if let Some(first) = x.decrement_curve.first() {
+                if first.time_s != 0.0 || first.current_ratio != 1.0 {
+                    errors.push(format!("source {} decrement_curve must start at time_s 0 with current_ratio 1", x.id));
+                }
+                let mut previous_time = f64::NEG_INFINITY;
+                for (index, point) in x.decrement_curve.iter().enumerate() {
+                    if !point.time_s.is_finite() || point.time_s < 0.0 || point.time_s <= previous_time
+                        || !point.current_ratio.is_finite() || point.current_ratio <= 0.0 {
+                        errors.push(format!("source {} decrement_curve point {} must have finite, strictly increasing nonnegative time_s and finite positive current_ratio", x.id, index));
+                    }
+                    previous_time = point.time_s;
+                }
             }
         }
         let mut controlled_branches = std::collections::HashSet::new();
@@ -1017,9 +1064,57 @@ mod tests {
         object.remove("switch_groups");
         object.remove("operating_cases");
         object.get_mut("sources").unwrap().as_array_mut().unwrap()[0].as_object_mut().unwrap().remove("in_service");
+        assert!(object["sources"][0].get("decrement_curve").is_none());
         let project: Project = serde_json::from_value(value).unwrap();
         assert!(project.sources[0].in_service);
+        assert!(project.sources[0].decrement_curve.is_empty());
         assert!(project.switches.is_empty() && project.switch_groups.is_empty() && project.operating_cases.is_empty());
+    }
+
+    #[test]
+    fn source_decrement_curve_roundtrips_and_interpolates_with_endpoint_hold() {
+        let mut project = Project::sample();
+        let source = &mut project.sources[0];
+        assert_eq!(source.decrement_ratio_at(0.7), 1.0);
+        source.decrement_curve = vec![
+            DecrementPoint { time_s: 0.0, current_ratio: 1.0 },
+            DecrementPoint { time_s: 0.2, current_ratio: 0.4 },
+            DecrementPoint { time_s: 1.0, current_ratio: 1.2 },
+        ];
+        assert!(project.validate().is_empty(), "{:?}", project.validate());
+        let source = &project.sources[0];
+        assert_eq!(source.decrement_ratio_at(-1.0), 1.0);
+        assert!((source.decrement_ratio_at(0.1) - 0.7).abs() < 1e-12);
+        assert!((source.decrement_ratio_at(0.6) - 0.8).abs() < 1e-12);
+        assert_eq!(source.decrement_ratio_at(3.0), 1.2);
+
+        let value = serde_json::to_value(&project).unwrap();
+        assert_eq!(value["sources"][0]["decrement_curve"][2]["current_ratio"], 1.2);
+        let parsed: Project = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.sources[0].decrement_curve, source.decrement_curve);
+    }
+
+    #[test]
+    fn source_decrement_curve_rejects_invalid_anchor_times_and_ratios() {
+        let mut project = Project::sample();
+        let source = &mut project.sources[0];
+        source.decrement_curve = vec![DecrementPoint { time_s: 0.1, current_ratio: 1.0 }];
+        assert!(project.validate().iter().any(|error| error.contains("must start at time_s 0")));
+        project.sources[0].decrement_curve[0].time_s = 0.0;
+        project.sources[0].decrement_curve[0].current_ratio = 0.9;
+        assert!(project.validate().iter().any(|error| error.contains("current_ratio 1")));
+
+        project.sources[0].decrement_curve = vec![
+            DecrementPoint { time_s: 0.0, current_ratio: 1.0 },
+            DecrementPoint { time_s: 0.1, current_ratio: 0.5 },
+        ];
+        for (time_s, current_ratio) in [(0.0, 0.4), (-0.1, 0.4), (f64::NAN, 0.4), (0.2, 0.0), (0.2, f64::INFINITY)] {
+            project.sources[0].decrement_curve[1] = DecrementPoint { time_s, current_ratio };
+            assert!(project.validate().iter().any(|error| error.contains("decrement_curve point 1")), "{time_s:?} {current_ratio:?}");
+        }
+        project.sources[0].decrement_curve[1] = DecrementPoint { time_s: 0.1, current_ratio: 0.5 };
+        project.sources[0].decrement_curve.push(DecrementPoint { time_s: 0.05, current_ratio: 0.4 });
+        assert!(project.validate().iter().any(|error| error.contains("decrement_curve point 2")));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::connectivity::{self, Topology};
-use crate::model::{ArcEquipment, Branch, BranchKind, Bus, CurveSpec, Device, Electrode, EquipmentState, Load, Motor, OperatingCase, Project, Source, SourceState, Switch, SwitchGroup, SwitchKind, SwitchState, XfmrConn};
+use crate::model::{ArcEquipment, Branch, BranchKind, Bus, CurveSpec, DecrementPoint, Device, Electrode, EquipmentState, Load, Motor, OperatingCase, Project, Source, SourceState, Switch, SwitchGroup, SwitchKind, SwitchState, XfmrConn};
 use crate::sld::{self, Diagram};
 use crate::study::{self, Studies, StudyOutput};
 use crate::tcc::{self, TccPlot};
@@ -69,6 +69,7 @@ pub enum Command {
         #[serde(default = "one")] v_pu: f64,
         #[serde(default)] angle_deg: f64,
         mva_sc: f64,
+        #[serde(default)] decrement_curve: Vec<DecrementPoint>,
         xr: f64,
         #[serde(default = "one")] x0_over_x1: f64,
         #[serde(default = "one")] r0_over_r1: f64,
@@ -124,6 +125,7 @@ pub enum Command {
     SetSource {
         id: String,
         #[serde(default)] mva_sc: Option<f64>,
+        #[serde(default)] decrement_curve: Option<Vec<DecrementPoint>>,
         #[serde(default)] xr: Option<f64>,
         #[serde(default)] v_pu: Option<f64>,
         #[serde(default)] x0_over_x1: Option<f64>,
@@ -303,7 +305,7 @@ fn apply_one(
             fresh(id, project)?;
             project.loads.push(Load { id: id.clone(), name: named(name, id), bus: bus.clone(), kw: *kw, kvar: *kvar, basis: basis.clone() });
         }
-        Command::AddSource { id, name, bus, v_pu, angle_deg, mva_sc, xr, x0_over_x1, r0_over_r1, is_slack, in_service, p_mw } => {
+        Command::AddSource { id, name, bus, v_pu, angle_deg, mva_sc, decrement_curve, xr, x0_over_x1, r0_over_r1, is_slack, in_service, p_mw } => {
             fresh(id, project)?;
             project.sources.push(Source {
                 id: id.clone(),
@@ -312,6 +314,7 @@ fn apply_one(
                 v_pu: *v_pu,
                 angle_deg: *angle_deg,
                 mva_sc: *mva_sc,
+                decrement_curve: decrement_curve.clone(),
                 xr: *xr,
                 x0_over_x1: *x0_over_x1,
                 r0_over_r1: *r0_over_r1,
@@ -382,9 +385,10 @@ fn apply_one(
             if let Some(ka) = bracing_ka { bus.bracing_ka = Some(*ka); }
             if let Some(amps) = main_rating_a { bus.main_rating_a = Some(*amps); }
         }
-        Command::SetSource { id, mva_sc, xr, v_pu, x0_over_x1, is_slack, in_service } => {
+        Command::SetSource { id, mva_sc, decrement_curve, xr, v_pu, x0_over_x1, is_slack, in_service } => {
             let source = project.sources.iter_mut().find(|s| s.id == *id).ok_or_else(|| format!("no source '{id}'"))?;
             if let Some(v) = mva_sc { source.mva_sc = *v; }
+            if let Some(v) = decrement_curve { source.decrement_curve = v.clone(); }
             if let Some(v) = xr { source.xr = *v; }
             if let Some(v) = v_pu { source.v_pu = *v; }
             if let Some(v) = x0_over_x1 { source.x0_over_x1 = *v; }
@@ -567,6 +571,7 @@ pub fn schema() -> serde_json::Value {
         "exec_request_note": "The project field is optional; omit it or set it to null to start empty. The example commands build on the built-in sample.",
         "exec_response": ["ok", "error", "warnings", "project", "results", "topology", "sld_svg", "tcc_svg", "tcc_csv", "skm"],
         "topology": "Validated entered connections only: every bus lists branch terminal and neighbor plus attached source, load, motor, device, and arc equipment IDs. Global records give branch endpoints and switch link, source base in-service state, switch base closed state, group rules, named operating cases, and each device's entered protected branch terminal. Null placement means it was not entered. No study or protection inference is performed.",
+        "source_decrement": "Optional add_source/set_source decrement_curve is an array of {time_s,current_ratio} for symmetrical three-phase RMS short-circuit current at source terminals relative to initial mva_sc. First point must be {time_s:0,current_ratio:1}; times increase strictly and ratios stay positive. Linear interpolation in time holds the first/last value outside entered points. An empty array clears the curve; omission retains the constant-current model. Arc energy with decrement requires an explicit total duration (clearing_s or authorized fallback_duration_s); dynamic device-based clearing is unavailable without relay response and reset data.",
         "operating_cases": "Base switch.closed and source.in_service values define normal operation. Each named operating case overrides listed switch/source states. Its arc equipment starts with no inherited upstream_device, clearing_s, or fallback_duration_s; list case-specific values in equipment_states, or leave them absent for automatic protection selection or an explicit failure. At most one switch can control a branch. A switch group limits simultaneous closures using max_closed. `run` evaluates the base configuration and each named valid case; inspect per-case failures before using an arc-flash maximum.",
         "switch_model": "Opening a switch removes its entire referenced branch, including any transformer grounding shunt or line charging on that branch. For an independent breaker or ATS contact, use a separate short finite-impedance branch with separate bus nodes; put transformers and other equipment on their own branches. The closed field is required for every switch, especially normally open ties and ATS contacts.",
         "switch_kinds": ["breaker", "tie", "ats"],
@@ -685,5 +690,46 @@ mod tests {
         ]}"#);
         assert!(!response.ok);
         assert!(response.error.unwrap().contains("switch feeder-switch"));
+    }
+
+    #[test]
+    fn exec_add_and_set_source_decrement_curve_with_topology_visibility() {
+        let added = exec_request(r#"{"commands":[
+            {"op":"sample"},
+            {"op":"add_source","id":"standby","bus":"util","mva_sc":35,"xr":8,"in_service":false,
+             "decrement_curve":[{"time_s":0,"current_ratio":1},{"time_s":0.1,"current_ratio":0.6}]},
+            {"op":"topology"}
+        ]}"#);
+        assert!(added.ok, "{:?}", added.error);
+        assert!((added.project.sources[1].decrement_ratio_at(0.05) - 0.8).abs() < 1e-12);
+        let view = serde_json::to_value(added.topology.unwrap()).unwrap();
+        assert_eq!(view["sources"][1]["decrement_curve"][1]["current_ratio"], 0.6);
+
+        let changed = exec_request(r#"{"commands":[
+            {"op":"sample"},
+            {"op":"set_source","id":"grid","decrement_curve":[{"time_s":0,"current_ratio":1},{"time_s":0.5,"current_ratio":0.4}]},
+            {"op":"topology"}
+        ]}"#);
+        assert!(changed.ok, "{:?}", changed.error);
+        assert!((changed.project.sources[0].decrement_ratio_at(0.25) - 0.7).abs() < 1e-12);
+        let cleared = exec_request(&serde_json::json!({
+            "project": changed.project,
+            "commands": [{"op":"set_source","id":"grid","decrement_curve":[]},{"op":"topology"}]
+        }).to_string());
+        assert!(cleared.ok, "{:?}", cleared.error);
+        assert!(cleared.project.sources[0].decrement_curve.is_empty());
+        let view = serde_json::to_value(cleared.topology.unwrap()).unwrap();
+        assert!(view["sources"][0].get("decrement_curve").is_none());
+    }
+
+    #[test]
+    fn topology_command_rejects_invalid_source_decrement_curve() {
+        let response = exec_request(r#"{"commands":[
+            {"op":"sample"},
+            {"op":"set_source","id":"grid","decrement_curve":[{"time_s":0,"current_ratio":1},{"time_s":0.1,"current_ratio":0}]},
+            {"op":"topology"}
+        ]}"#);
+        assert!(!response.ok);
+        assert!(response.error.unwrap().contains("decrement_curve point 1"));
     }
 }

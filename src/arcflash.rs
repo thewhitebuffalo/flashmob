@@ -60,6 +60,94 @@ pub struct IeeeOutput {
     pub warnings: Vec<String>,
 }
 
+/// A constant bolted-current interval in a time-varying fault profile.
+#[derive(Clone, Copy, Debug)]
+pub struct EnergySegment {
+    pub ibf_ka: f64,
+    pub duration_s: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProfileEnergy {
+    pub energy_cal_cm2: f64,
+    pub boundary_mm: f64,
+    pub warnings: Vec<String>,
+}
+
+/// Integrate IEEE 1584 incident energy over constant-current intervals.
+///
+/// `template.ibf_ka`, `time_s`, and `time_min_s` are replaced by each segment.
+/// The same arcing-current variation choice is used for every interval. At
+/// medium voltage, reference-voltage energies are accumulated before the
+/// nonlinear boundary equation and voltage interpolation are applied.
+pub fn integrate_profile(
+    template: &IeeeInput,
+    segments: &[EnergySegment],
+    reduced: bool,
+) -> Result<ProfileEnergy, String> {
+    if segments.is_empty() {
+        return Err("arc-flash current profile has no segments".into());
+    }
+    let mut energy_j = 0.0;
+    let mut reference_energy_j = [0.0; 3];
+    let mut warnings = Vec::new();
+    let levels = [0.6, 2.7, 14.3];
+    let var_cf = variation_factor(template.electrode, template.voc_kv);
+
+    for (index, segment) in segments.iter().enumerate() {
+        if !segment.ibf_ka.is_finite() || segment.ibf_ka <= 0.0
+            || !segment.duration_s.is_finite() || segment.duration_s <= 0.0 {
+            return Err(format!("arc-flash current profile segment {} requires finite positive current and duration", index + 1));
+        }
+        let input = IeeeInput {
+            ibf_ka: segment.ibf_ka,
+            time_s: segment.duration_s,
+            time_min_s: segment.duration_s,
+            ..template.clone()
+        };
+        let calibrated_current = if input.voc_kv <= 0.6 { 0.5..=106.0 } else { 0.2..=65.0 };
+        if !calibrated_current.contains(&segment.ibf_ka) {
+            return Err(format!(
+                "arc-flash current profile segment {} has {:.3} kA outside the IEEE 1584-2018 bolted-current model range; integrated energy is unavailable",
+                index + 1, segment.ibf_ka,
+            ));
+        }
+        // Reuse the established IEEE input validation and model-range warnings.
+        let result = calculate(&input)
+            .map_err(|error| format!("arc-flash current profile segment {}: {error}", index + 1))?;
+        energy_j += if reduced { result.energy_min_j_cm2 } else { result.energy_j_cm2 };
+        for warning in result.warnings {
+            if !warnings.contains(&warning) { warnings.push(warning); }
+        }
+
+        if input.voc_kv > 0.6 {
+            let cf = enclosure(&input)?.cf;
+            for (level, total) in levels.into_iter().zip(&mut reference_energy_j) {
+                let nominal_i = i_arc_intermediate(input.electrode, level, input.ibf_ka, input.gap_mm)?;
+                let i_arc = if reduced { nominal_i * (1.0 - 0.5 * var_cf) } else { nominal_i };
+                *total += intermediate_energy(
+                    input.electrode, level, i_arc, input.ibf_ka, input.gap_mm,
+                    input.distance_mm, cf, segment.duration_s * 1000.0, None,
+                )?;
+            }
+        }
+    }
+
+    let boundary_mm = if template.voc_kv <= 0.6 {
+        afb_from_energy(template.electrode, template.voc_kv, energy_j, template.distance_mm)?
+    } else {
+        let mut boundaries = [0.0; 3];
+        for ((level, energy), boundary) in levels.into_iter().zip(reference_energy_j).zip(&mut boundaries) {
+            *boundary = afb_from_energy(template.electrode, level, energy, template.distance_mm)?;
+        }
+        interpolate(template.voc_kv, boundaries[0], boundaries[1], boundaries[2])
+    };
+    if !energy_j.is_finite() || energy_j <= 0.0 || !boundary_mm.is_finite() || boundary_mm <= 0.0 {
+        return Err("non-finite or non-positive integrated IEEE 1584 result".into());
+    }
+    Ok(ProfileEnergy { energy_cal_cm2: energy_j / J_PER_CAL, boundary_mm, warnings })
+}
+
 pub fn calculate(input: &IeeeInput) -> Result<IeeeOutput, String> {
     let mut warnings = Vec::new();
     if [input.voc_kv, input.ibf_ka, input.gap_mm, input.distance_mm, input.height_mm, input.width_mm, input.depth_mm, input.time_s, input.time_min_s].into_iter().any(|v| !v.is_finite() || v <= 0.0) {
@@ -479,5 +567,80 @@ mod boundary_regression {
         assert!((out.afb_full_mm-full).abs() < 2.0);
         assert!((out.afb_reduced_mm-reduced).abs() < 2.0);
         assert!((out.afb_mm-reduced).abs() < 2.0);
+    }
+}
+
+#[cfg(test)]
+mod profile_regression {
+    use super::*;
+
+    fn input(voc_kv: f64, ibf_ka: f64) -> IeeeInput {
+        IeeeInput {
+            voc_kv,
+            ibf_ka,
+            gap_mm: if voc_kv <= 0.6 { 32.0 } else { 104.0 },
+            distance_mm: if voc_kv <= 0.6 { 609.6 } else { 914.4 },
+            height_mm: if voc_kv <= 0.6 { 610.0 } else { 1143.0 },
+            width_mm: if voc_kv <= 0.6 { 610.0 } else { 762.0 },
+            depth_mm: if voc_kv <= 0.6 { 254.0 } else { 508.0 },
+            electrode: Electrode::VCB,
+            time_s: 0.3,
+            time_min_s: 0.3,
+        }
+    }
+
+    fn close(got: f64, expected: f64) {
+        let tolerance = 1e-10 * expected.abs().max(1.0);
+        assert!((got - expected).abs() <= tolerance, "got {got}, expected {expected}");
+    }
+
+    #[test]
+    fn constant_profile_matches_existing_low_and_medium_voltage_equations() {
+        for (voltage, current) in [(0.48, 45.0), (4.16, 15.0)] {
+            let template = input(voltage, current);
+            let constant = calculate(&template).unwrap();
+            let segments = [
+                EnergySegment { ibf_ka: current, duration_s: 0.1 },
+                EnergySegment { ibf_ka: current, duration_s: 0.2 },
+            ];
+            let full = integrate_profile(&template, &segments, false).unwrap();
+            close(full.energy_cal_cm2, constant.energy_cal_cm2);
+            close(full.boundary_mm, constant.afb_full_mm);
+            let reduced = integrate_profile(&template, &segments, true).unwrap();
+            close(reduced.energy_cal_cm2, constant.energy_min_cal_cm2);
+            close(reduced.boundary_mm, constant.afb_reduced_mm);
+        }
+    }
+
+    #[test]
+    fn segmented_energy_is_additive_but_arc_boundary_is_not() {
+        let template = input(0.48, 45.0);
+        let segments = [
+            EnergySegment { ibf_ka: 45.0, duration_s: 0.1 },
+            EnergySegment { ibf_ka: 20.0, duration_s: 0.2 },
+        ];
+        let combined = integrate_profile(&template, &segments, false).unwrap();
+        let first = integrate_profile(&template, &segments[..1], false).unwrap();
+        let second = integrate_profile(&template, &segments[1..], false).unwrap();
+        close(combined.energy_cal_cm2, first.energy_cal_cm2 + second.energy_cal_cm2);
+        let expected_boundary = afb_from_energy(
+            template.electrode, template.voc_kv,
+            combined.energy_cal_cm2 * J_PER_CAL, template.distance_mm,
+        ).unwrap();
+        close(combined.boundary_mm, expected_boundary);
+        assert!((combined.boundary_mm - first.boundary_mm - second.boundary_mm).abs() > 1.0);
+    }
+
+    #[test]
+    fn rejects_empty_and_invalid_profiles() {
+        let template = input(0.48, 45.0);
+        assert!(integrate_profile(&template, &[], false).is_err());
+        for segment in [
+            EnergySegment { ibf_ka: 0.0, duration_s: 0.1 },
+            EnergySegment { ibf_ka: 20.0, duration_s: f64::NAN },
+            EnergySegment { ibf_ka: 0.3, duration_s: 0.1 },
+        ] {
+            assert!(integrate_profile(&template, &[segment], false).is_err());
+        }
     }
 }

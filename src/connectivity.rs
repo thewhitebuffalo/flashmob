@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
-use crate::model::{BranchKind, OperatingCase, Project, SwitchGroup, SwitchKind};
+use crate::model::{BranchKind, DecrementPoint, OperatingCase, Project, SwitchGroup, SwitchKind};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Topology {
@@ -86,6 +86,9 @@ pub struct SourceConnection {
     /// Omitted from JSON for the legacy/default true state.
     #[serde(skip_serializing_if = "is_true")]
     pub in_service: bool,
+    /// Supplied symmetrical three-phase current profile, omitted when absent.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub decrement_curve: Vec<DecrementPoint>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -191,6 +194,7 @@ pub fn topology(project: &Project) -> Result<Topology, String> {
                 name: source.name.clone(),
                 bus_id: source.bus.clone(),
                 in_service: source.in_service,
+                decrement_curve: source.decrement_curve.clone(),
             }
         })
         .collect();
@@ -478,16 +482,22 @@ mod tests {
         assert!(legacy.get("operating_cases").is_none());
         assert!(legacy["branches"][0].get("switch_id").is_none());
         assert!(legacy["sources"][0].get("in_service").is_none());
+        assert!(legacy["sources"][0].get("decrement_curve").is_none());
 
         project.switches.push(Switch {
             id: "feeder-switch".into(), name: "Feeder switch".into(),
             branch_id: "feeder".into(), kind: SwitchKind::Breaker, closed: false,
         });
         project.sources[0].in_service = false;
+        project.sources[0].decrement_curve = vec![
+            DecrementPoint { time_s: 0.0, current_ratio: 1.0 },
+            DecrementPoint { time_s: 0.2, current_ratio: 0.6 },
+        ];
         let active = serde_json::to_value(topology(&project).unwrap()).unwrap();
         assert_eq!(active["branches"][1]["switch_id"], "feeder-switch");
         assert_eq!(active["branches"][1]["base_closed"], false);
         assert_eq!(active["switches"][0]["branch_id"], "feeder");
         assert_eq!(active["sources"][0]["in_service"], false);
+        assert_eq!(active["sources"][0]["decrement_curve"][1]["current_ratio"], 0.6);
     }
 }

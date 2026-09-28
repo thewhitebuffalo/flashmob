@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::arcflash::{self, IeeeInput};
+use crate::arcflash::{self, EnergySegment, IeeeInput};
 use crate::curves::{self, curve_label};
 use crate::fault::{self, FaultResult};
 use crate::loadflow::{self, LoadflowResult};
@@ -142,6 +142,8 @@ pub struct ArcRow {
     pub bus_name: String,
     pub assumed: bool,
     pub electrode: String,
+    /// Bolted and arcing currents at fault inception. Integrated energy below
+    /// uses the full entered decrement profile when decrement_applied is true.
     pub bolted_ka: f64,
     pub arcing_ka: f64,
     pub arcing_min_ka: f64,
@@ -161,6 +163,12 @@ pub struct ArcRow {
     pub upstream_device: Option<String>,
     pub standard: String,
     pub warnings: Vec<String>,
+    /// True when supplied source-current decrement points were used to
+    /// integrate the incident energy and boundary over the arc duration.
+    #[serde(default)]
+    pub decrement_applied: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decrement_source_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -261,7 +269,7 @@ fn run_one(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
     let protection = crate::protection::identify_all(project);
     let mut arc_flash_failures = Vec::new();
     let arc_flash = if studies.arcflash {
-        Some(arc_flash(project, fault.as_ref().unwrap(), &protection, &mut warnings, &mut arc_flash_failures))
+        Some(arc_flash(project, loadflow.as_ref(), fault.as_ref().unwrap(), &protection, &mut warnings, &mut arc_flash_failures))
     } else {
         None
     };
@@ -406,8 +414,9 @@ fn scenario_envelope(project: &Project, normal: &StudyOutput, studies: Studies) 
     ScenarioEnvelope { buses, arc_equipment }
 }
 
-fn arc_flash(project: &Project, fault: &FaultResult, protection: &[crate::protection::Protection], warnings: &mut Vec<String>, failures: &mut Vec<ArcFailure>) -> Vec<ArcRow> {
+fn arc_flash(project: &Project, loadflow: Option<&LoadflowResult>, fault: &FaultResult, protection: &[crate::protection::Protection], warnings: &mut Vec<String>, failures: &mut Vec<ArcFailure>) -> Vec<ArcRow> {
     let mut rows = Vec::new();
+    let mut decrement_cache = DecrementFaultCache::default();
     for case in cases(project, protection) {
         let mut fail = |error: String| {
             warnings.push(format!("{}: {error}", case.name));
@@ -415,6 +424,7 @@ fn arc_flash(project: &Project, fault: &FaultResult, protection: &[crate::protec
         };
         let assumed = case.id.starts_with("assumed:") || case.basis == "assumed";
         let Some(bus) = project.bus(&case.bus) else { fail("unknown bus".into()); continue };
+        let decrement_source_ids = curved_sources_reaching(project, &case.bus);
         let Some(bus_fault) = fault.buses.iter().find(|b| b.id == bus.id) else { fail("missing fault result".into()); continue };
         let Some(bolted) = bus_fault.three_phase.as_ref().map(|p| p.symmetrical_ka) else {
             fail(bus_fault.note.clone().unwrap_or_else(|| "no three-phase fault current".into()));
@@ -444,14 +454,27 @@ fn arc_flash(project: &Project, fault: &FaultResult, protection: &[crate::protec
             }
         };
         let protection = protection.iter().find(|p| p.bus_id == case.bus).expect("validated bus has protection status");
-        let full_clear = match duration(project, &case, bus_fault, preview.i_arc_ka, protection) {
+        let full_clear = match if decrement_source_ids.is_empty() {
+            duration(project, &case, bus_fault, preview.i_arc_ka, protection)
+        } else {
+            decrement_duration(project, &case, bus_fault, preview.i_arc_ka, protection)
+        } {
             Ok(v) => v, Err(e) => { fail(e); continue; }
         };
-        let min_clear = match duration(project, &case, bus_fault, preview.i_arc_min_ka, protection) {
+        let min_clear = match if decrement_source_ids.is_empty() {
+            duration(project, &case, bus_fault, preview.i_arc_min_ka, protection)
+        } else {
+            decrement_duration(project, &case, bus_fault, preview.i_arc_min_ka, protection)
+        } {
             Ok(v) => v, Err(e) => { fail(e); continue; }
         };
         let input = IeeeInput { time_s: full_clear.seconds, time_min_s: min_clear.seconds, ..preview_input(&case, bus.kv, bolted) };
-        match arcflash::calculate(&input) {
+        let integrated = if decrement_source_ids.is_empty() {
+            arcflash::calculate(&input)
+        } else {
+            calculate_decrement_arc(project, loadflow, &case.bus, &input, &decrement_source_ids, &mut decrement_cache)
+        };
+        match integrated {
             Ok(out) => {
                 if assumed {
                     warnings.push(format!(
@@ -487,6 +510,8 @@ fn arc_flash(project: &Project, fault: &FaultResult, protection: &[crate::protec
                     duration_note: governing_clear.note.clone(),
                     upstream_device: case.upstream_device.clone(),
                     standard: out.standard.into(),
+                    decrement_applied: !decrement_source_ids.is_empty(),
+                    decrement_source_ids: decrement_source_ids.clone(),
                     warnings: {
                         let mut notes = out.warnings;
                         for clear in [&full_clear, &min_clear] {
@@ -500,6 +525,129 @@ fn arc_flash(project: &Project, fault: &FaultResult, protection: &[crate::protec
         }
     }
     rows
+}
+
+/// A sampled generator-current curve says nothing about a relay's memory,
+/// reset, or fuse melting behavior. Use a duration entered for this operating
+/// case; never silently reuse the time obtained from the initial current.
+fn decrement_duration(project: &Project, equipment: &ArcEquipment, fault: &crate::fault::BusFault, i_ka: f64, protection: &crate::protection::Protection) -> Result<Clearing, String> {
+    if equipment.clearing_s.is_some() {
+        return duration(project, equipment, fault, i_ka, protection);
+    }
+    if let Some(seconds) = equipment.fallback_duration_s {
+        let mut clear = finish_clearing(seconds, project.arc_duration_cap_s,
+            &format!("entered assumed exposure duration of {seconds:.3} s with source-current decrement"),
+            "This cap is not a field trip setting and is not for an arc-flash label.");
+        clear.assumed = true;
+        clear.note.push_str(" Protective-device clearing under time-varying current has not been established.");
+        return Ok(clear);
+    }
+    Err("source-current decrement is supplied, but protective-device clearing under time-varying current is unresolved; enter clearing_s or an explicit fallback_duration_s for this operating case".into())
+}
+
+fn calculate_decrement_arc(project: &Project, loadflow: Option<&LoadflowResult>, bus_id: &str, input: &IeeeInput, decrement_source_ids: &[String], cache: &mut DecrementFaultCache) -> Result<arcflash::IeeeOutput, String> {
+    let mut out = arcflash::calculate(input)?;
+    let full_segments = decrement_segments(project, loadflow, bus_id, input.time_s, decrement_source_ids, cache)?;
+    let reduced_segments = if (input.time_s - input.time_min_s).abs() < 1e-12 {
+        full_segments.clone()
+    } else {
+        decrement_segments(project, loadflow, bus_id, input.time_min_s, decrement_source_ids, cache)?
+    };
+    let full = arcflash::integrate_profile(input, &full_segments, false)?;
+    let reduced = arcflash::integrate_profile(input, &reduced_segments, true)?;
+    out.energy_cal_cm2 = full.energy_cal_cm2;
+    out.energy_min_cal_cm2 = reduced.energy_cal_cm2;
+    out.energy_j_cm2 = full.energy_cal_cm2 * 4.184;
+    out.energy_min_j_cm2 = reduced.energy_cal_cm2 * 4.184;
+    out.afb_full_mm = full.boundary_mm;
+    out.afb_reduced_mm = reduced.boundary_mm;
+    out.afb_mm = full.boundary_mm.max(reduced.boundary_mm);
+    out.afb_in = out.afb_mm / 25.4;
+    if reduced.energy_cal_cm2 >= full.energy_cal_cm2 {
+        out.governing = "reduced_arcing";
+        out.governing_cal_cm2 = reduced.energy_cal_cm2;
+    } else {
+        out.governing = "arcing";
+        out.governing_cal_cm2 = full.energy_cal_cm2;
+    }
+    out.governing_j_cm2 = out.governing_cal_cm2 * 4.184;
+    for warning in full.warnings.into_iter().chain(reduced.warnings) {
+        if !out.warnings.contains(&warning) { out.warnings.push(warning); }
+    }
+    out.warnings.push("Source-current decrement was applied with repeated quasi-steady three-phase network solves and piecewise IEEE 1584 incident-energy integration; source X/R was held constant.".into());
+    Ok(out)
+}
+
+fn curved_sources_reaching(project: &Project, bus_id: &str) -> Vec<String> {
+    let mut connected = std::collections::HashSet::from([bus_id.to_string()]);
+    loop {
+        let prior = connected.len();
+        for branch in project.branches.iter().filter(|branch| project.branch_closed(branch)) {
+            if connected.contains(&branch.from) { connected.insert(branch.to.clone()); }
+            if connected.contains(&branch.to) { connected.insert(branch.from.clone()); }
+        }
+        if connected.len() == prior { break; }
+    }
+    project.sources.iter()
+        .filter(|source| source.in_service && !source.decrement_curve.is_empty() && connected.contains(&source.bus))
+        .map(|source| source.id.clone()).collect()
+}
+
+const DECREMENT_STEP_S: f64 = 0.01;
+
+#[derive(Default)]
+struct DecrementFaultCache {
+    /// One network solve at each sampled time serves every arc-equipment item
+    /// and both the full and reduced-current integrations in this case.
+    bolted_by_time: std::collections::HashMap<u64, std::collections::HashMap<String, f64>>,
+}
+
+impl DecrementFaultCache {
+    fn bolted_at(&mut self, project: &Project, loadflow: Option<&LoadflowResult>, bus_id: &str, midpoint_s: f64) -> Result<f64, String> {
+        let key = midpoint_s.to_bits();
+        if !self.bolted_by_time.contains_key(&key) {
+            let mut snapshot = project.clone();
+            for source in snapshot.sources.iter_mut().filter(|source| source.in_service && !source.decrement_curve.is_empty()) {
+                let ratio = source.decrement_ratio_at(midpoint_s);
+                source.mva_sc *= ratio;
+            }
+            let sampled_fault = fault::solve(&snapshot, loadflow)?;
+            if !sampled_fault.valid {
+                return Err(sampled_fault.error.unwrap_or_else(|| "time-varying fault result is invalid".into()));
+            }
+            let bolted_by_bus = sampled_fault.buses.into_iter().filter_map(|bus| {
+                bus.three_phase.map(|point| (bus.id, point.symmetrical_ka))
+            }).collect();
+            self.bolted_by_time.insert(key, bolted_by_bus);
+        }
+        self.bolted_by_time[&key].get(bus_id).copied()
+            .ok_or_else(|| format!("no three-phase fault current at bus '{bus_id}' during decrement profile"))
+    }
+}
+
+fn decrement_segments(project: &Project, loadflow: Option<&LoadflowResult>, bus_id: &str, duration_s: f64, decrement_source_ids: &[String], cache: &mut DecrementFaultCache) -> Result<Vec<EnergySegment>, String> {
+    let mut segments = Vec::new();
+    let mut time_s = 0.0;
+    while duration_s - time_s > 1e-12 {
+        if segments.len() >= 10_000 {
+            return Err("source-current decrement interval exceeds 10,000 slices; reduce the arc duration or provide a shorter exposure limit".into());
+        }
+        let mut end_s = (time_s + DECREMENT_STEP_S).min(duration_s);
+        // The derivative of an entered profile changes at a recorded point.
+        // Keep each such point as an integration boundary.
+        for source in project.sources.iter().filter(|source| decrement_source_ids.contains(&source.id)) {
+            if let Some(next) = source.decrement_curve.iter()
+                .find(|point| point.time_s > time_s + 1e-12 && point.time_s < end_s - 1e-12) {
+                end_s = next.time_s;
+            }
+        }
+        let width_s = end_s - time_s;
+        let midpoint_s = time_s + width_s / 2.0;
+        let bolted = cache.bolted_at(project, loadflow, bus_id, midpoint_s)?;
+        segments.push(EnergySegment { ibf_ka: bolted, duration_s: width_s });
+        time_s = end_s;
+    }
+    Ok(segments)
 }
 
 fn preview_input(case: &ArcEquipment, kv: f64, bolted: f64) -> IeeeInput {
@@ -711,6 +859,9 @@ pub fn text_report(project: &Project, out: &StudyOutput) -> String {
             }
             for row in mine {
                 lines.push(format!("    {}", row.duration_note));
+                if row.decrement_applied {
+                    lines.push(format!("    Source-current decrement integrated for: {}", row.decrement_source_ids.join(", ")));
+                }
                 lines.push(format!(
                     "    IEEE 1584-2018  {:.2} cal/cm2  AFB {:.1} in  ({})",
                     row.governing_cal_cm2, row.afb_in, row.governing

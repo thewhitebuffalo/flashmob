@@ -419,6 +419,7 @@ mod tests {
                 name: "slack".into(),
                 bus: "a".into(),
                 in_service: true,
+                decrement_curve: Vec::new(),
                 v_pu: 1.0,
                 angle_deg: 0.0,
                 mva_sc: 10_000.0,
