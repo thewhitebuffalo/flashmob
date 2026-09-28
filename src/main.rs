@@ -17,7 +17,7 @@ mod ui;
     about = "Load flow, short circuit, coordination, and IEEE 1584-2018 arc flash",
     long_about = "Flashmob is a power-system study tool.\n\n\
 The window is `flashmob gui`.\n\n\
-For a model or any other headless caller, stdout of schema, sample, validate, run, exec, sld, and tcc is data and there are no prompts. \
+For a model or any other headless caller, stdout of schema, sample, validate, topology, run, exec, sld, and tcc is data and there are no prompts. \
 `flashmob schema` describes the JSON project and the exec protocol. \
 `flashmob sld` writes a single-line diagram with short-circuit and arc-flash results on every bus. \
 `flashmob tcc` writes a time-current curve."
@@ -46,6 +46,13 @@ enum Command {
     /// Check a project file. Prints JSON.
     Validate {
         path: PathBuf,
+    },
+    /// Print entered bus, branch, and component connections as JSON. No study is run.
+    Topology {
+        /// Project JSON file. Use - to read stdin.
+        path: PathBuf,
+        #[arg(long)]
+        compact: bool,
     },
     /// Run studies. Prints JSON, or a text report with --text.
     Run {
@@ -111,6 +118,11 @@ fn main() -> ExitCode {
                 emit(&serde_json::json!({"ok": errors.is_empty(), "errors": errors}), false)
                     .max_code(if errors.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) })
             }
+            Err(err) => fail(&err),
+        },
+        Command::Topology { path, compact } => match read_project(&path)
+            .and_then(|project| flashmob::connectivity::topology(&project)) {
+            Ok(topology) => emit(&serde_json::json!({"ok": true, "topology": topology}), compact),
             Err(err) => fail(&err),
         },
         Command::Run { path, study, text, compact } => match read_project(&path).and_then(|p| Studies::parse(&study).map(|s| (p, s))) {

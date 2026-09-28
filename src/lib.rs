@@ -3,11 +3,13 @@
 //! the headless JSON command line.
 
 pub mod arcflash;
+pub mod connectivity;
 pub mod curves;
 pub mod exec;
 pub mod fault;
 pub mod loadflow;
 pub mod model;
+pub mod protection;
 pub mod skm;
 pub mod sld;
 pub mod study;

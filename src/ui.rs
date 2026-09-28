@@ -141,6 +141,10 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("FLASHMOB").size(16.0).strong().color(color("#E2E8F0")));
                 ui.label(RichText::new(self.project.name.to_uppercase()).size(14.0).color(color("#94A3B8")));
+                if !self.project.assumptions.is_empty() {
+                    ui.label(RichText::new("PRELIMINARY - ASSUMPTIONS APPLY").color(color("#FFB300")))
+                        .on_hover_text(self.project.assumptions.iter().map(|a| format!("{}: {}", a.id, a.statement)).collect::<Vec<_>>().join("\n\n"));
+                }
                 ui.separator();
                 if ui.button("Run").clicked() {
                     self.run_study();
@@ -384,7 +388,7 @@ impl App {
                 ui.label(format!("{:.2}", row.bolted_ka));
                 ui.label(format!("{:.2}", row.arcing_ka));
                 let seconds = if row.governing == "reduced_arcing" { row.time_min_s } else { row.time_s };
-                ui.label(format!("{seconds:.3}"));
+                ui.label(format!("{seconds:.3}")).on_hover_text(&row.duration_note);
                 ui.label(RichText::new(format!("{:.2}", row.governing_cal_cm2)).color(color(sld::energy_color(row.governing_cal_cm2))));
                 ui.label(format!("{:.0}", row.afb_in));
                 ui.end_row();
@@ -430,6 +434,11 @@ impl App {
         };
         if edited { self.results = None; self.status = "Results stale — model edited; run the study".into(); }
         if let Some(results) = &self.results {
+            if let Some(protection) = results.protection.iter().find(|p| p.bus_id == id) {
+                ui.separator();
+                ui.label(RichText::new("Protection from topology").strong());
+                ui.label(&protection.detail);
+            }
             for f in results.arc_flash_failures.iter().filter(|f| f.bus_id == id) { ui.label(format!("Arc flash FAILED: {}", f.error)); }
             if let Some(fault) = results.fault.as_ref().and_then(|f| f.buses.iter().find(|b| b.id == id)) {
                 ui.separator();
@@ -447,9 +456,10 @@ impl App {
                     ui.label(RichText::new(&row.name).strong().color(color(sld::energy_color(row.governing_cal_cm2))));
                     ui.label(format!("{:.2} cal/cm²    AFB {:.0} in", row.governing_cal_cm2, row.afb_in));
                     ui.label(format!("Arcing {:.2} / {:.2} kA", row.arcing_ka, row.arcing_min_ka));
+                    ui.label(&row.duration_note);
                     ui.label(format!("IEEE 1584-2018  {}", row.electrode));
                     if row.assumed {
-                        ui.label("Enclosure is assumed from the bus voltage.");
+                        ui.label("Assumed inputs: see duration note and equipment record.");
                     }
                 }
             }

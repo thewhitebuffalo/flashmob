@@ -4,7 +4,7 @@ use crate::cplx::Cplx;
 use crate::loadflow::LoadflowResult;
 use crate::model::{i_base_ka, Prefault, Project};
 use crate::network::{self, Net};
-use crate::solve::zth;
+use crate::solve::AdmittanceSolver;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FaultResult {
@@ -56,14 +56,26 @@ pub struct FaultPoint {
 
 pub fn solve(project: &Project, loadflow: Option<&LoadflowResult>) -> Result<FaultResult, String> {
     let model = network::build(project)?;
+    solve_with_model(project, loadflow, &model)
+}
+
+pub(crate) fn solve_with_model(project: &Project, loadflow: Option<&LoadflowResult>, model: &network::SystemModel) -> Result<FaultResult, String> {
     let n = model.index.n;
     let (z1, map1) = reduced(&model.pos, &model.energized)?;
     let (z2, map2) = reduced(&model.neg, &model.energized)?;
     let (z0, map0) = reduced(&model.zero, &model.energized)?;
 
+    let mut pos = AdmittanceSolver::new(&z1);
+    let mut neg = AdmittanceSolver::new(&z2);
+    let mut zero = AdmittanceSolver::new(&z0);
+
     let requested = if project.prefault == Prefault::Loadflow { "loadflow" } else { "flat_1.0_pu" };
-    let lf_valid = loadflow.map_or(false, |lf| lf.converged && model.index.id_of.iter().all(|id|
-        lf.buses.iter().any(|b| b.id == *id && b.v_pu.is_finite() && b.v_pu > 0.0 && b.angle_deg.is_finite())));
+    let lf_valid = loadflow.map_or(false, |lf| lf.converged && model.index.id_of.iter().enumerate().all(|(i, id)|
+        lf.buses.iter().any(|b| b.id == *id && b.angle_deg.is_finite() && if model.energized[i] {
+            b.v_pu.is_finite() && b.v_pu > 0.0
+        } else {
+            b.kind == "unenergized" && b.v_pu == 0.0
+        })));
     let valid = project.prefault != Prefault::Loadflow || lf_valid;
     let error = if valid { None } else { Some("requested loadflow prefault unavailable or unconverged; method used: none; fault and arc-flash results invalid".to_string()) };
     let mut prefault_v = vec![Cplx::real(1.0); n];
@@ -81,7 +93,7 @@ pub fn solve(project: &Project, loadflow: Option<&LoadflowResult>) -> Result<Fau
         }
     }
 
-    let mut buses = Vec::new();
+    let mut buses = Vec::with_capacity(n);
     for i in 0..n {
         if !valid || !model.energized[i] {
             buses.push(BusFault {
@@ -94,9 +106,10 @@ pub fn solve(project: &Project, loadflow: Option<&LoadflowResult>) -> Result<Fau
         }
         let v = prefault_v[i];
         let ibase = i_base_ka(model.index.kv[i], project.s_base_mva);
-        let zz1 = zth(&z1, &map1, i)?;
-        let zz2 = zth(&z2, &map2, i)?;
-        let zz0 = zth(&z0, &map0, i)?;
+        let column1 = map1[i].map(|k| pos.column(k)).transpose()?;
+        let zz1 = map1[i].zip(column1.as_ref()).map(|(k, col)| col[k]);
+        let zz2 = neg.zth(map2[i])?;
+        let zz0 = zero.zth(map0[i])?;
         let mut note = None;
         let three = match zz1 {
             Some(z) => { checked_impedance(z)?; Some(point(v / z, Cplx::ZERO, Cplx::ZERO, z, ibase)?) },
@@ -137,10 +150,14 @@ pub fn solve(project: &Project, loadflow: Option<&LoadflowResult>) -> Result<Fau
         // Solve the voltage decrement caused by the fault current injection.
         // LF prefault includes initial branch flow; flat prefault neglects initial load flow.
         let mut terminal_currents = Vec::new();
-        if let (Some(k), Some(z)) = (map1[i], zz1) {
-            let mut inj = vec![Cplx::ZERO; z1.n];
-            inj[k] = v / z;
-            let drop = crate::solve::solve_y(&z1, &inj)?;
+        if let (Some(mut drop), Some(z)) = (column1, zz1) {
+            // Y^-1 (e_k * I_fault) = (Y^-1 e_k) * I_fault.
+            let current = v / z;
+            for value in &mut drop { *value = *value * current; }
+            if drop.iter().any(|v| !v.re.is_finite() || !v.im.is_finite()) {
+                return Err("non-finite linear solution".into());
+            }
+            terminal_currents.reserve(project.branches.len());
             for (branch, stamp) in project.branches.iter().zip(&model.branches) {
                 let (Some(f), Some(t)) = (map1[stamp.from], map1[stamp.to]) else { continue };
                 let q = stamp.positive;

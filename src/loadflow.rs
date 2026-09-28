@@ -68,8 +68,43 @@ pub fn solve(project: &Project) -> Result<LoadflowResult, String> {
         return Err("mark one source as the slack bus (is_slack: true)".into());
     }
     let model = network::build(project)?;
+    solve_with_model(project, &model)
+}
+
+pub(crate) fn solve_with_model(project: &Project, model: &network::SystemModel) -> Result<LoadflowResult, String> {
+    if project.buses.is_empty() { return Err("the project has no buses".into()); }
+    if !project.sources.iter().any(|s| s.is_slack) {
+        return Err("mark one source as the slack bus (is_slack: true)".into());
+    }
     let n = model.index.n;
     let sbase = project.s_base_mva;
+    // A source-free island has no voltage reference and cannot enter the
+    // Newton equations. Energized islands each require a slack source.
+    let mut adjacent = vec![Vec::new(); n];
+    for &(from, to) in &model.pos.edges {
+        adjacent[from].push(to);
+        adjacent[to].push(from);
+    }
+    let mut has_slack_path = vec![false; n];
+    let mut stack = Vec::new();
+    for source in project.sources.iter().filter(|source| source.is_slack) {
+        let i = model.index.of(&source.bus)?;
+        if !has_slack_path[i] {
+            has_slack_path[i] = true;
+            stack.push(i);
+        }
+    }
+    while let Some(i) = stack.pop() {
+        for &j in &adjacent[i] {
+            if !has_slack_path[j] {
+                has_slack_path[j] = true;
+                stack.push(j);
+            }
+        }
+    }
+    if let Some(i) = (0..n).find(|&i| model.energized[i] && !has_slack_path[i]) {
+        return Err(format!("energized island at bus '{}' has no slack source", model.index.id_of[i]));
+    }
     let mut spec = vec![
         Spec { kind: Kind::Pq, v: 1.0, ang: 0.0, p: 0.0, q: 0.0, qmin: 0.0, qmax: 0.0 };
         n
@@ -105,7 +140,8 @@ pub fn solve(project: &Project) -> Result<LoadflowResult, String> {
     let demand: Vec<f64> = spec.iter().map(|s| -s.q).collect();
     let pv: Vec<bool> = spec.iter().map(|s| s.kind == Kind::Pv).collect();
     let mut limited = vec![0i8; n];
-    let mut v: Vec<f64> = spec.iter().map(|s| s.v).collect();
+    let mut v: Vec<f64> = spec.iter().enumerate()
+        .map(|(i, s)| if model.energized[i] { s.v } else { 0.0 }).collect();
     let mut ang: Vec<f64> = spec.iter().map(|s| s.ang).collect();
     let mut converged = false;
     let mut iterations = 0;
@@ -115,7 +151,7 @@ pub fn solve(project: &Project) -> Result<LoadflowResult, String> {
     for iter in 1..=100 {
         iterations = iter;
         let (p, q) = injections(&model.loadflow, &v, &ang);
-        let (ang_idx, v_idx, nunk) = unknowns(&spec);
+        let (ang_idx, v_idx, nunk) = unknowns(&spec, &model.energized);
         max_mismatch = 0.0;
         if nunk == 0 {
             converged = true;
@@ -194,6 +230,12 @@ pub fn solve(project: &Project) -> Result<LoadflowResult, String> {
     if !converged && message.is_none() {
         message = Some(format!("load flow did not converge (mismatch {max_mismatch:.3e} pu)"));
     }
+    if converged {
+        let skipped = model.energized.iter().filter(|&&on| !on).count();
+        if skipped > 0 {
+            message = Some(format!("{skipped} unenergized bus(es) excluded from load flow"));
+        }
+    }
 
     let (p, q) = injections(&model.loadflow, &v, &ang);
     let mut buses = Vec::new();
@@ -206,11 +248,11 @@ pub fn solve(project: &Project) -> Result<LoadflowResult, String> {
             angle_deg: ang[i].to_degrees(),
             p_mw: p[i] * sbase,
             q_mvar: q[i] * sbase,
-            kind: match spec[i].kind {
+            kind: if !model.energized[i] { "unenergized" } else { match spec[i].kind {
                 Kind::Slack => "slack",
                 Kind::Pv => "pv",
                 Kind::Pq => "pq",
-            }
+            }}
             .into(),
         });
     }
@@ -262,19 +304,19 @@ fn injections(y: &SparseY, v: &[f64], ang: &[f64]) -> (Vec<f64>, Vec<f64>) {
     (p, q)
 }
 
-fn unknowns(spec: &[Spec]) -> (Vec<Option<usize>>, Vec<Option<usize>>, usize) {
+fn unknowns(spec: &[Spec], energized: &[bool]) -> (Vec<Option<usize>>, Vec<Option<usize>>, usize) {
     let n = spec.len();
     let mut ang_idx = vec![None; n];
     let mut v_idx = vec![None; n];
     let mut k = 0;
     for (i, s) in spec.iter().enumerate() {
-        if s.kind != Kind::Slack {
+        if energized[i] && s.kind != Kind::Slack {
             ang_idx[i] = Some(k);
             k += 1;
         }
     }
     for (i, s) in spec.iter().enumerate() {
-        if s.kind == Kind::Pq {
+        if energized[i] && s.kind == Kind::Pq {
             v_idx[i] = Some(k);
             k += 1;
         }

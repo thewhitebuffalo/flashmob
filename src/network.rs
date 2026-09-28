@@ -137,6 +137,11 @@ pub struct SystemModel {
 pub fn build(project: &Project) -> Result<SystemModel, String> {
     let errors = project.validate();
     if !errors.is_empty() { return Err(errors.join("; ")); }
+    build_validated(project)
+}
+
+/// Build only after validating this unchanged project snapshot.
+pub(crate) fn build_validated(project: &Project) -> Result<SystemModel, String> {
     let index = Index::build(project)?;
     let n = index.n;
     let mut loadflow = SparseY::new(n);
@@ -225,20 +230,27 @@ fn stamp_branch(project: &Project, index: &Index, branch: &Branch, warnings: &mu
                     branch.name, index.kv[i], index.kv[j]
                 ));
             }
-            let zb = zbase_ohm(index.kv[i], project.s_base_mva);
-            let z1 = Cplx::new(r_ohm / zb, x_ohm / zb);
+            let zb_from = zbase_ohm(index.kv[i], project.s_base_mva);
+            let zb_to = zbase_ohm(index.kv[j], project.s_base_mva);
+            let base_ratio = Cplx::real(index.kv[j] / index.kv[i]);
+            // A physical series impedance has different per-unit admittances
+            // at differently based buses. The off-diagonal term uses both
+            // voltage bases; treating them as equal creates zero-current lines
+            // between unequal physical voltages.
+            let z1 = Cplx::new(r_ohm / zb_to, x_ohm / zb_to);
             let y = z1.inv().ok_or_else(|| format!("line '{}' has zero impedance", branch.id))?;
-            let b = Cplx::new(0.0, b_siemens * zb / 2.0);
-            let q = Quad { yff: y + b, yft: -y, ytf: -y, ytt: y + b };
+            let mut q = quad(y, base_ratio)?;
+            q.yff += Cplx::new(0.0, b_siemens * zb_from / 2.0);
+            q.ytt += Cplx::new(0.0, b_siemens * zb_to / 2.0);
             let (r0, x0) = if r0_ohm.abs() < 1e-12 && x0_ohm.abs() < 1e-12 {
                 { warnings.push(format!("line {}: R0=3R1 and X0=3X1 assumed", branch.id)); (3.0 * r_ohm, 3.0 * x_ohm) }
             } else {
                 (*r0_ohm, *x0_ohm)
             };
             if *b_siemens != 0.0 { warnings.push(format!("line {}: zero-sequence charging omitted; B0 was not supplied", branch.id)); }
-            let y0 = Cplx::new(r0 / zb, x0 / zb).inv()
+            let y0 = Cplx::new(r0 / zb_to, x0 / zb_to).inv()
                 .ok_or_else(|| format!("line {}: zero or non-finite zero-sequence impedance", branch.id))?;
-            let zero = ZeroStamp::Series(Quad { yff: y0, yft: -y0, ytf: -y0, ytt: y0 });
+            let zero = ZeroStamp::Series(quad(y0, base_ratio)?);
             Ok(BranchStamp {
                 from: i,
                 to: j,

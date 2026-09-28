@@ -48,6 +48,8 @@ pub struct StudyOutput {
     pub arc_flash: Option<Vec<ArcRow>>,
     pub coordination: Option<Vec<CoordRow>>,
     pub arc_flash_failures: Vec<ArcFailure>,
+    #[serde(default)]
+    pub protection: Vec<crate::protection::Protection>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -110,19 +112,17 @@ pub struct CoordRow {
 
 pub fn run(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
     let errors = project.validate();
-    if !errors.is_empty() {
-        return Err(errors.join("; "));
-    }
+    if !errors.is_empty() { return Err(errors.join("; ")); }
     let started = std::time::Instant::now();
-    let mut warnings = Vec::new();
-    if let Ok(model) = crate::network::build(project) {
-        warnings.extend(model.warnings);
-    }
+    let model = crate::network::build_validated(project);
+    let mut warnings = model.as_ref().map(|m| m.warnings.clone()).unwrap_or_default();
     let need_lf = studies.loadflow || project.prefault == crate::model::Prefault::Loadflow;
     let need_fault = studies.fault || studies.arcflash || studies.coordination;
 
     let loadflow = if need_lf {
-        match loadflow::solve(project) {
+        let result = model.as_ref().map_err(Clone::clone)
+            .and_then(|model| loadflow::solve_with_model(project, model));
+        match result {
             Ok(result) => {
                 if let Some(msg) = &result.message {
                     warnings.push(msg.clone());
@@ -139,14 +139,15 @@ pub fn run(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
     };
 
     let fault = if need_fault {
-        Some(fault::solve(project, loadflow.as_ref())?)
+        Some(fault::solve_with_model(project, loadflow.as_ref(), model.as_ref().map_err(Clone::clone)?)?)
     } else {
         None
     };
 
+    let protection = crate::protection::identify_all(project);
     let mut arc_flash_failures = Vec::new();
     let arc_flash = if studies.arcflash {
-        Some(arc_flash(project, fault.as_ref().unwrap(), &mut warnings, &mut arc_flash_failures))
+        Some(arc_flash(project, fault.as_ref().unwrap(), &protection, &mut warnings, &mut arc_flash_failures))
     } else {
         None
     };
@@ -174,12 +175,13 @@ pub fn run(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
         arc_flash,
         coordination,
         arc_flash_failures,
+        protection,
     })
 }
 
-fn arc_flash(project: &Project, fault: &FaultResult, warnings: &mut Vec<String>, failures: &mut Vec<ArcFailure>) -> Vec<ArcRow> {
+fn arc_flash(project: &Project, fault: &FaultResult, protection: &[crate::protection::Protection], warnings: &mut Vec<String>, failures: &mut Vec<ArcFailure>) -> Vec<ArcRow> {
     let mut rows = Vec::new();
-    for case in cases(project) {
+    for case in cases(project, protection) {
         let mut fail = |error: String| {
             warnings.push(format!("{}: {error}", case.name));
             failures.push(ArcFailure { equipment_id: case.id.clone(), name: case.name.clone(), bus_id: case.bus.clone(), error });
@@ -214,10 +216,11 @@ fn arc_flash(project: &Project, fault: &FaultResult, warnings: &mut Vec<String>,
                 continue;
             }
         };
-        let full_clear = match duration(project, &case, bus_fault, preview.i_arc_ka) {
+        let protection = protection.iter().find(|p| p.bus_id == case.bus).expect("validated bus has protection status");
+        let full_clear = match duration(project, &case, bus_fault, preview.i_arc_ka, protection) {
             Ok(v) => v, Err(e) => { fail(e); continue; }
         };
-        let min_clear = match duration(project, &case, bus_fault, preview.i_arc_min_ka) {
+        let min_clear = match duration(project, &case, bus_fault, preview.i_arc_min_ka, protection) {
             Ok(v) => v, Err(e) => { fail(e); continue; }
         };
         let input = IeeeInput { time_s: full_clear.seconds, time_min_s: min_clear.seconds, ..preview_input(&case, bus.kv, bolted) };
@@ -238,7 +241,7 @@ fn arc_flash(project: &Project, fault: &FaultResult, warnings: &mut Vec<String>,
                     name: case.name,
                     bus_id: bus.id.clone(),
                     bus_name: bus.name.clone(),
-                    assumed,
+                    assumed: assumed || full_clear.assumed || min_clear.assumed,
                     electrode: case.electrode.as_str().into(),
                     bolted_ka: bolted,
                     arcing_ka: out.i_arc_ka,
@@ -257,7 +260,13 @@ fn arc_flash(project: &Project, fault: &FaultResult, warnings: &mut Vec<String>,
                     duration_note: governing_clear.note.clone(),
                     upstream_device: case.upstream_device.clone(),
                     standard: out.standard.into(),
-                    warnings: out.warnings,
+                    warnings: {
+                        let mut notes = out.warnings;
+                        for clear in [&full_clear, &min_clear] {
+                            if clear.assumed && !notes.contains(&clear.note) { notes.push(clear.note.clone()); }
+                        }
+                        notes
+                    },
                 });
             }
             Err(err) => fail(err),
@@ -281,7 +290,7 @@ fn preview_input(case: &ArcEquipment, kv: f64, bolted: f64) -> IeeeInput {
     }
 }
 
-fn cases(project: &Project) -> Vec<ArcEquipment> {
+fn cases(project: &Project, protection: &[crate::protection::Protection]) -> Vec<ArcEquipment> {
     let mut cases = project.equipment.clone();
     for bus in &project.buses {
         if cases.iter().any(|e| e.bus == bus.id) {
@@ -302,8 +311,14 @@ fn cases(project: &Project) -> Vec<ArcEquipment> {
             depth_mm: depth,
             upstream_device: upstream,
             clearing_s: None,
+            fallback_duration_s: None,
             basis: "assumed".into(),
         });
+    }
+    for case in &mut cases {
+        if case.upstream_device.is_none() {
+            case.upstream_device = protection.iter().find(|p| p.bus_id == case.bus).and_then(|p| p.device_id.clone());
+        }
     }
     cases
 }
@@ -312,23 +327,36 @@ struct Clearing {
     seconds: f64,
     capped: bool,
     note: String,
+    assumed: bool,
 }
 
-fn duration(project: &Project, case: &ArcEquipment, fault: &crate::fault::BusFault, i_ka: f64) -> Result<Clearing, String> {
+fn duration(project: &Project, case: &ArcEquipment, fault: &crate::fault::BusFault, i_ka: f64, protection: &crate::protection::Protection) -> Result<Clearing, String> {
     let cap = project.arc_duration_cap_s;
     let not_a_label = "This cap is not a field trip setting and is not for an arc-flash label.";
     if let Some(manual) = case.clearing_s {
-        return Ok(finish_clearing(manual, cap, &format!("manual total clearing time of {manual:.3} s"), not_a_label));
+        let basis = if case.basis == "assumed" { "assumed exposure duration" } else { "manual duration" };
+        let mut clear = finish_clearing(manual, cap, &format!("{basis} of {manual:.3} s"), not_a_label);
+        clear.assumed = case.basis == "assumed";
+        clear.note.push_str(&format!(" {} Manual duration overrides device-based clearing.", protection.detail));
+        return Ok(clear);
     }
-    let id = case.upstream_device.as_ref().ok_or("no upstream device or manual total clearing time entered")?;
+    let fallback = |reason: String| -> Result<Clearing, String> {
+        let Some(seconds) = case.fallback_duration_s else { return Err(reason) };
+        let mut clear = finish_clearing(seconds, cap, &format!("authorized assumed exposure fallback of {seconds:.3} s"), not_a_label);
+        clear.assumed = true;
+        clear.note.push_str(&format!(" {reason}. {} No device clearing time is inferred from this assumption.", protection.detail));
+        Ok(clear)
+    };
+    let Some(id) = case.upstream_device.as_ref() else { return fallback(protection.detail.clone()) };
     let device = project.device(id).ok_or("upstream device missing")?;
     let bolted = fault.three_phase.as_ref().ok_or("fault current unavailable")?.symmetrical_ka;
     let amps = device_current(project, device, fault, i_ka / bolted).ok_or("protected branch terminal current unavailable; enter protected_branch and terminal bus")?;
     if !isolates_sources(project, device, &case.bus) {
         return Err("opening the selected device does not isolate all utility/generator paths to the fault; a multi-device clearing study is required".into());
     }
-    let raw = curves::clearing_time(device, amps)
-        .ok_or("total clearing unavailable: enter operating settings and breaker interrupting time, or a fuse total-clearing curve; device may not operate at this current")?;
+    let Some(raw) = curves::clearing_time(device, amps) else {
+        return fallback(format!("Upstream device {} [{}] identified; total clearing unavailable at {amps:.0} A: enter operating settings and breaker interrupting time, or a fuse total-clearing curve; device may not operate at this current", device.name, device.id));
+    };
     Ok(finish_clearing(raw, cap, &format!("total clearing time of {} at {amps:.0} A through its protected terminal (network terminal current; loadflow prefault includes initial branch flow)", device.name), not_a_label))
 }
 
@@ -361,10 +389,11 @@ fn finish_clearing(raw: f64, cap: f64, what: &str, not_a_label: &str) -> Clearin
         Clearing {
             seconds: cap,
             capped: true,
+            assumed: false,
             note: format!("Arc duration is the {cap:.1} s cap. The {what} exceeds the cap. {not_a_label}"),
         }
     } else {
-        Clearing { seconds: raw, capped: false, note: format!("Arc duration {raw:.3} s is the {what}.") }
+        Clearing { seconds: raw, capped: false, assumed: false, note: format!("Arc duration {raw:.3} s is the {what}.") }
     }
 }
 
@@ -421,6 +450,9 @@ pub fn text_report(project: &Project, out: &StudyOutput) -> String {
     lines.push("Buses".into());
     for bus in &project.buses {
         lines.push(format!("  {}", bus.name));
+        if let Some(protection) = out.protection.iter().find(|p| p.bus_id == bus.id) {
+            lines.push(format!("    {}", protection.detail));
+        }
         if let Some(lf) = out.loadflow.as_ref().filter(|lf| lf.converged).and_then(|lf| lf.buses.iter().find(|row| row.id == bus.id)) {
             let angle = if (lf.angle_deg * 100.0).round() == 0.0 { 0.0 } else { lf.angle_deg };
             lines.push(format!("    Load flow  {:.3} pu  {angle:.2} deg", lf.v_pu));

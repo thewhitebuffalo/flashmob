@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::connectivity::{self, Topology};
 use crate::model::{ArcEquipment, Branch, BranchKind, Bus, CurveSpec, Device, Electrode, Load, Motor, Project, Source, XfmrConn};
 use crate::sld::{self, Diagram};
 use crate::study::{self, Studies, StudyOutput};
@@ -98,6 +99,7 @@ pub enum Command {
         depth_mm: f64,
         #[serde(default)] upstream_device: Option<String>,
         #[serde(default)] clearing_s: Option<f64>,
+        #[serde(default)] fallback_duration_s: Option<f64>,
         #[serde(default)] basis: String,
     },
     Remove { id: String },
@@ -118,6 +120,7 @@ pub enum Command {
         #[serde(default)] is_slack: Option<bool>,
     },
     Run { #[serde(default)] studies: Vec<String> },
+    Topology,
     Sld,
     Tcc { #[serde(default)] ref_kv: Option<f64>, #[serde(default)] devices: Vec<String> },
     /// Write the engineering data package for mapping. `output` is a directory, or an `.xml` path.
@@ -137,6 +140,8 @@ pub struct ExecResponse {
     pub warnings: Vec<String>,
     pub project: Project,
     pub results: Option<StudyOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topology: Option<Topology>,
     pub sld_svg: Option<String>,
     pub tcc_svg: Option<String>,
     pub tcc_csv: Option<String>,
@@ -154,6 +159,7 @@ pub fn exec_request(json: &str) -> ExecResponse {
                 warnings: Vec::new(),
                 project: Project::default(),
                 results: None,
+                topology: None,
                 sld_svg: None,
                 tcc_svg: None,
                 tcc_csv: None,
@@ -166,12 +172,13 @@ pub fn exec_request(json: &str) -> ExecResponse {
 
 pub fn apply(mut project: Project, commands: &[Command]) -> ExecResponse {
     let mut results = None;
+    let mut topology = None;
     let mut sld_svg = None;
     let mut tcc_svg = None;
     let mut tcc_csv = None;
     let mut skm = None;
     for (n, command) in commands.iter().enumerate() {
-        let step = apply_one(&mut project, command, &mut results, &mut sld_svg, &mut tcc_svg, &mut tcc_csv, &mut skm);
+        let step = apply_one(&mut project, command, &mut results, &mut topology, &mut sld_svg, &mut tcc_svg, &mut tcc_csv, &mut skm);
         if let Err(err) = step {
             return ExecResponse {
                 ok: false,
@@ -179,6 +186,7 @@ pub fn apply(mut project: Project, commands: &[Command]) -> ExecResponse {
                 warnings: Vec::new(),
                 project,
                 results,
+                topology,
                 sld_svg,
                 tcc_svg,
                 tcc_csv,
@@ -187,24 +195,28 @@ pub fn apply(mut project: Project, commands: &[Command]) -> ExecResponse {
         }
     }
     let warnings = results.as_ref().map(|r| r.warnings.clone()).unwrap_or_default();
-    ExecResponse { ok: true, error: None, warnings, project, results, sld_svg, tcc_svg, tcc_csv, skm }
+    ExecResponse { ok: true, error: None, warnings, project, results, topology, sld_svg, tcc_svg, tcc_csv, skm }
 }
 
 fn apply_one(
     project: &mut Project,
     command: &Command,
     results: &mut Option<StudyOutput>,
+    topology: &mut Option<Topology>,
     sld_svg: &mut Option<String>,
     tcc_svg: &mut Option<String>,
     tcc_csv: &mut Option<String>,
     skm: &mut Option<crate::skm::SkmExport>,
 ) -> Result<(), String> {
-    if !matches!(command, Command::Sld | Command::Tcc { .. } | Command::ExportSkm { .. }) {
+    if !matches!(command, Command::Topology | Command::Sld | Command::Tcc { .. } | Command::ExportSkm { .. }) {
         *results = None;
         *sld_svg = None;
         *tcc_svg = None;
         *tcc_csv = None;
         *skm = None;
+    }
+    if !matches!(command, Command::Run { .. } | Command::Topology | Command::Sld | Command::Tcc { .. } | Command::ExportSkm { .. }) {
+        *topology = None;
     }
     match command {
         Command::Sample => *project = Project::sample(),
@@ -315,7 +327,7 @@ fn apply_one(
             fresh(id, project)?;
             project.devices.push(Device { id: id.clone(), name: named(name, id), bus: bus.clone(), curve: curve.clone(), basis: basis.clone(), protected_branch: protected_branch.clone(), breaker_interrupting_s: *breaker_interrupting_s, fuse_total_clearing: *fuse_total_clearing });
         }
-        Command::AddEquipment { id, name, bus, electrode, gap_mm, distance_mm, height_mm, width_mm, depth_mm, upstream_device, clearing_s, basis } => {
+        Command::AddEquipment { id, name, bus, electrode, gap_mm, distance_mm, height_mm, width_mm, depth_mm, upstream_device, clearing_s, fallback_duration_s, basis } => {
             fresh(id, project)?;
             project.equipment.push(ArcEquipment {
                 id: id.clone(),
@@ -329,6 +341,7 @@ fn apply_one(
                 depth_mm: *depth_mm,
                 upstream_device: upstream_device.clone(),
                 clearing_s: *clearing_s,
+                fallback_duration_s: *fallback_duration_s,
                 basis: basis.clone(),
             });
         }
@@ -352,6 +365,9 @@ fn apply_one(
         Command::Run { studies } => {
             let which = Studies::parse(studies)?;
             *results = Some(study::run(project, which)?);
+        }
+        Command::Topology => {
+            *topology = Some(connectivity::topology(project)?);
         }
         Command::Sld => {
             let study = ensure_study(project, results)?;
@@ -456,6 +472,7 @@ fn op_name(command: &Command) -> &'static str {
         Command::SetBus { .. } => "set_bus",
         Command::SetSource { .. } => "set_source",
         Command::Run { .. } => "run",
+        Command::Topology => "topology",
         Command::Sld => "sld",
         Command::Tcc { .. } => "tcc",
         Command::ExportSkm { .. } => "export_skm",
@@ -474,6 +491,7 @@ pub fn schema() -> serde_json::Value {
             "schema": "flashmob schema",
             "sample": "flashmob sample",
             "validate": "flashmob validate project.json",
+            "topology": "flashmob topology project.json    # or - for stdin",
             "run": "flashmob run project.json",
             "exec": "flashmob exec request.json    # or stdin",
             "sld": "flashmob sld project.json -o diagram.svg",
@@ -484,13 +502,15 @@ pub fn schema() -> serde_json::Value {
             "project": "optional project object; omit to start empty",
             "commands": [
                 {"op": "sample"},
+                {"op": "topology"},
                 {"op": "run", "studies": ["loadflow", "fault", "arcflash", "coordination"]},
                 {"op": "sld"},
                 {"op": "tcc", "ref_kv": 0.48, "devices": []},
                 {"op": "export_skm", "output": "skm-export"}
             ]
         },
-        "exec_response": ["ok", "error", "warnings", "project", "results", "sld_svg", "tcc_svg", "tcc_csv", "skm"],
+        "exec_response": ["ok", "error", "warnings", "project", "results", "topology", "sld_svg", "tcc_svg", "tcc_csv", "skm"],
+        "topology": "Validated entered connections only: every bus lists branch terminal and neighbor plus attached source, load, motor, device, and arc equipment IDs. Global records give both branch endpoints and each device's entered protected branch terminal. Null placement means it was not entered. No study or protection inference is performed.",
         "skm": "Engineering data package for mapping; PTW import unverified: project.xml, per-component CSV, components.tab, and Revit panel/circuit schedules. See IMPORT.txt.",
         "sld": "SVG single-line diagram. Each bus card shows nominal voltage, load-flow pu voltage, symmetrical 3P and LG fault current, and the governing IEEE 1584-2018 incident energy and arc-flash boundary.",
         "tcc": "SVG log-log time-current curve plus CSV points. Current is referred to ref_kv. Fault and arcing-current markers are included when a study has been run.",
@@ -535,5 +555,33 @@ mod tests {
         let tcc = response.tcc_svg.unwrap();
         assert!(tcc.contains("MCC main") && tcc.contains("<path"));
         assert!(response.tcc_csv.unwrap().contains("time_s"));
+    }
+
+    #[test]
+    fn topology_op_is_optional_and_does_not_discard_study_results() {
+        let response = exec_request(r#"{"commands":[{"op":"sample"},{"op":"run","studies":["fault"]},{"op":"topology"}]}"#);
+        assert!(response.ok, "{:?}", response.error);
+        assert!(response.results.unwrap().fault.is_some());
+        let topology = response.topology.unwrap();
+        assert_eq!(topology.buses.len(), 3);
+        assert_eq!(topology.branches.len(), 2);
+
+        let without = exec_request(r#"{"commands":[{"op":"sample"}]}"#);
+        let json = serde_json::to_value(without).unwrap();
+        assert!(json.get("topology").is_none());
+    }
+
+    #[test]
+    fn topology_op_rejects_invalid_project_and_model_edits_clear_the_view() {
+        let mut invalid = Project::sample();
+        invalid.branches[0].to = "missing".into();
+        let response = apply(invalid, &[Command::Topology]);
+        assert!(!response.ok);
+        assert!(response.error.unwrap().contains("unknown bus 'missing'"));
+        assert!(response.topology.is_none());
+
+        let response = exec_request(r#"{"commands":[{"op":"sample"},{"op":"topology"},{"op":"set_source","id":"grid","mva_sc":300}]}"#);
+        assert!(response.ok, "{:?}", response.error);
+        assert!(response.topology.is_none());
     }
 }

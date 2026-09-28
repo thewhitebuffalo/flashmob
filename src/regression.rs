@@ -110,6 +110,92 @@ fn capacitor_and_motor_cannot_energize_an_island() {
     p.sources.clear();
     assert!(fault::solve(&p, None).unwrap().buses.iter().all(|b| b.three_phase.is_none()));
 }
+
+#[test]
+fn source_free_island_does_not_invalidate_energized_loadflow_prefault() {
+    let mut p = Project::sample();
+    p.prefault = Prefault::Loadflow;
+    let reference = study::run(&p, Studies::all()).unwrap();
+    let reference_fault = reference.fault.as_ref().unwrap().buses[0]
+        .three_phase.as_ref().unwrap().symmetrical_ka;
+    let mut orphan = p.buses[2].clone();
+    orphan.id = "orphan".into();
+    orphan.name = "Unenergized bus".into();
+    p.buses.push(orphan);
+    let mut load = p.loads[1].clone();
+    load.id = "orphan-load".into();
+    load.bus = "orphan".into();
+    p.loads.push(load);
+
+    let result = study::run(&p, Studies::all()).unwrap();
+    let flow = result.loadflow.as_ref().unwrap();
+    assert!(flow.converged, "{:?}", flow.message);
+    let orphan_flow = flow.buses.iter().find(|b| b.id == "orphan").unwrap();
+    assert_eq!(orphan_flow.kind, "unenergized");
+    assert_eq!(orphan_flow.v_pu, 0.0);
+    assert_eq!(orphan_flow.p_mw, 0.0);
+    let fault = result.fault.as_ref().unwrap();
+    assert!(fault.valid);
+    near(fault.buses[0].three_phase.as_ref().unwrap().symmetrical_ka, reference_fault, 1e-9);
+    assert!(fault.buses.iter().find(|b| b.id == "orphan").unwrap().three_phase.is_none());
+}
+
+#[test]
+fn every_energized_island_requires_its_own_slack() {
+    let mut p = Project::sample();
+    let mut island = p.buses[2].clone();
+    island.id = "second-island".into();
+    p.buses.push(island);
+    let mut source = p.sources[0].clone();
+    source.id = "second-source".into();
+    source.bus = "second-island".into();
+    source.is_slack = false;
+    p.sources.push(source);
+    let error = loadflow::solve(&p).unwrap_err();
+    assert!(error.contains("second-island") && error.contains("no slack source"), "{error}");
+    p.sources.last_mut().unwrap().is_slack = true;
+    let flow = loadflow::solve(&p).unwrap();
+    assert!(flow.converged, "{:?}", flow.message);
+    assert_eq!(flow.buses.last().unwrap().kind, "slack");
+}
+
+#[test]
+fn line_between_different_voltage_bases_obeys_physical_ohms_law() {
+    let mut p = Project::sample();
+    p.buses.truncate(2);
+    p.buses[0].kv = 0.48;
+    p.buses[1].kv = 0.46;
+    p.branches.remove(0);
+    p.branches[0].from = "util".into();
+    p.branches[0].to = "mcc".into();
+    if let BranchKind::Line { r_ohm, x_ohm, b_siemens, r0_ohm, x0_ohm, .. } = &mut p.branches[0].kind {
+        *r_ohm = 0.01;
+        *x_ohm = 0.01;
+        *b_siemens = 0.0;
+        *r0_ohm = 0.03;
+        *x0_ohm = 0.03;
+    }
+    p.loads.clear();
+    p.motors.clear();
+    p.devices.clear();
+    p.equipment.clear();
+
+    let unloaded = loadflow::solve(&p).unwrap();
+    assert!(unloaded.converged, "{:?}", unloaded.message);
+    near(unloaded.buses[1].v_pu * 0.46, 0.48, 1e-10);
+    near(unloaded.branches[0].i_from_a, 0.0, 1e-6);
+
+    p.loads.push(Load { id: "lv-load".into(), name: "load".into(), bus: "mcc".into(),
+        kw: 100.0, kvar: 25.0, basis: String::new() });
+    let loaded = loadflow::solve(&p).unwrap();
+    assert!(loaded.converged, "{:?}", loaded.message);
+    let a = &loaded.buses[0];
+    let b = &loaded.buses[1];
+    let va = Cplx::from_polar(a.v_pu * a.kv_nominal * 1000.0, a.angle_deg.to_radians());
+    let vb = Cplx::from_polar(b.v_pu * b.kv_nominal * 1000.0, b.angle_deg.to_radians());
+    let expected_a = ((va - vb) / Cplx::new(0.01, 0.01)).abs() / 3.0_f64.sqrt();
+    near(loaded.branches[0].i_from_a, expected_a, 1e-7);
+}
 #[test]
 fn motor_impedance_uses_nameplate_voltage_and_both_bases() {
     let mut p = Project::sample(); p.buses.truncate(1); p.branches.clear(); p.loads.clear(); p.devices.clear(); p.equipment.clear();
@@ -226,8 +312,8 @@ fn parallel_infeeds_use_terminal_contributions_not_total_bus_current() {
     for terminal in &f.terminal_currents { near(terminal.to_a, expected_branch_a, 1e-7); }
     let c = &out.coordination.as_ref().unwrap()[0]; near(c.bolted_ka.unwrap()*1000.0, expected_branch_a, 1e-7);
     near(c.trip_at_bolted_s.unwrap(), 0.2, 1e-12); near(c.total_clearing_s.unwrap(), 0.28, 1e-12);
-    // A lone device on the bus is not inferred as upstream equipment protection.
-    assert!(out.arc_flash_failures.iter().any(|f| f.bus_id == "mcc" && f.error.contains("no upstream")));
+    // A partial infeed device must not be mistaken for protection of all sources.
+    assert!(out.arc_flash_failures.iter().any(|f| f.bus_id == "mcc" && f.error.contains("multiple-device")));
 }
 
 #[test]

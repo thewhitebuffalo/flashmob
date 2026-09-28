@@ -276,6 +276,10 @@ pub struct ArcEquipment {
     /// Explicit total arc duration. Automatic clearing requires a located upstream device and total-clearing data.
     #[serde(default)]
     pub clearing_s: Option<f64>,
+    /// Explicitly authorized assumed exposure duration, used only when automatic
+    /// total clearing is unavailable. A usable device curve takes precedence.
+    #[serde(default)]
+    pub fallback_duration_s: Option<f64>,
     /// "collected" or "assumed". Empty means unspecified.
     #[serde(default)]
     pub basis: String,
@@ -483,6 +487,7 @@ impl Project {
                     depth_mm: 250.0,
                     upstream_device: Some("brk-main".into()),
                     clearing_s: None,
+                    fallback_duration_s: None,
                     basis: String::new(),
                 },
                 ArcEquipment {
@@ -497,6 +502,7 @@ impl Project {
                     depth_mm: 100.0,
                     upstream_device: Some("brk-feeder".into()),
                     clearing_s: None,
+                    fallback_duration_s: None,
                     basis: String::new(),
                 },
             ],
@@ -692,7 +698,7 @@ impl Project {
         }
         for e in &self.equipment {
             check([e.gap_mm, e.distance_mm, e.height_mm, e.width_mm, e.depth_mm].into_iter().all(positive)
-                && e.clearing_s.map_or(true, positive), &e.id, "enclosure, gap, distance, or clearing time");
+                && e.clearing_s.map_or(true, positive) && e.fallback_duration_s.map_or(true, positive), &e.id, "enclosure, gap, distance, or clearing time");
         }
     }
 }

@@ -4,6 +4,7 @@ use crate::study::{ArcRow, StudyOutput};
 #[derive(Clone, Debug)]
 pub struct Diagram {
     pub title: String,
+    pub has_assumptions: bool,
     pub width: f64,
     pub height: f64,
     pub buses: Vec<BusGlyph>,
@@ -47,12 +48,14 @@ pub struct BranchGlyph {
     pub transformer: bool,
     /// SKM one-line mark on the feeder: breaker square, fused switch, or none.
     pub protector: String,
+    pub protector_at_source: bool,
+    /// Routed separately from symbols so folded feeder groups stay connected.
+    pub route: Vec<(f64, f64)>,
 }
 
-const PITCH_X: f64 = 420.0;
-
 pub fn diagram(project: &Project, study: &StudyOutput) -> Diagram {
-    let placed = place_by_voltage(project, study);
+    let layout = place_by_topology(project, study);
+    let placed = &layout.positions;
     let mut buses = Vec::new();
     let mut max_x: f64 = 480.0;
     let mut max_y: f64 = 180.0;
@@ -92,11 +95,11 @@ pub fn diagram(project: &Project, study: &StudyOutput) -> Diagram {
         }
     }
     let mut branches = Vec::new();
-    for branch in &project.branches {
+    for (branch_idx, branch) in project.branches.iter().enumerate() {
         let Some(a) = buses.iter().find(|b| b.id == branch.from) else { continue };
         let Some(b) = buses.iter().find(|b| b.id == branch.to) else { continue };
         let transformer = matches!(branch.kind, crate::model::BranchKind::Transformer { .. });
-        let protector = protector_on(project, &branch.to);
+        let protector = protector_on(project, &branch.id);
         branches.push(BranchGlyph {
             id: branch.id.clone(),
             name: branch.name.clone(),
@@ -106,10 +109,19 @@ pub fn diagram(project: &Project, study: &StudyOutput) -> Diagram {
             y2: b.y,
             transformer,
             protector,
+            protector_at_source: project.devices.iter().any(|d| d.protected_branch.as_deref() == Some(&branch.id) && d.bus == branch.from),
+            route: layout.routes[branch_idx].clone(),
         });
+    }
+    for branch in &branches {
+        for &(x, y) in &branch.route {
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
     }
     Diagram {
         title: project.name.clone(),
+        has_assumptions: !project.assumptions.is_empty(),
         width: max_x + 40.0,
         height: max_y + 30.0,
         buses,
@@ -130,111 +142,125 @@ fn notes_for(rows: &[ArcRow], bus: &str) -> Vec<ArcNote> {
         .collect()
 }
 
-/// Highest nominal voltage on the top row, lowest on the bottom.
-/// Buses on one voltage share a row and sit under the bus that feeds them.
-fn place_by_voltage(project: &Project, study: &StudyOutput) -> Vec<(f64, f64)> {
+/// Build a deterministic spanning forest. A common incoming chain stays at the
+/// top; downstream feeder subtrees fold into at most three vertical columns.
+/// Voltage alone cannot express feeder hierarchy (most LV buses share a voltage).
+struct Layout {
+    positions: Vec<(f64, f64)>,
+    routes: Vec<Vec<(f64, f64)>>,
+}
+
+fn place_by_topology(project: &Project, study: &StudyOutput) -> Layout {
     let n = project.buses.len();
-    let mut at = vec![(260.0, 100.0); n];
-    if n == 0 {
-        return at;
+    let mut positions = vec![(260.0, 100.0); n];
+    let index: std::collections::HashMap<&str, usize> = project.buses.iter()
+        .enumerate().map(|(i, b)| (b.id.as_str(), i)).collect();
+    let mut outgoing = vec![Vec::new(); n];
+    let mut indegree = vec![0; n];
+    for (edge, b) in project.branches.iter().enumerate() {
+        if let (Some(&a), Some(&z)) = (index.get(b.from.as_str()), index.get(b.to.as_str())) {
+            outgoing[a].push((z, edge));
+            indegree[z] += 1;
+        }
     }
-    let mut rows: Vec<(i64, Vec<usize>)> = Vec::new();
-    for (i, bus) in project.buses.iter().enumerate() {
-        let key = (bus.kv * 1000.0).round() as i64;
-        if let Some(row) = rows.iter_mut().find(|(k, _)| *k == key) {
-            row.1.push(i);
+    let mut candidates = Vec::new();
+    for s in &project.sources {
+        if let Some(&i) = index.get(s.bus.as_str()) { candidates.push(i); }
+    }
+    candidates.extend((0..n).filter(|&i| indegree[i] == 0));
+    candidates.extend(0..n);
+    let mut visited = vec![false; n];
+    let mut children = vec![Vec::new(); n];
+    let mut tree_edges = std::collections::HashSet::new();
+    let mut roots = Vec::new();
+    for root in candidates {
+        if visited[root] { continue; }
+        roots.push(root);
+        visited[root] = true;
+        let mut queue = std::collections::VecDeque::from([root]);
+        while let Some(a) = queue.pop_front() {
+            for &(z, edge) in &outgoing[a] {
+                if !visited[z] {
+                    visited[z] = true;
+                    children[a].push(z);
+                    tree_edges.insert(edge);
+                    queue.push_back(z);
+                }
+            }
+        }
+    }
+    let max_arcs = project.buses.iter().map(|b| study.arc_flash.as_ref()
+        .map_or(0, |rows| rows.iter().filter(|r| r.bus_id == b.id).count())).max().unwrap_or(0);
+    // Every row includes enough room for the tallest result card and feeder label.
+    let pitch = (112.0 + max_arcs as f64 * 30.0 + 120.0).max(240.0);
+    let mut groups = Vec::new();
+    let mut group_roots = std::collections::HashSet::new();
+    let mut top_rows = 0;
+    if roots.len() == 1 {
+        let mut a = roots[0];
+        loop {
+            positions[a] = (260.0, 100.0 + top_rows as f64 * pitch);
+            top_rows += 1;
+            if children[a].len() == 1 { a = children[a][0]; }
+            else { groups.extend(children[a].iter().copied()); break; }
+        }
+    } else { groups = roots; }
+    let mut subtrees = Vec::new();
+    let mut max_depth = 0;
+    for root in groups {
+        group_roots.insert(root);
+        let mut nodes = Vec::new();
+        let mut stack = vec![(root, 0)];
+        while let Some((a, depth)) = stack.pop() {
+            nodes.push((a, depth));
+            max_depth = max_depth.max(depth);
+            stack.extend(children[a].iter().rev().map(|&z| (z, depth + 1)));
+        }
+        subtrees.push(nodes);
+    }
+    // Large subtrees first gives stable, balanced sheets without widening a star.
+    subtrees.sort_by_key(|nodes| std::cmp::Reverse(nodes.len()));
+    let columns = subtrees.len().clamp(1, 3);
+    let lane_width = max_depth as f64 * 140.0 + 540.0;
+    let mut heights = vec![top_rows; columns];
+    let mut gutters = vec![150.0; n];
+    for nodes in subtrees {
+        let col = (0..columns).min_by_key(|&c| heights[c]).unwrap();
+        let base = 260.0 + col as f64 * lane_width;
+        for (a, depth) in nodes {
+            positions[a] = (base + depth as f64 * 140.0, 100.0 + heights[col] as f64 * pitch);
+            gutters[a] = base - 110.0;
+            heights[col] += 1;
+        }
+        heights[col] += 1;
+    }
+    let routes = project.branches.iter().enumerate().map(|(edge, b)| {
+        let (Some(&a), Some(&z)) = (index.get(b.from.as_str()), index.get(b.to.as_str())) else { return Vec::new() };
+        let (ax, ay) = positions[a];
+        let (zx, zy) = positions[z];
+        if !tree_edges.contains(&edge) {
+            // Ties and cycles use the outside margin; never overwrite a tree parent.
+            vec![(ax, ay), (ax, ay + pitch - 60.0), (40.0, ay + pitch - 60.0),
+                 (40.0, zy - 90.0), (zx, zy - 90.0), (zx, zy)]
+        } else if group_roots.contains(&z) {
+            vec![(ax, ay), (ax, ay + pitch - 90.0), (gutters[z], ay + pitch - 90.0),
+                 (gutters[z], zy - 90.0), (zx, zy - 90.0), (zx, zy)]
         } else {
-            rows.push((key, vec![i]));
+            vec![(ax, ay), (ax, zy - 90.0), (zx, zy - 90.0), (zx, zy)]
         }
-    }
-    rows.sort_by(|a, b| b.0.cmp(&a.0));
-    let mut upstream = vec![None; n];
-    let mut index = std::collections::HashMap::new();
-    for (i, bus) in project.buses.iter().enumerate() {
-        index.insert(bus.id.as_str(), i);
-    }
-    for branch in &project.branches {
-        if let (Some(&from), Some(&to)) = (index.get(branch.from.as_str()), index.get(branch.to.as_str())) {
-            if project.buses[from].kv + 1e-6 >= project.buses[to].kv {
-                upstream[to] = Some(from);
-            }
-        }
-    }
-    let mut y = 100.0;
-    for (_, members) in &rows {
-        let mut order = members.clone();
-        order.sort_by(|&a, &b| {
-            let ax = upstream[a].map(|u| at[u].0).unwrap_or(0.0);
-            let bx = upstream[b].map(|u| at[u].0).unwrap_or(0.0);
-            ax.partial_cmp(&bx).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b))
-        });
-        let mut raw = Vec::with_capacity(order.len());
-        let mut cursor = 0;
-        while cursor < order.len() {
-            let parent = upstream[order[cursor]];
-            let mut end = cursor + 1;
-            while end < order.len() && upstream[order[end]] == parent {
-                end += 1;
-            }
-            let count = (end - cursor) as f64;
-            let center = parent.map(|p| at[p].0).unwrap_or(260.0 + (cursor as f64) * PITCH_X);
-            let start = center - (count - 1.0) * PITCH_X / 2.0;
-            for k in 0..(end - cursor) {
-                raw.push(start + k as f64 * PITCH_X);
-            }
-            cursor = end;
-        }
-        for i in 1..raw.len() {
-            if raw[i] < raw[i - 1] + PITCH_X {
-                raw[i] = raw[i - 1] + PITCH_X;
-            }
-        }
-        let shift = if raw.first().copied().unwrap_or(260.0) < 260.0 {
-            260.0 - raw[0]
-        } else {
-            0.0
-        };
-        let mut row_card: f64 = 80.0;
-        for (k, &idx) in order.iter().enumerate() {
-            let arcs = study.arc_flash.as_ref().map(|rows| rows.iter().filter(|r| r.bus_id == project.buses[idx].id).count()).unwrap_or(0);
-            row_card = row_card.max(112.0 + arcs as f64 * 30.0);
-            at[idx] = (raw[k] + shift, y);
-        }
-        y += row_card + 80.0;
-    }
-    at
+    }).collect();
+    Layout { positions, routes }
 }
 
 impl BranchGlyph {
-    /// Orthogonal feeder, dropping from the upper bus toward the lower one.
-    pub fn points(&self) -> Vec<(f64, f64)> {
-        if (self.y1 - self.y2).abs() < 2.0 {
-            let bridge = self.y1 - 36.0;
-            vec![(self.x1, self.y1), (self.x1, bridge), (self.x2, bridge), (self.x2, self.y2)]
-        } else {
-            let mid_y = (self.y1 + self.y2) / 2.0;
-            vec![(self.x1, self.y1), (self.x1, mid_y), (self.x2, mid_y), (self.x2, self.y2)]
-        }
-    }
+    pub fn points(&self) -> Vec<(f64, f64)> { self.route.clone() }
 
     pub fn device_at(&self) -> (f64, f64) {
-        if (self.y1 - self.y2).abs() < 2.0 {
-            ((self.x1 + self.x2) / 2.0, self.y1 - 36.0)
-        } else if self.y2 >= self.y1 {
-            (self.x1, self.y1 + 26.0)
-        } else {
-            (self.x1, self.y1 - 26.0)
-        }
+        if self.protector_at_source { (self.x1, self.y1 + 26.0) }
+        else { (self.x2, self.y2 - 16.0) }
     }
 
-    pub fn winding_at(&self) -> (f64, f64) {
-        if (self.y1 - self.y2).abs() < 2.0 {
-            ((self.x1 + self.x2) / 2.0, self.y1 - 28.0)
-        } else {
-            let mid_y = (self.y1 + self.y2) / 2.0;
-            (self.x1, (self.y1 + mid_y) / 2.0)
-        }
-    }
+    pub fn winding_at(&self) -> (f64, f64) { (self.x2, self.y2 - 60.0) }
 }
 
 pub fn to_svg(diagram: &Diagram) -> String {
@@ -259,8 +285,9 @@ pub fn to_svg(diagram: &Diagram) -> String {
 <rect x="1" y="1" width="{inner_w:.1}" height="{inner_h:.1}" class="fm-border"/>
 <text x="24" y="28" class="fm-text-lbl">FLASHMOB</text>
 <text x="140" y="28" class="fm-text-dat">{title}</text>
-<text x="24" y="46" class="fm-text-dat">ONE-LINE  IEEE 1584-2018  SYMMETRICAL RMS</text>
+<text x="24" y="46" class="fm-text-dat">ONE-LINE  IEEE 1584-2018  SYMMETRICAL RMS{basis}</text>
 "##,
+        basis = if diagram.has_assumptions { "  |  PRELIMINARY - ASSUMPTIONS APPLY" } else { "" },
         w = diagram.width,
         h = diagram.height,
         inner_w = diagram.width - 2.0,
@@ -297,20 +324,17 @@ pub fn to_svg(diagram: &Diagram) -> String {
     s
 }
 
-fn protector_on(project: &Project, bus: &str) -> String {
+fn protector_on(project: &Project, branch: &str) -> String {
     let mut breaker = false;
-    let mut switch = false;
-    for device in project.devices.iter().filter(|d| d.bus == bus) {
+    for device in project.devices.iter().filter(|d| d.protected_branch.as_deref() == Some(branch)) {
         match &device.curve {
             crate::model::CurveSpec::ThermalMagnetic { .. } => breaker = true,
-            crate::model::CurveSpec::SettingsNotCollected { .. } => switch = true,
+            crate::model::CurveSpec::SettingsNotCollected { .. } => {},
             _ => breaker = true,
         }
     }
     if breaker {
         "breaker".into()
-    } else if switch {
-        "switch".into()
     } else {
         "none".into()
     }
@@ -380,14 +404,10 @@ fn focal_bus(diagram: &Diagram) -> Option<String> {
 
 fn short_label(name: &str) -> String {
     let trimmed = name.trim();
-    if trimmed.chars().count() <= 46 {
+    if trimmed.chars().count() <= 26 {
         trimmed.to_string()
     } else {
-        let mut end = 46;
-        while !trimmed.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}…", &trimmed[..end])
+        format!("{}…", trimmed.chars().take(26).collect::<String>())
     }
 }
 
@@ -425,7 +445,7 @@ fn bus_svg(bus: &BusGlyph, focal: bool) -> String {
     body.push_str(&format!(
         r##"<text x="{x:.1}" y="{ty:.1}" class="{name_class}">{name}</text>"##,
         x = left + 8.0,
-        name = esc(&tag(&bus.name)),
+        name = esc(&tag(&bus.name).chars().take(23).collect::<String>()),
     ));
     ty += 16.0;
     if focal {
@@ -503,6 +523,63 @@ fn esc(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::study::{self, Studies};
+
+    #[test]
+    fn wide_same_voltage_system_folds_without_overlapping_cards() {
+        let mut p = Project::default();
+        for i in 0..41 {
+            p.buses.push(crate::model::Bus { id: format!("b{i}"), name: format!("Bus {i}"), kv: 0.48,
+                shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None });
+            if i > 0 {
+                p.branches.push(crate::model::Branch { id: format!("f{i}"), name: format!("Feeder {i}"),
+                    from: "b0".into(), to: format!("b{i}"),
+                    kind: crate::model::BranchKind::Line { r_ohm: 0.01, x_ohm: 0.01,
+                        b_siemens: 0.0, r0_ohm: 0.03, x0_ohm: 0.03, ampacity_a: None } });
+            }
+        }
+        let study = study::run(&Project::sample(), Studies::all()).unwrap();
+        let d = diagram(&p, &study);
+        assert!(d.width < 2000.0, "a star must not become a 40-column strip");
+        assert_eq!(d.buses.len(), 41);
+        for (i, a) in d.buses.iter().enumerate() {
+            for b in &d.buses[i + 1..] {
+                assert!((a.x - b.x).abs() >= 400.0 || (a.y - b.y).abs() >= a.card_h.max(b.card_h) + 40.0);
+            }
+        }
+        for edge in &d.branches {
+            assert!(edge.y2 > edge.y1, "same-voltage child must be below its parent");
+            assert_eq!(edge.points().first(), Some(&(edge.x1, edge.y1)));
+            assert_eq!(edge.points().last(), Some(&(edge.x2, edge.y2)));
+            for segment in edge.points().windows(2) {
+                assert!(segment[0].0 == segment[1].0 || segment[0].1 == segment[1].1);
+                // No feeder may run through an unrelated result card.
+                for bus in &d.buses {
+                    let left = bus.x + 96.0;
+                    let right = left + 210.0;
+                    let top = bus.y - 16.0;
+                    let bottom = top + bus.card_h;
+                    let lo_x = segment[0].0.min(segment[1].0);
+                    let hi_x = segment[0].0.max(segment[1].0);
+                    let lo_y = segment[0].1.min(segment[1].1);
+                    let hi_y = segment[0].1.max(segment[1].1);
+                    assert!(!(hi_x > left && lo_x < right && hi_y > top && lo_y < bottom));
+                }
+            }
+        }
+        // A reverse tie and an isolated bus do not collapse the forest or loop.
+        let mut tie = p.branches[0].clone();
+        tie.id = "tie".into(); tie.from = "b1".into(); tie.to = "b0".into();
+        p.branches.push(tie);
+        let mut isolated = p.buses[0].clone(); isolated.id = "island".into(); p.buses.push(isolated);
+        let d = diagram(&p, &study);
+        assert_eq!(d.buses.len(), 42);
+        assert_eq!(d.branches.len(), 41);
+        let positions: std::collections::HashSet<_> = d.buses.iter().map(|b| (b.x as i64, b.y as i64)).collect();
+        assert_eq!(positions.len(), 42);
+        for edge in &d.branches {
+            assert!(edge.points().iter().all(|&(x, y)| x >= 0.0 && y >= 0.0 && x < d.width && y < d.height));
+        }
+    }
 
     #[test]
     fn sample_sld_shows_fault_and_arc_flash_on_each_bus() {
