@@ -794,7 +794,8 @@ mod zoom_tests {
 
     #[test]
     fn painted_bus_labels_do_not_overlap_or_escape_cards_at_any_zoom() {
-        let project = Project::sample();
+        let mut project = Project::sample();
+        project.motors.clear(); // Keep a completed arc row for this geometry-only test.
         let results = study::run(&project, Studies::all()).unwrap();
         let mut bus = sld::diagram(&project, &results).buses[1].clone();
         bus.x = 0.0; bus.y = 30.0;

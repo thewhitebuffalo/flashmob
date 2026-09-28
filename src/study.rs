@@ -549,6 +549,7 @@ fn decrement_duration(project: &Project, loadflow: Option<&LoadflowResult>, equi
     if !isolates_sources(project, device, &equipment.bus) {
         return Err("opening the selected device does not isolate all utility/generator paths to the fault; a multi-device clearing study is required".into());
     }
+    reject_connected_motors(project, device, &equipment.bus)?;
     if device.fuse_total_clearing {
         return fallback(format!("upstream device {} [{}] has a fuse total-clearing curve; its melt and arcing history cannot be inferred from a time-varying relay model", device.name, device.id));
     }
@@ -909,6 +910,7 @@ fn duration(project: &Project, case: &ArcEquipment, fault: &crate::fault::BusFau
     if !isolates_sources(project, device, &case.bus) {
         return Err("opening the selected device does not isolate all utility/generator paths to the fault; a multi-device clearing study is required".into());
     }
+    reject_connected_motors(project, device, &case.bus)?;
     let Some(raw) = curves::clearing_time(device, amps) else {
         return fallback(format!("Upstream device {} [{}] identified; total clearing unavailable at {amps:.0} A: enter operating settings and breaker interrupting time, or a fuse total-clearing curve; device may not operate at this current", device.name, device.id));
     };
@@ -931,6 +933,25 @@ fn device_current_from_terminals(project: &Project, device: &crate::model::Devic
 }
 
 fn isolates_sources(project: &Project, device: &crate::model::Device, fault_bus: &str) -> bool {
+    let seen = buses_after_device_opens(project, device, fault_bus);
+    !project.sources.iter().any(|s| s.in_service && seen.contains(&s.bus))
+}
+
+/// A motor on the fault side of the selected breaker can keep feeding the arc
+/// until its own feeder opens or its current decays. The present single-device
+/// duration cannot claim that the main breaker's opening ends exposure.
+fn reject_connected_motors(project: &Project, device: &crate::model::Device, fault_bus: &str) -> Result<(), String> {
+    let seen = buses_after_device_opens(project, device, fault_bus);
+    let mut motors: Vec<&str> = project.motors.iter()
+        .filter(|motor| seen.contains(&motor.bus))
+        .map(|motor| motor.id.as_str()).collect();
+    if motors.is_empty() { return Ok(()); }
+    motors.sort_unstable();
+    Err(format!("opening upstream device '{}' leaves motor(s) {} connected to the fault at bus '{}'; motor feeder breaker operation and motor-current decay are not modeled as clearing events, so total arc duration is unresolved",
+        device.id, motors.join(", "), fault_bus))
+}
+
+fn buses_after_device_opens(project: &Project, device: &crate::model::Device, fault_bus: &str) -> std::collections::HashSet<String> {
     let mut seen = std::collections::HashSet::from([fault_bus.to_string()]);
     loop {
         let old = seen.len();
@@ -942,7 +963,7 @@ fn isolates_sources(project: &Project, device: &crate::model::Device, fault_bus:
         }
         if old == seen.len() { break; }
     }
-    !project.sources.iter().any(|s| s.in_service && seen.contains(&s.bus))
+    seen
 }
 
 fn finish_clearing(raw: f64, cap: f64, what: &str, not_a_label: &str) -> Clearing {
