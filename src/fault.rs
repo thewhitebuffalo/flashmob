@@ -159,6 +159,7 @@ pub(crate) fn solve_with_model(project: &Project, loadflow: Option<&LoadflowResu
             }
             terminal_currents.reserve(project.branches.len());
             for (branch, stamp) in project.branches.iter().zip(&model.branches) {
+                if !stamp.active { continue; }
                 let (Some(f), Some(t)) = (map1[stamp.from], map1[stamp.to]) else { continue };
                 let q = stamp.positive;
                 let bf = i_base_ka(model.index.kv[stamp.from], project.s_base_mva) * 1000.0;
@@ -269,6 +270,7 @@ mod tests {
                 id: "s".into(),
                 name: "grid".into(),
                 bus: "a".into(),
+                in_service: true,
                 v_pu: 1.0,
                 angle_deg: 0.0,
                 mva_sc: 500.0,
@@ -317,6 +319,7 @@ mod tests {
                 id: "s".into(),
                 name: "grid".into(),
                 bus: "hv".into(),
+                in_service: true,
                 v_pu: 1.0,
                 angle_deg: 0.0,
                 mva_sc: 1000.0,
@@ -342,6 +345,29 @@ mod tests {
         let gotg = lv.line_to_ground.as_ref().unwrap().symmetrical_ka;
         assert!((got3 - i3).abs() / i3 < 1e-4, "3P got {got3}, expected {i3}");
         assert!((gotg - ilg).abs() / ilg < 1e-4, "LG got {gotg}, expected {ilg}");
+    }
+
+    #[test]
+    fn open_contact_removes_fault_path_and_terminal_current() {
+        let mut project = Project::sample();
+        project.switches.push(Switch {
+            id: "panel-switch".into(), name: "Panel switch".into(), branch_id: "feeder".into(),
+            kind: SwitchKind::Breaker, closed: false,
+        });
+        let model = network::build(&project).unwrap();
+        assert_eq!(model.branches.len(), project.branches.len());
+        assert!(!model.branches[1].active);
+        let open = solve_with_model(&project, None, &model).unwrap();
+        assert!(open.buses.iter().find(|b| b.id == "mcc").unwrap().three_phase.is_some());
+        assert!(open.buses.iter().find(|b| b.id == "pnl").unwrap().three_phase.is_none());
+        assert!(open.buses.iter().find(|b| b.id == "mcc").unwrap().terminal_currents.iter().all(|i| i.branch_id != "feeder"));
+
+        project.switches[0].closed = true;
+        let closed = solve(&project, None).unwrap();
+        assert!(closed.buses.iter().find(|b| b.id == "pnl").unwrap().three_phase.is_some());
+        project.sources[0].in_service = false;
+        let unavailable = solve(&project, None).unwrap();
+        assert!(unavailable.buses.iter().all(|b| b.three_phase.is_none()));
     }
 }
 

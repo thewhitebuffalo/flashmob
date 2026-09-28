@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::connectivity::{self, Topology};
-use crate::model::{ArcEquipment, Branch, BranchKind, Bus, CurveSpec, Device, Electrode, Load, Motor, Project, Source, XfmrConn};
+use crate::model::{ArcEquipment, Branch, BranchKind, Bus, CurveSpec, Device, Electrode, EquipmentState, Load, Motor, OperatingCase, Project, Source, SourceState, Switch, SwitchGroup, SwitchKind, SwitchState, XfmrConn};
 use crate::sld::{self, Diagram};
 use crate::study::{self, Studies, StudyOutput};
 use crate::tcc::{self, TccPlot};
@@ -73,6 +73,7 @@ pub enum Command {
         #[serde(default = "one")] x0_over_x1: f64,
         #[serde(default = "one")] r0_over_r1: f64,
         #[serde(default)] is_slack: bool,
+        #[serde(default = "default_true")] in_service: bool,
         #[serde(default)] p_mw: f64,
     },
     AddMotor {
@@ -87,6 +88,15 @@ pub enum Command {
         #[serde(default = "default_xr")] xr: f64,
     },
     AddDevice { id: String, #[serde(default)] name: String, bus: String, curve: CurveSpec, #[serde(default)] basis: String, #[serde(default)] protected_branch: Option<String>, #[serde(default)] breaker_interrupting_s: Option<f64>, #[serde(default)] fuse_total_clearing: bool },
+    AddSwitch { id: String, #[serde(default)] name: String, branch_id: String, kind: SwitchKind, closed: bool },
+    AddSwitchGroup { id: String, switch_ids: Vec<String>, max_closed: usize },
+    AddOperatingCase {
+        id: String,
+        #[serde(default)] name: String,
+        #[serde(default)] switch_states: Vec<SwitchState>,
+        #[serde(default)] source_states: Vec<SourceState>,
+        #[serde(default)] equipment_states: Vec<EquipmentState>,
+    },
     AddEquipment {
         id: String,
         #[serde(default)] name: String,
@@ -118,6 +128,7 @@ pub enum Command {
         #[serde(default)] v_pu: Option<f64>,
         #[serde(default)] x0_over_x1: Option<f64>,
         #[serde(default)] is_slack: Option<bool>,
+        #[serde(default)] in_service: Option<bool>,
     },
     Run { #[serde(default)] studies: Vec<String> },
     Topology,
@@ -128,6 +139,7 @@ pub enum Command {
 }
 
 fn one() -> f64 { 1.0 }
+fn default_true() -> bool { true }
 fn default_pf() -> f64 { 0.85 }
 fn default_eff() -> f64 { 0.94 }
 fn default_xd() -> f64 { 0.17 }
@@ -291,7 +303,7 @@ fn apply_one(
             fresh(id, project)?;
             project.loads.push(Load { id: id.clone(), name: named(name, id), bus: bus.clone(), kw: *kw, kvar: *kvar, basis: basis.clone() });
         }
-        Command::AddSource { id, name, bus, v_pu, angle_deg, mva_sc, xr, x0_over_x1, r0_over_r1, is_slack, p_mw } => {
+        Command::AddSource { id, name, bus, v_pu, angle_deg, mva_sc, xr, x0_over_x1, r0_over_r1, is_slack, in_service, p_mw } => {
             fresh(id, project)?;
             project.sources.push(Source {
                 id: id.clone(),
@@ -304,6 +316,7 @@ fn apply_one(
                 x0_over_x1: *x0_over_x1,
                 r0_over_r1: *r0_over_r1,
                 is_slack: *is_slack,
+                in_service: *in_service,
                 p_mw: *p_mw,
                 qmin_mvar: None,
                 qmax_mvar: None,
@@ -326,6 +339,21 @@ fn apply_one(
         Command::AddDevice { id, name, bus, curve, basis, protected_branch, breaker_interrupting_s, fuse_total_clearing } => {
             fresh(id, project)?;
             project.devices.push(Device { id: id.clone(), name: named(name, id), bus: bus.clone(), curve: curve.clone(), basis: basis.clone(), protected_branch: protected_branch.clone(), breaker_interrupting_s: *breaker_interrupting_s, fuse_total_clearing: *fuse_total_clearing });
+        }
+        Command::AddSwitch { id, name, branch_id, kind, closed } => {
+            fresh(id, project)?;
+            project.switches.push(Switch { id: id.clone(), name: named(name, id), branch_id: branch_id.clone(), kind: kind.clone(), closed: *closed });
+        }
+        Command::AddSwitchGroup { id, switch_ids, max_closed } => {
+            fresh(id, project)?;
+            project.switch_groups.push(SwitchGroup { id: id.clone(), switch_ids: switch_ids.clone(), max_closed: *max_closed });
+        }
+        Command::AddOperatingCase { id, name, switch_states, source_states, equipment_states } => {
+            fresh(id, project)?;
+            project.operating_cases.push(OperatingCase {
+                id: id.clone(), name: named(name, id),
+                switch_states: switch_states.clone(), source_states: source_states.clone(), equipment_states: equipment_states.clone(),
+            });
         }
         Command::AddEquipment { id, name, bus, electrode, gap_mm, distance_mm, height_mm, width_mm, depth_mm, upstream_device, clearing_s, fallback_duration_s, basis } => {
             fresh(id, project)?;
@@ -354,13 +382,14 @@ fn apply_one(
             if let Some(ka) = bracing_ka { bus.bracing_ka = Some(*ka); }
             if let Some(amps) = main_rating_a { bus.main_rating_a = Some(*amps); }
         }
-        Command::SetSource { id, mva_sc, xr, v_pu, x0_over_x1, is_slack } => {
+        Command::SetSource { id, mva_sc, xr, v_pu, x0_over_x1, is_slack, in_service } => {
             let source = project.sources.iter_mut().find(|s| s.id == *id).ok_or_else(|| format!("no source '{id}'"))?;
             if let Some(v) = mva_sc { source.mva_sc = *v; }
             if let Some(v) = xr { source.xr = *v; }
             if let Some(v) = v_pu { source.v_pu = *v; }
             if let Some(v) = x0_over_x1 { source.x0_over_x1 = *v; }
             if let Some(v) = is_slack { source.is_slack = *v; }
+            if let Some(v) = in_service { source.in_service = *v; }
         }
         Command::Run { studies } => {
             let which = Studies::parse(studies)?;
@@ -429,7 +458,24 @@ fn remove(project: &mut Project, id: &str) -> Result<(), String> {
         if item.bus == id { deps.push(format!("motor {}", item.id)); }
     }
     for item in &project.devices {
-        if item.bus == id { deps.push(format!("device {}", item.id)); }
+        if item.bus == id || item.protected_branch.as_deref() == Some(id) {
+            deps.push(format!("device {}", item.id));
+        }
+    }
+    for item in &project.switches {
+        if item.branch_id == id { deps.push(format!("switch {}", item.id)); }
+    }
+    for item in &project.switch_groups {
+        if item.switch_ids.iter().any(|switch_id| switch_id == id) {
+            deps.push(format!("switch group {}", item.id));
+        }
+    }
+    for item in &project.operating_cases {
+        if item.switch_states.iter().any(|state| state.switch_id == id)
+            || item.source_states.iter().any(|state| state.source_id == id)
+            || item.equipment_states.iter().any(|state| state.equipment_id == id || state.upstream_device.as_deref() == Some(id)) {
+            deps.push(format!("operating case {}", item.id));
+        }
     }
     for item in &project.equipment {
         if item.bus == id || item.upstream_device.as_deref() == Some(id) {
@@ -446,6 +492,9 @@ fn remove(project: &mut Project, id: &str) -> Result<(), String> {
     project.sources.retain(|x| x.id != id);
     project.motors.retain(|x| x.id != id);
     project.devices.retain(|x| x.id != id);
+    project.switches.retain(|x| x.id != id);
+    project.switch_groups.retain(|x| x.id != id);
+    project.operating_cases.retain(|x| x.id != id);
     project.equipment.retain(|x| x.id != id);
     project.assumptions.retain(|x| x.id != id);
     if project.ids().len() == before {
@@ -467,6 +516,9 @@ fn op_name(command: &Command) -> &'static str {
         Command::AddSource { .. } => "add_source",
         Command::AddMotor { .. } => "add_motor",
         Command::AddDevice { .. } => "add_device",
+        Command::AddSwitch { .. } => "add_switch",
+        Command::AddSwitchGroup { .. } => "add_switch_group",
+        Command::AddOperatingCase { .. } => "add_operating_case",
         Command::AddEquipment { .. } => "add_equipment",
         Command::Remove { .. } => "remove",
         Command::SetBus { .. } => "set_bus",
@@ -499,9 +551,12 @@ pub fn schema() -> serde_json::Value {
             "export_skm": "flashmob export-skm project.json -o skm-export"
         },
         "exec_request": {
-            "project": "optional project object; omit to start empty",
+            "project": null,
             "commands": [
                 {"op": "sample"},
+                {"op": "add_switch", "id": "feeder_switch", "branch_id": "feeder", "kind": "breaker", "closed": true},
+                {"op": "add_switch_group", "id": "feeder_control", "switch_ids": ["feeder_switch"], "max_closed": 1},
+                {"op": "add_operating_case", "id": "feeder_open", "switch_states": [{"switch_id": "feeder_switch", "closed": false}], "source_states": [], "equipment_states": []},
                 {"op": "topology"},
                 {"op": "run", "studies": ["loadflow", "fault", "arcflash", "coordination"]},
                 {"op": "sld"},
@@ -509,8 +564,12 @@ pub fn schema() -> serde_json::Value {
                 {"op": "export_skm", "output": "skm-export"}
             ]
         },
+        "exec_request_note": "The project field is optional; omit it or set it to null to start empty. The example commands build on the built-in sample.",
         "exec_response": ["ok", "error", "warnings", "project", "results", "topology", "sld_svg", "tcc_svg", "tcc_csv", "skm"],
-        "topology": "Validated entered connections only: every bus lists branch terminal and neighbor plus attached source, load, motor, device, and arc equipment IDs. Global records give both branch endpoints and each device's entered protected branch terminal. Null placement means it was not entered. No study or protection inference is performed.",
+        "topology": "Validated entered connections only: every bus lists branch terminal and neighbor plus attached source, load, motor, device, and arc equipment IDs. Global records give branch endpoints and switch link, source base in-service state, switch base closed state, group rules, named operating cases, and each device's entered protected branch terminal. Null placement means it was not entered. No study or protection inference is performed.",
+        "operating_cases": "Base switch.closed and source.in_service values define normal operation. Each named operating case overrides listed switch/source states. Its arc equipment starts with no inherited upstream_device, clearing_s, or fallback_duration_s; list case-specific values in equipment_states, or leave them absent for automatic protection selection or an explicit failure. At most one switch can control a branch. A switch group limits simultaneous closures using max_closed. `run` evaluates the base configuration and each named valid case; inspect per-case failures before using an arc-flash maximum.",
+        "switch_model": "Opening a switch removes its entire referenced branch, including any transformer grounding shunt or line charging on that branch. For an independent breaker or ATS contact, use a separate short finite-impedance branch with separate bus nodes; put transformers and other equipment on their own branches. The closed field is required for every switch, especially normally open ties and ATS contacts.",
+        "switch_kinds": ["breaker", "tie", "ats"],
         "skm": "Engineering data package for mapping; PTW import unverified: project.xml, per-component CSV, components.tab, and Revit panel/circuit schedules. See IMPORT.txt.",
         "sld": "SVG single-line diagram. Each bus card shows nominal voltage, load-flow pu voltage, symmetrical 3P and LG fault current, and the governing IEEE 1584-2018 incident energy and arc-flash boundary.",
         "tcc": "SVG log-log time-current curve plus CSV points. Current is referred to ref_kv. Fault and arcing-current markers are included when a study has been run.",
@@ -583,5 +642,48 @@ mod tests {
         let response = exec_request(r#"{"commands":[{"op":"sample"},{"op":"topology"},{"op":"set_source","id":"grid","mva_sc":300}]}"#);
         assert!(response.ok, "{:?}", response.error);
         assert!(response.topology.is_none());
+    }
+
+    #[test]
+    fn exec_builds_switch_cases_and_exposes_them_in_topology() {
+        let response = exec_request(r#"{"commands":[
+            {"op":"sample"},
+            {"op":"add_switch","id":"feeder-switch","branch_id":"feeder","kind":"breaker","closed":true},
+            {"op":"add_switch_group","id":"feeder-group","switch_ids":["feeder-switch"],"max_closed":1},
+            {"op":"add_operating_case","id":"feeder-open","switch_states":[{"switch_id":"feeder-switch","closed":false}],"equipment_states":[{"equipment_id":"af-pnl","upstream_device":"brk-feeder","clearing_s":0.5}]},
+            {"op":"topology"}
+        ]}"#);
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(response.project.switches.len(), 1);
+        assert_eq!(response.project.operating_cases.len(), 1);
+        let topology = response.topology.unwrap();
+        let branch = topology.branches.iter().find(|branch| branch.id == "feeder").unwrap();
+        assert_eq!(branch.switch_id.as_deref(), Some("feeder-switch"));
+        assert_eq!(branch.base_closed, Some(true));
+        assert_eq!(topology.switches[0].branch_id, "feeder");
+        assert_eq!(topology.switch_groups[0].switch_ids, ["feeder-switch"]);
+        assert_eq!(topology.operating_cases[0].switch_states[0].switch_id, "feeder-switch");
+        assert_eq!(topology.operating_cases[0].equipment_states[0].equipment_id, "af-pnl");
+        assert_eq!(topology.operating_cases[0].equipment_states[0].clearing_s, Some(0.5));
+    }
+
+    #[test]
+    fn source_service_edits_invalidate_outputs_and_remove_checks_case_references() {
+        let response = exec_request(r#"{"commands":[
+            {"op":"sample"},
+            {"op":"run","studies":["fault"]},
+            {"op":"set_source","id":"grid","in_service":false}
+        ]}"#);
+        assert!(response.ok, "{:?}", response.error);
+        assert!(response.results.is_none());
+        assert!(!response.project.sources[0].in_service);
+
+        let response = exec_request(r#"{"commands":[
+            {"op":"sample"},
+            {"op":"add_switch","id":"feeder-switch","branch_id":"feeder","kind":"breaker","closed":true},
+            {"op":"remove","id":"feeder"}
+        ]}"#);
+        assert!(!response.ok);
+        assert!(response.error.unwrap().contains("switch feeder-switch"));
     }
 }

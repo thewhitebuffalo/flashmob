@@ -41,16 +41,16 @@ struct Index {
 impl Index {
     fn new(project: &Project) -> Self {
         let mut graph = Graph::new();
-        for b in &project.branches {
+        for b in project.branches.iter().filter(|b| project.branch_closed(b)) {
             graph.entry(b.from.clone()).or_default().push((b.to.clone(), b.id.clone()));
             graph.entry(b.to.clone()).or_default().push((b.from.clone(), b.id.clone()));
         }
         let mut cuts = HashMap::new();
         for d in &project.devices {
-            let Some(b) = d.protected_branch.as_ref().and_then(|id| project.branches.iter().find(|b| b.id == *id)) else { continue };
+            let Some(b) = d.protected_branch.as_ref().and_then(|id| project.branches.iter().find(|b| b.id == *id && project.branch_closed(b))) else { continue };
             cuts.entry(b.id.clone()).or_insert_with(|| {
                 let side = distances(&graph, &b.from, Some(&b.id));
-                let sources = project.sources.iter().filter(|s| side.contains_key(&s.bus)).count();
+                let sources = project.sources.iter().filter(|s| s.in_service && side.contains_key(&s.bus)).count();
                 (side, sources)
             });
         }
@@ -74,7 +74,7 @@ fn identify_with_index(project: &Project, bus: &str, index: &Index) -> Protectio
     let distance = distances(&index.graph, bus, None);
     let mut result = Protection { bus_id: bus.into(), status: "unprotected".into(),
         device_id: None, candidates: Vec::new(), clearing_data: "unavailable".into(), detail: String::new() };
-    let live_sources: Vec<_> = project.sources.iter().filter(|s| distance.contains_key(&s.bus)).collect();
+    let live_sources: Vec<_> = project.sources.iter().filter(|s| s.in_service && distance.contains_key(&s.bus)).collect();
     if live_sources.is_empty() {
         result.status = "unenergized".into();
         result.detail = "No connected utility/generator source; no upstream protection inferred.".into();
@@ -83,7 +83,7 @@ fn identify_with_index(project: &Project, bus: &str, index: &Index) -> Protectio
     let mut candidates = Vec::new();
     let mut partial = Vec::new();
     for device in &project.devices {
-        let Some(edge) = device.protected_branch.as_ref().and_then(|id| project.branches.iter().find(|b| b.id == *id)) else { continue };
+        let Some(edge) = device.protected_branch.as_ref().and_then(|id| project.branches.iter().find(|b| b.id == *id && project.branch_closed(b))) else { continue };
         if device.bus != edge.from && device.bus != edge.to { continue; }
         let Some(&hops) = distance.get(&device.bus) else { continue };
         let (side, source_count) = &index.cuts[&edge.id];
@@ -218,6 +218,21 @@ mod tests {
         let mut p = radial(); p.sources.clear();
         assert_eq!(identify(&p, "pnl").status, "unenergized");
         assert!(identify(&p, "pnl").device_id.is_none());
+    }
+
+    #[test]
+    fn open_contact_and_offline_source_are_absent_from_protection_graph() {
+        let mut p = radial();
+        p.switches.push(Switch {
+            id: "ats-contact".into(), name: "ATS contact".into(), branch_id: "feeder".into(),
+            kind: SwitchKind::Ats, closed: false,
+        });
+        assert_eq!(identify(&p, "pnl").status, "unenergized");
+        assert_eq!(identify(&p, "mcc").device_id.as_deref(), Some("brk-main"));
+        p.switches[0].closed = true;
+        assert_eq!(identify(&p, "pnl").device_id.as_deref(), Some("brk-feeder"));
+        p.sources[0].in_service = false;
+        assert_eq!(identify(&p, "pnl").status, "unenergized");
     }
 }
 

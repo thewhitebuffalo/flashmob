@@ -49,6 +49,88 @@ The response contains `project`, `results`, `sld_svg`, `tcc_svg`, and `tcc_csv`,
 
 `flashmob topology plant.json` (or `flashmob topology -` for stdin) validates the project and prints entered connectivity as JSON without running a study. Every bus lists its branch IDs, which terminal it is on (`from` or `to`), the neighboring bus, and attached sources, loads, motors, protection devices, and arc equipment. Global branch records show both endpoints; device records show the entered bus and protected branch terminal, with `null` when placement has not been entered. Equipment records identify the entered upstream device. Parallel branches remain separate. These are model relationships, not inferred protection paths or calculated results. An AI caller can use them with study output to produce an SLD when needed.
 
+Switch records add their controlled branch, kind, and normal `closed` state to topology output. Branch records link back to their switch. The output also lists switch groups, named operating cases, and any source marked out of service. An omitted source service state means the default `in_service: true`.
+
+### Operating cases
+
+`switches` attach breakers, ties, and ATS contacts to branches. The normal state is each switch's `closed` value and each source's `in_service` value. A named `operating_case` overrides the listed states. A branch has at most one switch. A `switch_group` sets `max_closed` across its listed switches, rejecting a state that violates an entered interlock. The `ats` kind is a label, not an interlock: use `max_closed: 1` for two break-before-make contacts; use `max_closed: 2` only when explicitly modeling a closed transition. Cases must be entered explicitly; Flashmob does not invent switch combinations or a switching sequence.
+
+In each alternate case, arc equipment starts without the normal state's `upstream_device`, `clearing_s`, or `fallback_duration_s`. Use `equipment_states`, for example `{"equipment_id":"arc_section","upstream_device":"tie_breaker"}`, to enter a case-specific device or duration. An item absent from `equipment_states` uses protection inferred from that case's active network; if clearing data remain unavailable, that case reports an arc-flash failure and the worst-case envelope is incomplete. A normal-state manual duration or assumed fallback never silently carries into a transfer case.
+
+**An open switch removes its entire referenced branch from the electrical model**, including transformer grounding shunts or line charging on that branch. To represent an independent breaker or ATS contact, give it a separate short, finite-impedance branch and separate bus nodes; keep transformers and other equipment on their own branches. A breaker and ATS contact in series need separate branch segments and bus nodes. The `closed` field is required for every switch, especially normally open ties and ATS contacts.
+
+This main–tie–main example has both mains closed and the tie open normally. Each transfer state has one main open and the tie closed. The electrical values are illustrative project inputs; replace them with the equipment and cable data being studied.
+
+```json
+{
+  "name": "Main tie main example",
+  "buses": [
+    {"id":"source_left","name":"Left source","kv":0.48},
+    {"id":"section_left","name":"Left section","kv":0.48},
+    {"id":"section_right","name":"Right section","kv":0.48},
+    {"id":"source_right","name":"Right source","kv":0.48}
+  ],
+  "branches": [
+    {"id":"left_incoming","name":"Left incoming","from":"source_left","to":"section_left","kind":{"type":"line","r_ohm":0.002,"x_ohm":0.004}},
+    {"id":"section_tie","name":"Section tie","from":"section_left","to":"section_right","kind":{"type":"line","r_ohm":0.004,"x_ohm":0.008}},
+    {"id":"right_incoming","name":"Right incoming","from":"source_right","to":"section_right","kind":{"type":"line","r_ohm":0.002,"x_ohm":0.004}}
+  ],
+  "sources": [
+    {"id":"utility_left","name":"Left utility","bus":"source_left","mva_sc":40,"xr":8,"is_slack":true},
+    {"id":"utility_right","name":"Right utility","bus":"source_right","mva_sc":25,"xr":8,"is_slack":true}
+  ],
+  "switches": [
+    {"id":"main_left","name":"Left main","branch_id":"left_incoming","kind":"breaker","closed":true},
+    {"id":"tie","name":"Bus tie","branch_id":"section_tie","kind":"tie","closed":false},
+    {"id":"main_right","name":"Right main","branch_id":"right_incoming","kind":"breaker","closed":true}
+  ],
+  "switch_groups": [
+    {"id":"main_tie_interlock","switch_ids":["main_left","tie","main_right"],"max_closed":2}
+  ],
+  "operating_cases": [
+    {"id":"left_supplies_both","name":"Left main and tie","switch_states":[{"switch_id":"main_right","closed":false},{"switch_id":"tie","closed":true}]},
+    {"id":"right_supplies_both","name":"Right main and tie","switch_states":[{"switch_id":"main_left","closed":false},{"switch_id":"tie","closed":true}]}
+  ]
+}
+```
+
+An ATS with a generator uses two incoming branches and a group permitting at most one closed contact. The generator is out of service normally and enters service in the transfer case. For load-flow prefault, every energized island needs an in-service source with `is_slack: true`. Designate the standby generator as slack even while its normal `in_service` value is false, as shown below; its slack role takes effect when the generator enters service. Without a slack source in a transferred island, load-flow prefault is unavailable and that case's fault and arc-flash results are invalid or incomplete.
+
+```json
+{
+  "name": "Utility generator ATS example",
+  "buses": [
+    {"id":"utility_bus","name":"Utility bus","kv":0.48},
+    {"id":"generator_bus","name":"Generator bus","kv":0.48},
+    {"id":"load_bus","name":"ATS load bus","kv":0.48}
+  ],
+  "branches": [
+    {"id":"utility_throw","name":"Utility ATS connection","from":"utility_bus","to":"load_bus","kind":{"type":"line","r_ohm":0.003,"x_ohm":0.004}},
+    {"id":"generator_throw","name":"Generator ATS connection","from":"generator_bus","to":"load_bus","kind":{"type":"line","r_ohm":0.003,"x_ohm":0.004}}
+  ],
+  "sources": [
+    {"id":"utility","name":"Utility","bus":"utility_bus","mva_sc":40,"xr":8,"is_slack":true},
+    {"id":"generator","name":"Generator","bus":"generator_bus","mva_sc":8,"xr":6,"is_slack":true,"in_service":false}
+  ],
+  "switches": [
+    {"id":"ats_utility","name":"ATS utility contact","branch_id":"utility_throw","kind":"ats","closed":true},
+    {"id":"ats_generator","name":"ATS generator contact","branch_id":"generator_throw","kind":"ats","closed":false}
+  ],
+  "switch_groups": [
+    {"id":"ats_interlock","switch_ids":["ats_utility","ats_generator"],"max_closed":1}
+  ],
+  "operating_cases": [
+    {"id":"on_generator","name":"Generator supplies load","switch_states":[{"switch_id":"ats_utility","closed":false},{"switch_id":"ats_generator","closed":true}],"source_states":[{"source_id":"utility","in_service":false},{"source_id":"generator","in_service":true}]}
+  ]
+}
+```
+
+Save either object as a project JSON file and run `flashmob run project.json --study fault`. `flashmob exec` can build the same records with `add_switch`, `add_switch_group`, and `add_operating_case`; `add_source` and `set_source` accept `in_service`. A full arc-flash study also needs equipment geometry and a clearing duration or located protective device with sufficient settings.
+
+`flashmob run` returns the normal result at the top level (`case_id: "normal"`) and each named result in `operating_cases`. `worst_case.buses` records independent maxima for symmetrical RMS, IEC peak, and half-cycle RMS fault current at each bus and fault type; `worst_case.arc_equipment` records the largest incident energy and boundary for each equipment item. Each maximum includes its governing `case_id`. The incident-energy case may differ from the boundary case, and the highest fault current may have lower incident energy when its protective device clears faster. Check `complete` and `failed_case_ids`: a failed case is retained and the reported maximum is incomplete for that bus or equipment.
+
+Generator sources use fixed short-circuit impedance and current in this prototype. Generator fault-current decrement and time-varying arcing or clearing are not modeled. Long generator-fed arc results are screening estimates, not validated worst-case incident energy.
+
 Current on a TCC is referred to the chosen voltage, so a device on another winding can sit on the same plot. Fault-current and arcing-current markers are drawn when a study has been run.
 
 ## Studies

@@ -114,6 +114,7 @@ pub enum ZeroStamp {
 }
 
 pub struct BranchStamp {
+    pub active: bool,
     pub from: usize,
     pub to: usize,
     pub positive: Quad,
@@ -152,6 +153,22 @@ pub(crate) fn build_validated(project: &Project) -> Result<SystemModel, String> 
     let mut branches = Vec::new();
 
     for branch in &project.branches {
+        if !project.branch_closed(branch) {
+            let from = index.of(&branch.from)?;
+            let to = index.of(&branch.to)?;
+            let zero_quad = Quad { yff: Cplx::ZERO, yft: Cplx::ZERO, ytf: Cplx::ZERO, ytt: Cplx::ZERO };
+            branches.push(BranchStamp {
+                active: false,
+                from,
+                to,
+                positive: zero_quad,
+                negative: zero_quad,
+                zero: ZeroStamp::Open,
+                ampacity_a: None,
+                rating_kva: None,
+            });
+            continue;
+        }
         let stamp = stamp_branch(project, &index, branch, &mut warnings)?;
         let q = stamp.positive;
         loadflow.add(stamp.from, stamp.from, q.yff);
@@ -183,6 +200,7 @@ pub(crate) fn build_validated(project: &Project) -> Result<SystemModel, String> 
     }
 
     for source in &project.sources {
+        if !source.in_service { continue; }
         let i = index.of(&source.bus)?;
         let z1 = Cplx::from_mag_xr(project.s_base_mva / source.mva_sc, source.xr);
         let y1 = z1.inv().ok_or_else(|| format!("source '{}' has zero impedance", source.id))?;
@@ -196,7 +214,9 @@ pub(crate) fn build_validated(project: &Project) -> Result<SystemModel, String> 
     // Only utility/generator sources energize islands; passive shunts and motors do not.
     let mut supply = Net::new(n);
     supply.edges = pos.edges.clone();
-    for source in &project.sources { supply.shunt[index.of(&source.bus)?] = true; }
+    for source in project.sources.iter().filter(|source| source.in_service) {
+        supply.shunt[index.of(&source.bus)?] = true;
+    }
     let energized = reaches_shunt(&supply);
 
     for motor in &project.motors {
@@ -252,6 +272,7 @@ fn stamp_branch(project: &Project, index: &Index, branch: &Branch, warnings: &mu
                 .ok_or_else(|| format!("line {}: zero or non-finite zero-sequence impedance", branch.id))?;
             let zero = ZeroStamp::Series(quad(y0, base_ratio)?);
             Ok(BranchStamp {
+                active: true,
                 from: i,
                 to: j,
                 positive: q,
@@ -294,6 +315,7 @@ fn stamp_branch(project: &Project, index: &Index, branch: &Branch, warnings: &mu
                 _ => ZeroStamp::Open,
             };
             Ok(BranchStamp {
+                active: true,
                 from: i,
                 to: j,
                 positive,

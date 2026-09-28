@@ -64,18 +64,12 @@ pub fn solve(project: &Project) -> Result<LoadflowResult, String> {
     if project.buses.is_empty() {
         return Err("the project has no buses".into());
     }
-    if !project.sources.iter().any(|s| s.is_slack) {
-        return Err("mark one source as the slack bus (is_slack: true)".into());
-    }
     let model = network::build(project)?;
     solve_with_model(project, &model)
 }
 
 pub(crate) fn solve_with_model(project: &Project, model: &network::SystemModel) -> Result<LoadflowResult, String> {
     if project.buses.is_empty() { return Err("the project has no buses".into()); }
-    if !project.sources.iter().any(|s| s.is_slack) {
-        return Err("mark one source as the slack bus (is_slack: true)".into());
-    }
     let n = model.index.n;
     let sbase = project.s_base_mva;
     // A source-free island has no voltage reference and cannot enter the
@@ -87,7 +81,7 @@ pub(crate) fn solve_with_model(project: &Project, model: &network::SystemModel) 
     }
     let mut has_slack_path = vec![false; n];
     let mut stack = Vec::new();
-    for source in project.sources.iter().filter(|source| source.is_slack) {
+    for source in project.sources.iter().filter(|source| source.in_service && source.is_slack) {
         let i = model.index.of(&source.bus)?;
         if !has_slack_path[i] {
             has_slack_path[i] = true;
@@ -111,6 +105,7 @@ pub(crate) fn solve_with_model(project: &Project, model: &network::SystemModel) 
     ];
 
     for source in &project.sources {
+        if !source.in_service { continue; }
         let i = model.index.of(&source.bus)?;
         if source.is_slack {
             spec[i].kind = Kind::Slack;
@@ -260,6 +255,14 @@ pub(crate) fn solve_with_model(project: &Project, model: &network::SystemModel) 
     let volts: Vec<Cplx> = (0..n).map(|i| Cplx::from_polar(v[i], ang[i])).collect();
     let mut branches = Vec::new();
     for (branch, stamp) in project.branches.iter().zip(&model.branches) {
+        if !stamp.active {
+            branches.push(BranchResult {
+                id: branch.id.clone(), name: branch.name.clone(), from: branch.from.clone(), to: branch.to.clone(),
+                p_from_mw: 0.0, q_from_mvar: 0.0, p_to_mw: 0.0, q_to_mvar: 0.0,
+                i_from_a: 0.0, loading_pct: None, p_loss_mw: 0.0,
+            });
+            continue;
+        }
         let vi = volts[stamp.from];
         let vj = volts[stamp.to];
         let q = stamp.positive;
@@ -415,6 +418,7 @@ mod tests {
                 id: "s".into(),
                 name: "slack".into(),
                 bus: "a".into(),
+                in_service: true,
                 v_pu: 1.0,
                 angle_deg: 0.0,
                 mva_sc: 10_000.0,
@@ -437,5 +441,28 @@ mod tests {
         assert!((bus.v_pu - v_expected).abs() < 1e-5, "v = {}, expected {v_expected}", bus.v_pu);
         assert!((bus.angle_deg - ang_expected).abs() < 1e-3, "angle = {}, expected {ang_expected}", bus.angle_deg);
         assert!(result.max_mismatch_pu < 1e-8);
+    }
+
+    #[test]
+    fn open_branch_reports_zero_and_all_sources_off_is_unenergized() {
+        let mut project = Project::sample();
+        project.switches.push(Switch {
+            id: "panel-switch".into(), name: "Panel switch".into(), branch_id: "feeder".into(),
+            kind: SwitchKind::Breaker, closed: false,
+        });
+        let open = solve(&project).unwrap();
+        assert!(open.converged, "{:?}", open.message);
+        let panel = open.buses.iter().find(|b| b.id == "pnl").unwrap();
+        assert_eq!(panel.kind, "unenergized");
+        assert_eq!(panel.v_pu, 0.0);
+        let feeder = open.branches.iter().find(|b| b.id == "feeder").unwrap();
+        assert_eq!(feeder.i_from_a, 0.0);
+        assert_eq!(feeder.p_from_mw, 0.0);
+        assert_eq!(feeder.loading_pct, None);
+
+        project.sources[0].in_service = false;
+        let offline = solve(&project).unwrap();
+        assert!(offline.converged);
+        assert!(offline.buses.iter().all(|b| b.kind == "unenergized" && b.v_pu == 0.0));
     }
 }

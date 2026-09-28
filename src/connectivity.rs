@@ -5,18 +5,24 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
-use crate::model::{BranchKind, Project};
+use crate::model::{BranchKind, OperatingCase, Project, SwitchGroup, SwitchKind};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Topology {
     pub project_name: String,
     pub buses: Vec<BusConnections>,
     pub branches: Vec<BranchConnection>,
-    pub sources: Vec<LocatedComponent>,
+    pub sources: Vec<SourceConnection>,
     pub loads: Vec<LocatedComponent>,
     pub motors: Vec<LocatedComponent>,
     pub devices: Vec<DeviceConnection>,
     pub equipment: Vec<EquipmentConnection>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub switches: Vec<SwitchConnection>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub switch_groups: Vec<SwitchGroup>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub operating_cases: Vec<OperatingCase>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -59,6 +65,10 @@ pub struct BranchConnection {
     pub kind: &'static str,
     pub from_bus_id: String,
     pub to_bus_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub switch_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_closed: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -67,6 +77,27 @@ pub struct LocatedComponent {
     pub name: String,
     pub bus_id: String,
 }
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SourceConnection {
+    pub id: String,
+    pub name: String,
+    pub bus_id: String,
+    /// Omitted from JSON for the legacy/default true state.
+    #[serde(skip_serializing_if = "is_true")]
+    pub in_service: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SwitchConnection {
+    pub id: String,
+    pub name: String,
+    pub branch_id: String,
+    pub kind: SwitchKind,
+    pub closed: bool,
+}
+
+fn is_true(value: &bool) -> bool { *value }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct DeviceConnection {
@@ -142,6 +173,8 @@ pub fn topology(project: &Project) -> Result<Topology, String> {
                 },
                 from_bus_id: branch.from.clone(),
                 to_bus_id: branch.to.clone(),
+                switch_id: project.switches.iter().find(|item| item.branch_id == branch.id).map(|item| item.id.clone()),
+                base_closed: project.switches.iter().find(|item| item.branch_id == branch.id).map(|item| item.closed),
             }
         })
         .collect();
@@ -153,7 +186,12 @@ pub fn topology(project: &Project) -> Result<Topology, String> {
             buses[bus_index[source.bus.as_str()]]
                 .sources
                 .push(named(&source.id, &source.name));
-            located(&source.id, &source.name, &source.bus)
+            SourceConnection {
+                id: source.id.clone(),
+                name: source.name.clone(),
+                bus_id: source.bus.clone(),
+                in_service: source.in_service,
+            }
         })
         .collect();
     let loads = project
@@ -243,6 +281,15 @@ pub fn topology(project: &Project) -> Result<Topology, String> {
         motors,
         devices,
         equipment,
+        switches: project.switches.iter().map(|item| SwitchConnection {
+            id: item.id.clone(),
+            name: item.name.clone(),
+            branch_id: item.branch_id.clone(),
+            kind: item.kind.clone(),
+            closed: item.closed,
+        }).collect(),
+        switch_groups: project.switch_groups.clone(),
+        operating_cases: project.operating_cases.clone(),
     })
 }
 
@@ -264,7 +311,7 @@ fn located(id: &str, name: &str, bus: &str) -> LocatedComponent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Branch, BranchKind, Bus, CurveSpec, Device, Project};
+    use crate::model::{Branch, BranchKind, Bus, CurveSpec, Device, Project, Switch, SwitchKind};
 
     fn line(id: &str, from: &str, to: &str) -> Branch {
         Branch {
@@ -420,5 +467,27 @@ mod tests {
         project.branches[0].to = "missing".into();
         let err = topology(&project).unwrap_err();
         assert!(err.contains("unknown bus 'missing'"), "{err}");
+    }
+
+    #[test]
+    fn topology_serializes_explicit_switch_and_source_states_without_changing_legacy_shape() {
+        let mut project = Project::sample();
+        let legacy = serde_json::to_value(topology(&project).unwrap()).unwrap();
+        assert!(legacy.get("switches").is_none());
+        assert!(legacy.get("switch_groups").is_none());
+        assert!(legacy.get("operating_cases").is_none());
+        assert!(legacy["branches"][0].get("switch_id").is_none());
+        assert!(legacy["sources"][0].get("in_service").is_none());
+
+        project.switches.push(Switch {
+            id: "feeder-switch".into(), name: "Feeder switch".into(),
+            branch_id: "feeder".into(), kind: SwitchKind::Breaker, closed: false,
+        });
+        project.sources[0].in_service = false;
+        let active = serde_json::to_value(topology(&project).unwrap()).unwrap();
+        assert_eq!(active["branches"][1]["switch_id"], "feeder-switch");
+        assert_eq!(active["branches"][1]["base_closed"], false);
+        assert_eq!(active["switches"][0]["branch_id"], "feeder");
+        assert_eq!(active["sources"][0]["in_service"], false);
     }
 }

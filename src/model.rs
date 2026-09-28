@@ -22,6 +22,15 @@ pub struct Project {
     pub devices: Vec<Device>,
     #[serde(default)]
     pub equipment: Vec<ArcEquipment>,
+    /// Operable contacts on existing finite-impedance branches.
+    #[serde(default)]
+    pub switches: Vec<Switch>,
+    /// Interlocks that limit the number of simultaneously closed contacts.
+    #[serde(default)]
+    pub switch_groups: Vec<SwitchGroup>,
+    /// Named deviations from the normal switch and source state.
+    #[serde(default)]
+    pub operating_cases: Vec<OperatingCase>,
     /// Maximum arc duration reported for incident energy. IEEE 1584 discusses 2 s when a person can move away.
     #[serde(default = "default_cap")]
     pub arc_duration_cap_s: f64,
@@ -137,6 +146,9 @@ pub struct Source {
     pub id: String,
     pub name: String,
     pub bus: String,
+    /// Whether this utility or generator is available in the current state.
+    #[serde(default = "default_true")]
+    pub in_service: bool,
     #[serde(default = "default_vpu")]
     pub v_pu: f64,
     #[serde(default)]
@@ -156,6 +168,77 @@ pub struct Source {
     pub qmin_mvar: Option<f64>,
     #[serde(default)]
     pub qmax_mvar: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwitchKind {
+    Breaker,
+    Tie,
+    Ats,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Switch {
+    pub id: String,
+    pub name: String,
+    /// The existing branch whose series path this contact opens or closes.
+    pub branch_id: String,
+    pub kind: SwitchKind,
+    /// Explicit normal state. Requiring this avoids silently closing a tie or
+    /// both throws of an ATS when an input omits the field.
+    pub closed: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwitchGroup {
+    pub id: String,
+    pub switch_ids: Vec<String>,
+    pub max_closed: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwitchState {
+    pub switch_id: String,
+    pub closed: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceState {
+    pub source_id: String,
+    pub in_service: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EquipmentState {
+    pub equipment_id: String,
+    /// Case-specific protective device. None permits automatic selection.
+    #[serde(default)]
+    pub upstream_device: Option<String>,
+    /// Case-specific explicit total arc duration.
+    #[serde(default)]
+    pub clearing_s: Option<f64>,
+    /// Case-specific authorized fallback if device clearing is unavailable.
+    #[serde(default)]
+    pub fallback_duration_s: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatingCase {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub switch_states: Vec<SwitchState>,
+    #[serde(default)]
+    pub source_states: Vec<SourceState>,
+    #[serde(default)]
+    pub equipment_states: Vec<EquipmentState>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -313,6 +396,7 @@ impl Electrode {
 fn default_name() -> String {
     "Untitled".to_string()
 }
+fn default_true() -> bool { true }
 fn default_sbase() -> f64 {
     100.0
 }
@@ -353,6 +437,9 @@ impl Default for Project {
             motors: Vec::new(),
             devices: Vec::new(),
             equipment: Vec::new(),
+            switches: Vec::new(),
+            switch_groups: Vec::new(),
+            operating_cases: Vec::new(),
             arc_duration_cap_s: default_cap(),
             prefault: Prefault::Flat,
             assumptions: Vec::new(),
@@ -368,6 +455,9 @@ impl Project {
             arc_duration_cap_s: 2.0,
             prefault: Prefault::Flat,
             assumptions: Vec::new(),
+            switches: Vec::new(),
+            switch_groups: Vec::new(),
+            operating_cases: Vec::new(),
             buses: vec![
                 Bus { id: "util".into(), name: "Utility".into(), kv: 12.47, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None },
                 Bus { id: "mcc".into(), name: "MCC-1".into(), kv: 0.48, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None },
@@ -415,6 +505,7 @@ impl Project {
                 id: "grid".into(),
                 name: "Utility".into(),
                 bus: "util".into(),
+                in_service: true,
                 v_pu: 1.0,
                 angle_deg: 0.0,
                 mva_sc: 250.0,
@@ -517,6 +608,61 @@ impl Project {
         self.devices.iter().find(|d| d.id == id)
     }
 
+    /// Branches without an explicit switch are always connected.
+    pub fn branch_closed(&self, branch: &Branch) -> bool {
+        self.switches.iter().find(|s| s.branch_id == branch.id).map_or(true, |s| s.closed)
+    }
+
+    /// Apply a named state to a project snapshot, retaining interlocks while
+    /// dropping case definitions so this snapshot has one unambiguous state.
+    pub fn apply_operating_case(&self, case: &OperatingCase) -> Result<Self, String> {
+        let mut errors = self.validate();
+        if !errors.is_empty() { return Err(errors.join("; ")); }
+        let mut result = self.clone();
+        let mut switch_targets = std::collections::HashSet::new();
+        for state in &case.switch_states {
+            if !switch_targets.insert(&state.switch_id) {
+                errors.push(format!("operating case {} repeats switch '{}'", case.id, state.switch_id));
+            } else if let Some(switch) = result.switches.iter_mut().find(|s| s.id == state.switch_id) {
+                switch.closed = state.closed;
+            } else {
+                errors.push(format!("operating case {} references unknown switch '{}'", case.id, state.switch_id));
+            }
+        }
+        let mut source_targets = std::collections::HashSet::new();
+        for state in &case.source_states {
+            if !source_targets.insert(&state.source_id) {
+                errors.push(format!("operating case {} repeats source '{}'", case.id, state.source_id));
+            } else if let Some(source) = result.sources.iter_mut().find(|s| s.id == state.source_id) {
+                source.in_service = state.in_service;
+            } else {
+                errors.push(format!("operating case {} references unknown source '{}'", case.id, state.source_id));
+            }
+        }
+        // A normal-state device or time may not clear a fault after transfer.
+        // Start each alternate case with no inherited arc-clearing assignment.
+        for equipment in &mut result.equipment {
+            equipment.upstream_device = None;
+            equipment.clearing_s = None;
+            equipment.fallback_duration_s = None;
+        }
+        let mut equipment_targets = std::collections::HashSet::new();
+        for state in &case.equipment_states {
+            if !equipment_targets.insert(&state.equipment_id) {
+                errors.push(format!("operating case {} repeats equipment '{}'", case.id, state.equipment_id));
+            } else if let Some(equipment) = result.equipment.iter_mut().find(|e| e.id == state.equipment_id) {
+                equipment.upstream_device = state.upstream_device.clone();
+                equipment.clearing_s = state.clearing_s;
+                equipment.fallback_duration_s = state.fallback_duration_s;
+            } else {
+                errors.push(format!("operating case {} references unknown equipment '{}'", case.id, state.equipment_id));
+            }
+        }
+        result.operating_cases.clear();
+        errors.extend(result.validate());
+        if errors.is_empty() { Ok(result) } else { Err(errors.join("; ")) }
+    }
+
     pub fn ids(&self) -> Vec<&str> {
         let mut out = Vec::new();
         for b in &self.buses {
@@ -539,6 +685,15 @@ impl Project {
         }
         for b in &self.equipment {
             out.push(b.id.as_str());
+        }
+        for s in &self.switches {
+            out.push(s.id.as_str());
+        }
+        for g in &self.switch_groups {
+            out.push(g.id.as_str());
+        }
+        for c in &self.operating_cases {
+            out.push(c.id.as_str());
         }
         for b in &self.assumptions {
             out.push(b.id.as_str());
@@ -607,6 +762,87 @@ impl Project {
                 errors.push(format!("source {} has a non-positive strength or voltage", x.id));
             }
         }
+        let mut controlled_branches = std::collections::HashSet::new();
+        for x in &self.switches {
+            claim(&x.id, "switch", &mut errors);
+            if !self.branches.iter().any(|b| b.id == x.branch_id) {
+                errors.push(format!("switch {} references unknown branch '{}'", x.id, x.branch_id));
+            }
+            if !controlled_branches.insert(&x.branch_id) {
+                errors.push(format!("multiple switches control branch '{}'", x.branch_id));
+            }
+        }
+        for x in &self.switch_groups {
+            claim(&x.id, "switch group", &mut errors);
+            if x.switch_ids.is_empty() {
+                errors.push(format!("switch group {} has no switches", x.id));
+            }
+            if x.max_closed > x.switch_ids.len() {
+                errors.push(format!("switch group {} max_closed exceeds its switch count", x.id));
+            }
+            let mut members = std::collections::HashSet::new();
+            for id in &x.switch_ids {
+                if !members.insert(id) {
+                    errors.push(format!("switch group {} repeats switch '{}'", x.id, id));
+                }
+                if !self.switches.iter().any(|s| s.id == *id) {
+                    errors.push(format!("switch group {} references unknown switch '{}'", x.id, id));
+                }
+            }
+        }
+        errors.extend(self.group_state_errors("normal", &self.switches));
+        errors.extend(Self::source_setpoint_errors("normal", &self.sources));
+        for case in &self.operating_cases {
+            claim(&case.id, "operating case", &mut errors);
+            if case.id == "normal" {
+                errors.push("operating case id 'normal' is reserved for the base state".into());
+            }
+            let mut switches = self.switches.clone();
+            let mut switch_targets = std::collections::HashSet::new();
+            for state in &case.switch_states {
+                if !switch_targets.insert(&state.switch_id) {
+                    errors.push(format!("operating case {} repeats switch '{}'", case.id, state.switch_id));
+                }
+                if let Some(switch) = switches.iter_mut().find(|s| s.id == state.switch_id) {
+                    switch.closed = state.closed;
+                } else {
+                    errors.push(format!("operating case {} references unknown switch '{}'", case.id, state.switch_id));
+                }
+            }
+            let mut source_targets = std::collections::HashSet::new();
+            let mut sources = self.sources.clone();
+            for state in &case.source_states {
+                if !source_targets.insert(&state.source_id) {
+                    errors.push(format!("operating case {} repeats source '{}'", case.id, state.source_id));
+                }
+                if let Some(source) = sources.iter_mut().find(|s| s.id == state.source_id) {
+                    source.in_service = state.in_service;
+                } else {
+                    errors.push(format!("operating case {} references unknown source '{}'", case.id, state.source_id));
+                }
+            }
+            errors.extend(self.group_state_errors(&case.id, &switches));
+            errors.extend(Self::source_setpoint_errors(&case.id, &sources));
+            let mut equipment_targets = std::collections::HashSet::new();
+            for state in &case.equipment_states {
+                if !equipment_targets.insert(&state.equipment_id) {
+                    errors.push(format!("operating case {} repeats equipment '{}'", case.id, state.equipment_id));
+                }
+                if !self.equipment.iter().any(|equipment| equipment.id == state.equipment_id) {
+                    errors.push(format!("operating case {} references unknown equipment '{}'", case.id, state.equipment_id));
+                }
+                if let Some(device) = &state.upstream_device {
+                    if self.device(device).is_none() {
+                        errors.push(format!("operating case {} equipment {} references unknown device '{}'", case.id, state.equipment_id, device));
+                    }
+                }
+                for (what, seconds) in [("clearing_s", state.clearing_s), ("fallback_duration_s", state.fallback_duration_s)] {
+                    if seconds.is_some_and(|value| !value.is_finite() || value <= 0.0) {
+                        errors.push(format!("operating case {} equipment {} has invalid {}", case.id, state.equipment_id, what));
+                    }
+                }
+            }
+        }
         for x in &self.motors {
             claim(&x.id, "motor", &mut errors);
             need_bus(&x.bus, &format!("motor {}", x.id), &mut errors);
@@ -634,6 +870,29 @@ impl Project {
             }
         }
         self.validate_physical(&mut errors);
+        errors
+    }
+
+    fn group_state_errors(&self, label: &str, switches: &[Switch]) -> Vec<String> {
+        let mut errors = Vec::new();
+        for group in &self.switch_groups {
+            let closed = group.switch_ids.iter().filter(|id| switches.iter().any(|s| s.id == **id && s.closed)).count();
+            if closed > group.max_closed {
+                errors.push(format!("state {label} closes {closed} switches in group {} (max {})", group.id, group.max_closed));
+            }
+        }
+        errors
+    }
+
+    fn source_setpoint_errors(label: &str, sources: &[Source]) -> Vec<String> {
+        let mut errors = Vec::new();
+        for (i, source) in sources.iter().enumerate().filter(|(_, source)| source.in_service) {
+            for other in sources.iter().skip(i + 1).filter(|other| other.in_service && other.bus == source.bus) {
+                if (other.v_pu - source.v_pu).abs() >= 1e-8 {
+                    errors.push(format!("state {label}: sources '{}' and '{}' have conflicting voltage setpoints on bus '{}'", source.id, other.id, source.bus));
+                }
+            }
+        }
         errors
     }
 
@@ -670,9 +929,6 @@ impl Project {
                 && (s.r0_over_r1 > 0.0 || s.xr * s.x0_over_x1 > 0.0), &s.id, "source impedance or voltage");
             check(s.qmin_mvar.map_or(true, f64::is_finite) && s.qmax_mvar.map_or(true, f64::is_finite)
                 && s.qmin_mvar.unwrap_or(f64::NEG_INFINITY) <= s.qmax_mvar.unwrap_or(f64::INFINITY), &s.id, "reactive limits");
-            for other in self.sources.iter().filter(|o| o.bus == s.bus) {
-                check((other.v_pu - s.v_pu).abs() < 1e-8, &s.id, "conflicting voltage setpoints on one bus");
-            }
         }
         for l in &self.loads { check(l.kw.is_finite() && l.kvar.is_finite(), &l.id, "load"); }
         for m in &self.motors {
@@ -721,6 +977,114 @@ mod tests {
         let back: Project = serde_json::from_str(&text).unwrap();
         assert!(back.validate().is_empty(), "{:?}", back.validate());
         assert_eq!(back.branches.len(), 2);
+    }
+
+    #[test]
+    fn operating_cases_apply_overrides_and_enforce_interlocks() {
+        let mut project = Project::sample();
+        project.switches = vec![
+            Switch { id: "main".into(), name: "Main".into(), branch_id: "t1".into(), kind: SwitchKind::Breaker, closed: true },
+            Switch { id: "tie".into(), name: "Tie".into(), branch_id: "feeder".into(), kind: SwitchKind::Tie, closed: false },
+        ];
+        project.switch_groups.push(SwitchGroup { id: "interlock".into(), switch_ids: vec!["main".into(), "tie".into()], max_closed: 1 });
+        let transfer = OperatingCase {
+            id: "transfer".into(), name: "Transfer".into(),
+            switch_states: vec![SwitchState { switch_id: "main".into(), closed: false }, SwitchState { switch_id: "tie".into(), closed: true }],
+            source_states: vec![SourceState { source_id: "grid".into(), in_service: false }],
+            equipment_states: Vec::new(),
+        };
+        project.operating_cases.push(transfer.clone());
+        assert!(project.validate().is_empty(), "{:?}", project.validate());
+        let active = project.apply_operating_case(&transfer).unwrap();
+        assert!(!active.branch_closed(&active.branches[0]));
+        assert!(active.branch_closed(&active.branches[1]));
+        assert!(!active.sources[0].in_service);
+        assert!(active.operating_cases.is_empty());
+        assert!(project.branch_closed(&project.branches[0]));
+        assert!(!project.branch_closed(&project.branches[1]));
+
+        project.operating_cases[0].switch_states.remove(0);
+        assert!(project.validate().iter().any(|error| error.contains("max 1")));
+        project.operating_cases[0].id = "normal".into();
+        assert!(project.validate().iter().any(|error| error.contains("reserved")));
+    }
+
+    #[test]
+    fn legacy_json_defaults_sources_on_and_has_no_switches() {
+        let mut value = serde_json::to_value(Project::sample()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("switches");
+        object.remove("switch_groups");
+        object.remove("operating_cases");
+        object.get_mut("sources").unwrap().as_array_mut().unwrap()[0].as_object_mut().unwrap().remove("in_service");
+        let project: Project = serde_json::from_value(value).unwrap();
+        assert!(project.sources[0].in_service);
+        assert!(project.switches.is_empty() && project.switch_groups.is_empty() && project.operating_cases.is_empty());
+    }
+
+    #[test]
+    fn switch_normal_state_must_be_explicit() {
+        let mut value = serde_json::to_value(Project::sample()).unwrap();
+        value["switches"] = serde_json::json!([{
+            "id": "tie", "name": "Tie", "branch_id": "feeder", "kind": "tie"
+        }]);
+        let error = serde_json::from_value::<Project>(value).unwrap_err().to_string();
+        assert!(error.contains("closed"), "{error}");
+    }
+
+    #[test]
+    fn alternate_case_clearing_inputs_require_explicit_reentry() {
+        let mut project = Project::sample();
+        project.equipment[0].clearing_s = Some(0.2);
+        project.equipment[0].fallback_duration_s = Some(0.8);
+        let case = OperatingCase {
+            id: "transfer".into(), name: "Transfer".into(),
+            switch_states: Vec::new(), source_states: Vec::new(), equipment_states: Vec::new(),
+        };
+        project.operating_cases.push(case.clone());
+        let active = project.apply_operating_case(&case).unwrap();
+        assert_eq!(project.equipment[0].upstream_device.as_deref(), Some("brk-main"));
+        assert_eq!(project.equipment[0].clearing_s, Some(0.2));
+        assert_eq!(project.equipment[0].fallback_duration_s, Some(0.8));
+        assert!(active.equipment.iter().all(|e| e.upstream_device.is_none() && e.clearing_s.is_none() && e.fallback_duration_s.is_none()));
+
+        project.operating_cases[0].equipment_states.push(EquipmentState {
+            equipment_id: "af-mcc".into(), upstream_device: Some("brk-main".into()),
+            clearing_s: Some(0.4), fallback_duration_s: Some(1.0),
+        });
+        let active = project.apply_operating_case(&project.operating_cases[0]).unwrap();
+        assert_eq!(active.equipment[0].upstream_device.as_deref(), Some("brk-main"));
+        assert_eq!(active.equipment[0].clearing_s, Some(0.4));
+        assert_eq!(active.equipment[0].fallback_duration_s, Some(1.0));
+        assert!(active.equipment[1].upstream_device.is_none());
+
+        project.operating_cases[0].equipment_states[0].clearing_s = Some(-0.1);
+        assert!(project.validate().iter().any(|error| error.contains("invalid clearing_s")));
+        project.operating_cases[0].equipment_states[0].clearing_s = Some(0.4);
+        project.operating_cases[0].equipment_states[0].upstream_device = Some("missing".into());
+        assert!(project.validate().iter().any(|error| error.contains("unknown device 'missing'")));
+    }
+
+    #[test]
+    fn standby_sources_on_same_bus_may_have_distinct_voltage_setpoints() {
+        let mut project = Project::sample();
+        let mut generator = project.sources[0].clone();
+        generator.id = "standby".into();
+        generator.name = "Standby".into();
+        generator.v_pu = 1.05;
+        generator.in_service = false;
+        project.sources.push(generator);
+        let transfer = OperatingCase {
+            id: "generator".into(), name: "Generator".into(), switch_states: Vec::new(),
+            source_states: vec![SourceState { source_id: "grid".into(), in_service: false }, SourceState { source_id: "standby".into(), in_service: true }],
+            equipment_states: Vec::new(),
+        };
+        project.operating_cases.push(transfer.clone());
+        assert!(project.validate().is_empty(), "{:?}", project.validate());
+        let active = project.apply_operating_case(&transfer).unwrap();
+        assert!(!active.sources[0].in_service && active.sources[1].in_service);
+        project.operating_cases[0].source_states.remove(0);
+        assert!(project.validate().iter().any(|error| error.contains("conflicting voltage setpoints")));
     }
 }
 
