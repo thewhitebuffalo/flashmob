@@ -24,8 +24,12 @@ pub struct BusGlyph {
     pub fault_lg_ka: Option<f64>,
     pub arcs: Vec<ArcNote>,
     pub arc_failures: Vec<String>,
+    /// Worst case across operating cases, per equipment item; empty without cases.
+    pub worst: Vec<WorstNote>,
     pub card_h: f64,
     pub source: bool,
+    /// Every source on this bus is out of service in the normal state.
+    pub source_out_of_service: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -37,6 +41,33 @@ pub struct ArcNote {
     pub assumed: bool,
 }
 
+/// Envelope maximum incident energy and its governing operating case.
+#[derive(Clone, Debug)]
+pub struct WorstNote {
+    pub equipment_id: String,
+    pub cal_cm2: Option<f64>,
+    pub case_id: Option<String>,
+    pub complete: bool,
+    pub failed_case_ids: Vec<String>,
+}
+
+impl WorstNote {
+    /// One line for a bus card, such as "WORST 4.2 CAL/CM2 [on_generator]".
+    pub fn label(&self) -> String {
+        let value = match (self.cal_cm2, &self.case_id) {
+            (Some(cal), Some(case)) => format!("WORST {cal:.1} CAL/CM2 [{case}]"),
+            (Some(cal), None) => format!("WORST {cal:.1} CAL/CM2"),
+            _ => "WORST CASE UNAVAILABLE".into(),
+        };
+        if self.complete { value } else { format!("{value} INCOMPLETE") }
+    }
+}
+
+/// Card height for a bus with these result rows; used for layout and drawing.
+pub fn card_height(arcs: usize, has_failures: bool, worst: usize) -> f64 {
+    112.0 + arcs as f64 * 30.0 + if has_failures { 20.0 } else { 0.0 } + worst as f64 * 30.0
+}
+
 #[derive(Clone, Debug)]
 pub struct BranchGlyph {
     pub id: String,
@@ -46,7 +77,11 @@ pub struct BranchGlyph {
     pub x2: f64,
     pub y2: f64,
     pub transformer: bool,
-    /// SKM one-line mark on the feeder: breaker square, fused switch, or none.
+    /// Normal state. An open branch is drawn dashed with an open switch.
+    pub closed: bool,
+    /// Name of the switch controlling this branch, if any.
+    pub switch_name: Option<String>,
+    /// One-line mark on the feeder: "breaker", "fuse", "switch", or "none".
     pub protector: String,
     pub protector_at_source: bool,
     /// Routed separately from symbols so folded feeder groups stay connected.
@@ -69,12 +104,14 @@ pub fn diagram(project: &Project, study: &StudyOutput) -> Diagram {
                 .map(|rows| notes_for(rows, &bus.id))
                 .unwrap_or_default();
             let arc_failures: Vec<String> = study.arc_flash_failures.iter().filter(|f| f.bus_id == bus.id).map(|f| format!("{}: {}", f.name, f.error)).collect();
-            let card_h = 112.0 + arcs.len() as f64 * 30.0 + if arc_failures.is_empty() { 0.0 } else { 20.0 };
+            let worst = worst_for(project, study, &bus.id);
+            let card_h = card_height(arcs.len(), !arc_failures.is_empty(), worst.len());
             let fault = study.fault.as_ref().and_then(|f| f.buses.iter().find(|b| b.id == bus.id));
             let flow = study.loadflow.as_ref().filter(|lf| lf.converged).and_then(|lf| lf.buses.iter().find(|b| b.id == bus.id));
             let v_pu = flow.map(|b| b.v_pu);
             let angle_deg = flow.map(|b| b.angle_deg);
             let source = project.sources.iter().any(|s| s.bus == bus.id);
+            let source_out_of_service = source && project.sources.iter().filter(|s| s.bus == bus.id).all(|s| !s.in_service);
             max_x = max_x.max(x + 320.0);
             max_y = max_y.max(y + card_h + 24.0);
             buses.push(BusGlyph {
@@ -89,8 +126,10 @@ pub fn diagram(project: &Project, study: &StudyOutput) -> Diagram {
                 fault_lg_ka: fault.and_then(|b| b.line_to_ground.as_ref().map(|p| p.symmetrical_ka)),
                 arcs,
                 arc_failures,
+                worst,
                 card_h,
                 source,
+                source_out_of_service,
             });
         }
     }
@@ -108,6 +147,8 @@ pub fn diagram(project: &Project, study: &StudyOutput) -> Diagram {
             x2: b.x,
             y2: b.y,
             transformer,
+            closed: project.branch_closed(branch),
+            switch_name: project.switches.iter().find(|s| s.branch_id == branch.id).map(|s| s.name.clone()),
             protector,
             protector_at_source: project.devices.iter().any(|d| d.protected_branch.as_deref() == Some(&branch.id) && d.bus == branch.from),
             route: layout.routes[branch_idx].clone(),
@@ -138,6 +179,27 @@ fn notes_for(rows: &[ArcRow], bus: &str) -> Vec<ArcNote> {
             afb_in: r.afb_in,
             time_s: if r.governing == "reduced_arcing" { r.time_min_s } else { r.time_s },
             assumed: r.assumed,
+        })
+        .collect()
+}
+
+/// Worst-case incident energy per equipment item on this bus. Only shown when
+/// the project has named operating cases (the envelope then differs from normal).
+fn worst_for(project: &Project, study: &StudyOutput, bus: &str) -> Vec<WorstNote> {
+    if project.operating_cases.is_empty() {
+        return Vec::new();
+    }
+    let Some(envelope) = &study.worst_case else { return Vec::new() };
+    envelope
+        .arc_equipment
+        .iter()
+        .filter(|e| e.bus_id == bus)
+        .map(|e| WorstNote {
+            equipment_id: e.equipment_id.clone(),
+            cal_cm2: e.incident_energy_cal_cm2.as_ref().map(|m| m.value),
+            case_id: e.incident_energy_cal_cm2.as_ref().map(|m| m.case_id.clone()),
+            complete: e.complete,
+            failed_case_ids: e.failed_case_ids.clone(),
         })
         .collect()
 }
@@ -189,10 +251,13 @@ fn place_by_topology(project: &Project, study: &StudyOutput) -> Layout {
             }
         }
     }
-    let max_arcs = project.buses.iter().map(|b| study.arc_flash.as_ref()
-        .map_or(0, |rows| rows.iter().filter(|r| r.bus_id == b.id).count())).max().unwrap_or(0);
+    let max_card = project.buses.iter().map(|b| card_height(
+        study.arc_flash.as_ref().map_or(0, |rows| rows.iter().filter(|r| r.bus_id == b.id).count()),
+        study.arc_flash_failures.iter().any(|f| f.bus_id == b.id),
+        worst_for(project, study, &b.id).len(),
+    )).fold(112.0, f64::max);
     // Every row includes enough room for the tallest result card and feeder label.
-    let pitch = (112.0 + max_arcs as f64 * 30.0 + 120.0).max(240.0);
+    let pitch = (max_card + 120.0).max(240.0);
     let mut groups = Vec::new();
     let mut group_roots = std::collections::HashSet::new();
     let mut top_rows = 0;
@@ -261,6 +326,13 @@ impl BranchGlyph {
     }
 
     pub fn winding_at(&self) -> (f64, f64) { (self.x2, self.y2 - 60.0) }
+
+    /// Where the open-switch mark goes: the device slot when it is free,
+    /// otherwise just above a load-end device.
+    pub fn switch_at(&self) -> (f64, f64) {
+        if self.protector == "switch" || self.protector == "none" || self.protector_at_source { (self.x2, self.y2 - 16.0) }
+        else { (self.x2, self.y2 - 31.0) }
+    }
 }
 
 pub fn to_svg(diagram: &Diagram) -> String {
@@ -279,6 +351,9 @@ pub fn to_svg(diagram: &Diagram) -> String {
 .fm-focal-pulse {{ stroke:#00FF66; stroke-width:1.5; stroke-dasharray:2 2; fill:none; }}
 .fm-focal-text {{ fill:#00FF66; font-family:'JetBrains Mono','Fira Code','SF Mono',monospace; font-size:12px; font-weight:700; }}
 .fm-warn {{ fill:#FFB300; font-family:'JetBrains Mono','Fira Code','SF Mono',monospace; font-size:11px; font-weight:700; }}
+.fm-branch-open {{ stroke-dasharray:8 6; opacity:0.75; }}
+.fm-oos {{ stroke:#64748B; fill:none; stroke-width:1.5; stroke-dasharray:3 3; }}
+.fm-oos-text {{ fill:#64748B; font-family:'JetBrains Mono','Fira Code','SF Mono',monospace; font-size:10px; font-weight:700; }}
 </style>
 <rect width="100%" height="100%" fill="#0A0C10"/>
 {grid}
@@ -298,12 +373,28 @@ pub fn to_svg(diagram: &Diagram) -> String {
     for branch in &diagram.branches {
         let pts = branch.points();
         let coords: Vec<String> = pts.iter().map(|(x, y)| format!("{x:.1},{y:.1}")).collect();
-        s.push_str(&format!(r##"<polyline class="fm-branch-line" points="{}"/>"##, coords.join(" ")));
+        let class = if branch.closed { "fm-branch-line" } else { "fm-branch-line fm-branch-open" };
+        s.push_str(&format!(r##"<polyline class="{class}" data-state="{}" points="{}"/>"##,
+            if branch.closed { "closed" } else { "open" }, coords.join(" ")));
         let (dx, dy) = branch.device_at();
-        if branch.protector == "breaker" {
-            s.push_str(&breaker_symbol(dx, dy));
-        } else if branch.protector == "switch" {
-            s.push_str(&switch_symbol(dx, dy));
+        match branch.protector.as_str() {
+            "breaker" => s.push_str(&breaker_symbol(dx, dy)),
+            "fuse" => s.push_str(&fuse_symbol(dx, dy)),
+            "switch" => s.push_str(&switch_symbol(dx, dy, branch.closed)),
+            _ => {}
+        }
+        if !branch.closed {
+            // An open switch is always marked, even where a breaker or fuse is also drawn.
+            let (sx, sy) = branch.switch_at();
+            if branch.protector != "switch" {
+                s.push_str(&switch_symbol(sx, sy, false));
+            }
+            s.push_str(&format!(
+                r##"<text x="{x:.1}" y="{y:.1}" class="fm-warn">N.O.{name}</text>"##,
+                x = sx + 14.0,
+                y = sy + 4.0,
+                name = branch.switch_name.as_deref().map(|n| format!(" {}", esc(&short_label(n).to_uppercase()))).unwrap_or_default(),
+            ));
         }
         let (wx, wy) = branch.winding_at();
         if branch.transformer {
@@ -324,17 +415,26 @@ pub fn to_svg(diagram: &Diagram) -> String {
     s
 }
 
+/// The mark drawn on a branch: a fuse-type device (entered fuse total-clearing
+/// curve) is a fuse; another device with settings is a breaker; a branch with
+/// only a switch gets a switch; otherwise nothing.
 fn protector_on(project: &Project, branch: &str) -> String {
     let mut breaker = false;
+    let mut fuse = false;
     for device in project.devices.iter().filter(|d| d.protected_branch.as_deref() == Some(branch)) {
         match &device.curve {
-            crate::model::CurveSpec::ThermalMagnetic { .. } => breaker = true,
-            crate::model::CurveSpec::SettingsNotCollected { .. } => {},
+            crate::model::CurveSpec::SettingsNotCollected { .. } => {}
+            _ if device.fuse_total_clearing => fuse = true,
             _ => breaker = true,
         }
     }
-    if breaker {
+    let switched = project.switches.iter().any(|s| s.branch_id == branch);
+    if fuse {
+        "fuse".into()
+    } else if breaker {
         "breaker".into()
+    } else if switched {
+        "switch".into()
     } else {
         "none".into()
     }
@@ -352,13 +452,27 @@ fn breaker_symbol(x: f64, y: f64) -> String {
     )
 }
 
-fn switch_symbol(x: f64, y: f64) -> String {
+/// Fuse: a vertical rectangle with the conductor running through it.
+fn fuse_symbol(x: f64, y: f64) -> String {
     format!(
-        r##"<g data-symbol="fused-switch"><rect x="{x:.1}" y="{y:.1}" width="16" height="10" fill="#0A0C10" stroke="#E2E8F0" stroke-width="1.3"/><line x1="{x1:.1}" y1="{y:.1}" x2="{x2:.1}" y2="{y:.1}" stroke="#E2E8F0" stroke-width="1.2"/></g>"##,
-        x = x - 8.0,
-        y = y - 5.0,
-        x1 = x - 8.0,
-        x2 = x + 8.0,
+        r##"<g data-symbol="fuse"><rect x="{rx:.1}" y="{ry:.1}" width="8" height="18" fill="#0A0C10" stroke="#E2E8F0" stroke-width="1.3"/><line x1="{x:.1}" y1="{ry:.1}" x2="{x:.1}" y2="{y2:.1}" stroke="#E2E8F0" stroke-width="1.2"/></g>"##,
+        rx = x - 4.0,
+        ry = y - 9.0,
+        y2 = y + 9.0,
+    )
+}
+
+/// Disconnect switch: two contacts and a blade, closed in line or open at an angle.
+fn switch_symbol(x: f64, y: f64, closed: bool) -> String {
+    let (bx, by) = if closed { (x, y - 7.0) } else { (x + 9.0, y - 5.0) };
+    format!(
+        r##"<g data-symbol="switch" data-state="{state}"><rect x="{x0:.1}" y="{y0:.1}" width="14" height="18" fill="#0A0C10" stroke="none"/><circle cx="{x:.1}" cy="{ya:.1}" r="2" fill="#E2E8F0"/><circle cx="{x:.1}" cy="{yb:.1}" r="2" fill="#E2E8F0"/><line x1="{x:.1}" y1="{yb:.1}" x2="{bx:.1}" y2="{by:.1}" stroke="{ink}" stroke-width="1.6"/></g>"##,
+        state = if closed { "closed" } else { "open" },
+        ink = if closed { "#E2E8F0" } else { "#FFB300" },
+        x0 = x - 7.0,
+        y0 = y - 9.0,
+        ya = y - 7.0,
+        yb = y + 7.0,
     )
 }
 
@@ -415,7 +529,16 @@ fn bus_svg(bus: &BusGlyph, focal: bool) -> String {
     let x = bus.x;
     let y = bus.y;
     let mut body = String::new();
-    if bus.source {
+    if bus.source && bus.source_out_of_service {
+        body.push_str(&format!(
+            r##"<g data-symbol="utility" data-state="out-of-service"><circle cx="{cx:.1}" cy="{y:.1}" r="16" class="fm-oos"/><line x1="{x1:.1}" y1="{y:.1}" x2="{x2:.1}" y2="{y:.1}" class="fm-oos"/><text x="{tx:.1}" y="{ty:.1}" class="fm-oos-text">SOURCE OUT OF SERVICE</text></g>"##,
+            cx = x - 112.0,
+            x1 = x - 96.0,
+            x2 = x - 80.0,
+            tx = x - 150.0,
+            ty = y + 32.0,
+        ));
+    } else if bus.source {
         body.push_str(&utility_symbol(x - 112.0, y));
         body.push_str(&format!(
             r##"<line x1="{x1:.1}" y1="{y:.1}" x2="{x2:.1}" y2="{y:.1}" class="fm-branch-line"/>"##,
@@ -482,6 +605,15 @@ fn bus_svg(bus: &BusGlyph, focal: bool) -> String {
             &format!("AFB {:.0} IN  {:.3} S{}", arc.afb_in, arc.time_s, if arc.assumed { "  ASSUMED" } else { "" }),
         ));
     }
+    for worst in &bus.worst {
+        ty += 14.0;
+        let cls = if !worst.complete || worst.cal_cm2.is_some_and(|c| c >= 8.0) { "fm-warn" } else { "fm-text-dat" };
+        let title = if worst.failed_case_ids.is_empty() { format!("Worst case for {}", worst.equipment_id) }
+            else { format!("Worst case for {}; failed cases: {}", worst.equipment_id, worst.failed_case_ids.join(", ")) };
+        body.push_str(&format!(r##"<g data-envelope="{}"><title>{}</title><text x="{x:.1}" y="{ty:.1}" class="{cls}">{}</text></g>"##,
+            esc(&worst.equipment_id), esc(&title), esc(&worst.label()), x = left + 8.0));
+        ty += 16.0;
+    }
     if !bus.arc_failures.is_empty() {
         ty += 18.0;
         body.push_str(&format!(r##"<g><title>{}</title>{}</g>"##,
@@ -515,8 +647,13 @@ pub fn energy_color(cal: f64) -> &'static str {
     }
 }
 
+/// XML text/attribute escape that also drops control characters XML 1.0 forbids.
 fn esc(value: &str) -> String {
-    value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    crate::skm::strip_controls(value)
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 #[cfg(test)]
@@ -601,5 +738,61 @@ mod tests {
         let mcc = drawing.buses.iter().find(|b| b.id == "mcc").unwrap();
         assert!(util.kv > mcc.kv);
         assert!(util.y < mcc.y, "utility y {} should be above mcc y {}", util.y, mcc.y);
+    }
+
+    #[test]
+    fn operating_state_fuses_and_worst_case_are_drawn() {
+        use crate::model::{Branch, BranchKind, Bus, OperatingCase, Switch, SwitchKind, SwitchState};
+        let mut project = Project::sample();
+        project.devices[1].fuse_total_clearing = true;
+        project.devices[1].breaker_interrupting_s = None;
+        project.buses.push(Bus { id: "gen_bus".into(), name: "Gen bus".into(), kv: 12.47, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None });
+        project.branches.push(Branch { id: "gen_tie".into(), name: "Gen tie".into(), from: "gen_bus".into(), to: "util".into(),
+            kind: BranchKind::Line { r_ohm: 0.01, x_ohm: 0.02, b_siemens: 0.0, r0_ohm: 0.03, x0_ohm: 0.06, ampacity_a: None } });
+        project.switches.push(Switch { id: "gen_sw".into(), name: "Gen breaker".into(), branch_id: "gen_tie".into(), kind: SwitchKind::Breaker, closed: false });
+        let mut generator = project.sources[0].clone();
+        generator.id = "gen".into();
+        generator.name = "Generator".into();
+        generator.bus = "gen_bus".into();
+        generator.in_service = false;
+        generator.is_slack = false;
+        project.sources.push(generator);
+        project.operating_cases.push(OperatingCase { id: "gen_closed".into(), name: "Generator breaker closed".into(),
+            switch_states: vec![SwitchState { switch_id: "gen_sw".into(), closed: true }], source_states: Vec::new(), equipment_states: Vec::new() });
+        assert!(project.validate().is_empty(), "{:?}", project.validate());
+        let study = study::run(&project, Studies::all()).unwrap();
+        let drawing = diagram(&project, &study);
+        let tie = drawing.branches.iter().find(|b| b.id == "gen_tie").unwrap();
+        assert!(!tie.closed);
+        assert_eq!(tie.protector, "switch");
+        assert_eq!(drawing.branches.iter().find(|b| b.id == "feeder").unwrap().protector, "fuse");
+        let gen_bus = drawing.buses.iter().find(|b| b.id == "gen_bus").unwrap();
+        assert!(gen_bus.source && gen_bus.source_out_of_service);
+        let pnl = drawing.buses.iter().find(|b| b.id == "pnl").unwrap();
+        assert_eq!(pnl.worst.len(), 1);
+        assert!(pnl.worst[0].case_id.is_some());
+        assert_eq!(pnl.card_h, card_height(pnl.arcs.len(), !pnl.arc_failures.is_empty(), 1));
+        let svg = to_svg(&drawing);
+        assert!(svg.contains("fm-branch-open") && svg.contains("data-state=\"open\""));
+        assert!(svg.contains("data-symbol=\"switch\" data-state=\"open\""));
+        assert!(svg.contains("N.O. GEN BREAKER"));
+        assert!(svg.contains("data-symbol=\"fuse\""));
+        assert!(svg.contains("SOURCE OUT OF SERVICE"));
+        assert!(svg.contains("WORST "), "{svg}");
+        assert!(svg.contains("data-envelope=\"af-pnl\""));
+        // Without operating cases there is no envelope line.
+        let plain = Project::sample();
+        let plain_svg = to_svg(&diagram(&plain, &study::run(&plain, Studies::all()).unwrap()));
+        assert!(!plain_svg.contains("WORST "));
+        assert!(!plain_svg.contains("fm-branch-open\""));
+    }
+
+    #[test]
+    fn svg_text_drops_control_characters() {
+        let mut project = Project::sample();
+        project.name = "Plant\u{0}\u{1b}<A>".into();
+        let svg = to_svg(&diagram(&project, &study::run(&project, Studies::all()).unwrap()));
+        assert!(svg.contains("PLANT&lt;A&gt;"));
+        assert!(!svg.chars().any(|c| c < ' ' && c != '\n'));
     }
 }
