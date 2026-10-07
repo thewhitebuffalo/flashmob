@@ -172,7 +172,7 @@ This is a study tool for building and checking a model. It does not include a ma
 - Automatic clearing also fails visibly when a motor remains connected to the fault after the selected breaker opens. An already open motor feeder branch disconnects its motor. A feeder breaker that trips during the arc cannot yet be credited because the current engine does not simulate staged main and motor-feeder openings or motor-current decay. Put the motor on a separate bus behind a finite-impedance feeder branch and switch/device to model its location. An explicit `clearing_s` must cover all contributing paths if used as an override.
 - Arc-flash calculation failures remain in `arc_flash_failures` with equipment, bus, and reason, and appear in the report. Successful rows include both case boundaries; the reported boundary is their maximum independently of governing incident energy.
 - Requested loadflow prefault is never replaced by flat prefault. Fault output states requested/used methods and validity; missing or unconverged loadflow invalidates dependent cases.
-- Model edits invalidate results and derived exports. TCCs with no usable settings return a status. Validation errors cause a nonzero CLI exit.
+- Model edits invalidate results and derived exports. TCCs with no usable settings return a status. Validation errors cause a nonzero CLI exit. Device pickups must increase from long-time to short-time to instantaneous, and an IEC/IEEE instantaneous must exceed its timed pickup. Negative load kW (modeled as generation), negative line `b_siemens` (an inductive shunt), and a source `v_pu` outside 0.8–1.2 are accepted with a warning.
 
 ## Performance checks
 

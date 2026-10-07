@@ -250,6 +250,68 @@ fn partial_line_zero_sequence_entry_is_kept_and_warned() {
     let net = network::build(&Project::sample()).unwrap();
     assert!(!net.warnings.iter().any(|w| w.contains("only")));
 }
+fn rejects(p: &Project, expected: &str) {
+    let errors = p.validate();
+    assert!(errors.iter().any(|e| e.contains(expected)), "expected '{expected}' in {errors:?}");
+}
+#[test]
+fn validation_rejects_reference_identity_and_interlock_errors() {
+    let mut p = Project::sample(); p.loads[0].id = "m1".into(); rejects(&p, "duplicate id 'm1' on motor and load");
+    let mut p = Project::sample(); p.equipment[0].id = "grid".into(); rejects(&p, "duplicate id 'grid'");
+    let mut p = Project::sample(); p.loads[0].bus = "nowhere".into(); rejects(&p, "load load-mcc references unknown bus 'nowhere'");
+    let mut p = Project::sample(); p.sources[0].bus = "nowhere".into(); rejects(&p, "source grid references unknown bus 'nowhere'");
+    let mut p = Project::sample(); p.motors[0].bus = "nowhere".into(); rejects(&p, "motor m1 references unknown bus 'nowhere'");
+    let switched = || {
+        let mut p = Project::sample();
+        p.switches.push(Switch { id: "sw".into(), name: "SW".into(), branch_id: "feeder".into(), kind: SwitchKind::Breaker, closed: true });
+        p
+    };
+    let mut p = switched(); p.switch_groups.push(SwitchGroup { id: "g".into(), switch_ids: vec!["sw".into(), "ghost".into()], max_closed: 1 });
+    rejects(&p, "references unknown switch 'ghost'");
+    let mut p = switched(); p.switch_groups.push(SwitchGroup { id: "g".into(), switch_ids: vec!["sw".into()], max_closed: 2 });
+    rejects(&p, "max_closed exceeds its switch count");
+    let mut p = switched(); p.switch_groups.push(SwitchGroup { id: "g".into(), switch_ids: Vec::new(), max_closed: 0 });
+    rejects(&p, "has no switches");
+    // brk-feeder is on bus pnl; the transformer t1 does not terminate there.
+    let mut p = Project::sample(); p.devices[1].protected_branch = Some("t1".into()); rejects(&p, "brk-feeder: invalid protected branch terminal");
+    let mut p = Project::sample(); p.devices[1].protected_branch = Some("ghost".into()); rejects(&p, "brk-feeder: invalid protected branch terminal");
+}
+#[test]
+fn validation_requires_increasing_device_pickups() {
+    let order = "pickup order";
+    let tm = |lt: f64, st: Option<f64>, inst: Option<f64>| CurveSpec::ThermalMagnetic {
+        lt_pickup_a: lt, lt_delay_s: 8.0, st_pickup_a: st, st_delay_s: st.map(|_| 0.3), inst_a: inst, inst_s: None,
+    };
+    for (curve, ok) in [
+        (tm(3200.0, Some(16000.0), Some(36000.0)), true),
+        (tm(3200.0, None, Some(36000.0)), true),
+        (tm(3200.0, Some(3000.0), None), false),
+        (tm(3200.0, Some(16000.0), Some(12000.0)), false),
+        (tm(3200.0, Some(16000.0), Some(16000.0)), false),
+        (tm(3200.0, None, Some(2000.0)), false),
+        (CurveSpec::Iec { kind: IecKind::Si, pickup_a: 600.0, tms: 0.1, inst_a: Some(6000.0), inst_s: None }, true),
+        (CurveSpec::Iec { kind: IecKind::Si, pickup_a: 600.0, tms: 0.1, inst_a: Some(600.0), inst_s: None }, false),
+        (CurveSpec::Ieee { kind: IeeeKind::VeryInverse, pickup_a: 600.0, td: 1.0, inst_a: Some(500.0), inst_s: None }, false),
+        (CurveSpec::Ieee { kind: IeeeKind::VeryInverse, pickup_a: 600.0, td: 1.0, inst_a: None, inst_s: None }, true),
+    ] {
+        let mut p = Project::sample(); p.devices[0].curve = curve.clone();
+        assert_eq!(p.validate().iter().any(|e| e.contains(order)), !ok, "{curve:?}: {:?}", p.validate());
+    }
+}
+#[test]
+fn unusual_but_accepted_entries_are_warned() {
+    let mut p = Project::sample();
+    p.loads[1].kw = -50.0;
+    p.sources[0].v_pu = 1.25;
+    if let BranchKind::Line { b_siemens, .. } = &mut p.branches[1].kind { *b_siemens = -1e-4; }
+    assert!(p.validate().is_empty(), "{:?}", p.validate());
+    let warnings = network::build(&p).unwrap().warnings;
+    for expected in ["load load-pnl: negative kW", "source grid: voltage setpoint 1.25 pu is outside", "line feeder: negative b_siemens"] {
+        assert!(warnings.iter().any(|w| w.contains(expected)), "{expected}: {warnings:?}");
+    }
+    let warnings = network::build(&Project::sample()).unwrap().warnings;
+    assert!(!warnings.iter().any(|w| w.contains("negative") || w.contains("setpoint")), "{warnings:?}");
+}
 fn pv_project() -> Project {
     let mut p = transformer();
     p.buses[0].kv = 13.8; p.buses[1].kv = 13.8;

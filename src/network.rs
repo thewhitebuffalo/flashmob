@@ -259,6 +259,24 @@ fn input_warnings(project: &Project) -> Vec<String> {
             }
         }
     }
+    // Accepted but unusual entries that are easy to make by mistake.
+    for source in &project.sources {
+        if !(0.8..=1.2).contains(&source.v_pu) {
+            warnings.push(format!("source {}: voltage setpoint {} pu is outside 0.8-1.2 pu", source.id, source.v_pu));
+        }
+    }
+    for load in &project.loads {
+        if load.kw < 0.0 {
+            warnings.push(format!("load {}: negative kW ({}) is modeled as generation", load.id, load.kw));
+        }
+    }
+    for branch in &project.branches {
+        if let BranchKind::Line { b_siemens, .. } = branch.kind {
+            if b_siemens < 0.0 {
+                warnings.push(format!("line {}: negative b_siemens ({b_siemens}) is an inductive (reactor) shunt, not cable charging", branch.id));
+            }
+        }
+    }
     warnings
 }
 

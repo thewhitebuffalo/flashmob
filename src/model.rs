@@ -1240,6 +1240,18 @@ impl Project {
                 CurveSpec::SettingsNotCollected { .. } => true,
             };
             check(ok, &d.id, "pickup or delay");
+            // Pickups of successive elements must increase: an instantaneous
+            // at or below the timed pickup, or a short-time below long-time,
+            // would make the slower element unreachable.
+            let ordered = match d.curve {
+                CurveSpec::Iec { pickup_a, inst_a, .. } | CurveSpec::Ieee { pickup_a, inst_a, .. } =>
+                    inst_a.map_or(true, |inst| inst > pickup_a),
+                CurveSpec::ThermalMagnetic { lt_pickup_a, st_pickup_a, inst_a, .. } =>
+                    [Some(lt_pickup_a), st_pickup_a, inst_a].into_iter().flatten()
+                        .collect::<Vec<_>>().windows(2).all(|pair| pair[0] < pair[1]),
+                _ => true,
+            };
+            check(ordered, &d.id, "pickup order (requires long-time < short-time < instantaneous, and instantaneous above the timed pickup)");
         }
         for e in &self.equipment {
             check([e.gap_mm, e.distance_mm, e.height_mm, e.width_mm, e.depth_mm].into_iter().all(positive)
