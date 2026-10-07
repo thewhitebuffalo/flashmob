@@ -459,6 +459,7 @@ mod tests {
                 p_mw: 0.0,
                 qmin_mvar: None,
                 qmax_mvar: None,
+                defaulted: Vec::new(),
             }],
             ..Project::default()
         };

@@ -197,6 +197,59 @@ fn legacy_json_without_grounding_is_solid_and_unchanged() {
     let back: Project = serde_json::from_str(&text).unwrap();
     assert_eq!(back.neutral_grounding, explicit.neutral_grounding);
 }
+#[test]
+fn omitted_source_and_motor_ratings_are_reported_and_stay_omitted() {
+    let mut json = serde_json::to_value(Project::sample()).unwrap();
+    for field in ["x0_over_x1", "r0_over_r1"] { json["sources"][0].as_object_mut().unwrap().remove(field); }
+    for field in ["pf", "efficiency", "x_subtransient_pu", "xr"] { json["motors"][0].as_object_mut().unwrap().remove(field); }
+    let p: Project = serde_json::from_value(json).unwrap();
+    assert_eq!((p.sources[0].x0_over_x1, p.sources[0].r0_over_r1), (1.0, 1.0));
+    assert_eq!((p.motors[0].pf, p.motors[0].efficiency, p.motors[0].x_subtransient_pu, p.motors[0].xr), (0.85, 0.94, 0.17, 6.0));
+    let warnings = network::build(&p).unwrap().warnings;
+    for expected in ["source grid: x0_over_x1 not entered; 1 assumed", "source grid: r0_over_r1 not entered; 1 assumed",
+        "motor m1: pf not entered; 0.85 assumed", "motor m1: efficiency not entered; 0.94 assumed",
+        "motor m1: x_subtransient_pu not entered; 0.17 assumed", "motor m1: xr not entered; 6 assumed"] {
+        assert!(warnings.iter().any(|w| w == expected), "{expected}: {warnings:?}");
+    }
+    let study = study::run(&p, Studies::all()).unwrap();
+    assert!(study.warnings.iter().any(|w| w.contains("pf not entered")));
+    // Saving keeps the omission, so a reload still reports the assumption.
+    let saved = serde_json::to_value(&p).unwrap();
+    assert!(saved["sources"][0].get("x0_over_x1").is_none() && saved["motors"][0].get("pf").is_none());
+    // Entered values (including ones equal to the default) are not assumptions.
+    let sample = Project::sample();
+    assert!(sample.sources[0].defaulted.is_empty() && sample.motors[0].defaulted.is_empty());
+    let saved = serde_json::to_value(&sample).unwrap();
+    assert_eq!(saved["sources"][0]["r0_over_r1"], 1.0);
+    assert_eq!(saved["motors"][0]["xr"], 6.0);
+    assert!(!network::build(&sample).unwrap().warnings.iter().any(|w| w.contains("not entered")));
+    // An edited default is written out.
+    let mut edited = p.clone(); edited.motors[0].pf = 0.9;
+    assert_eq!(serde_json::to_value(&edited).unwrap()["motors"][0]["pf"], 0.9);
+    // exec builders apply the same rule; set_source clears the assumption.
+    let r = exec::exec_request(r#"{"commands":[{"op":"sample"},{"op":"add_source","id":"g2","bus":"util","mva_sc":20,"xr":8},
+        {"op":"add_motor","id":"m2","bus":"mcc","hp":50,"kv":0.46,"pf":0.9},{"op":"run","studies":["fault"]}]}"#);
+    assert!(r.ok, "{:?}", r.error);
+    assert!(r.warnings.iter().any(|w| w == "source g2: x0_over_x1 not entered; 1 assumed"));
+    assert!(r.warnings.iter().any(|w| w == "motor m2: efficiency not entered; 0.94 assumed"));
+    assert!(!r.warnings.iter().any(|w| w.starts_with("motor m2: pf")));
+    let r = exec::exec_request(&serde_json::json!({"project": r.project, "commands": [
+        {"op":"set_source","id":"g2","x0_over_x1":3.0,"r0_over_r1":1.0},{"op":"run","studies":["fault"]}]}).to_string());
+    assert!(r.ok, "{:?}", r.error);
+    assert!(!r.warnings.iter().any(|w| w.starts_with("source g2")), "{:?}", r.warnings);
+}
+#[test]
+fn partial_line_zero_sequence_entry_is_kept_and_warned() {
+    for (r0, x0, expected) in [(0.03, 0.0, "only R0 entered; X0=0"), (0.0, 0.03, "only X0 entered; R0=0")] {
+        let mut p = Project::sample();
+        if let BranchKind::Line { r0_ohm, x0_ohm, .. } = &mut p.branches[1].kind { *r0_ohm = r0; *x0_ohm = x0; }
+        let net = network::build(&p).unwrap();
+        assert!(net.warnings.iter().any(|w| w.contains("line feeder") && w.contains(expected)), "{:?}", net.warnings);
+        assert!(!net.warnings.iter().any(|w| w.contains("R0=3R1")));
+    }
+    let net = network::build(&Project::sample()).unwrap();
+    assert!(!net.warnings.iter().any(|w| w.contains("only")));
+}
 fn pv_project() -> Project {
     let mut p = transformer();
     p.buses[0].kv = 13.8; p.buses[1].kv = 13.8;

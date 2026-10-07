@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::cplx::Cplx;
-use crate::model::{nearest_winding_kv, zbase_ohm, Branch, BranchKind, GroundingMethod, Project, Winding, XfmrConn};
+use crate::model::{nearest_winding_kv, zbase_ohm, Branch, BranchKind, GroundingMethod, Motor, Project, Source, Winding, XfmrConn};
 
 #[derive(Clone, Debug)]
 pub struct Index {
@@ -149,7 +149,7 @@ pub(crate) fn build_validated(project: &Project) -> Result<SystemModel, String> 
     let mut pos = Net::new(n);
     let mut neg = Net::new(n);
     let mut zero = Net::new(n);
-    let mut warnings = Vec::new();
+    let mut warnings = input_warnings(project);
     let mut branches = Vec::new();
 
     for branch in &project.branches {
@@ -241,6 +241,27 @@ pub(crate) fn build_validated(project: &Project) -> Result<SystemModel, String> 
     Ok(SystemModel { index, loadflow, pos, neg, zero, branches, warnings, energized })
 }
 
+/// Model-level assumptions and unusual entries reported with the study
+/// warnings: omitted source/motor ratings filled with typical defaults.
+fn input_warnings(project: &Project) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for source in &project.sources {
+        for field in &source.defaulted {
+            if let Some(value) = Source::default_value(field) {
+                warnings.push(format!("source {}: {field} not entered; {value} assumed", source.id));
+            }
+        }
+    }
+    for motor in &project.motors {
+        for field in &motor.defaulted {
+            if let Some(value) = Motor::default_value(field) {
+                warnings.push(format!("motor {}: {field} not entered; {value} assumed", motor.id));
+            }
+        }
+    }
+    warnings
+}
+
 fn stamp_branch(project: &Project, index: &Index, branch: &Branch, warnings: &mut Vec<String>) -> Result<BranchStamp, String> {
     let i = index.of(&branch.from)?;
     let j = index.of(&branch.to)?;
@@ -265,9 +286,15 @@ fn stamp_branch(project: &Project, index: &Index, branch: &Branch, warnings: &mu
             let mut q = quad(y, base_ratio)?;
             q.yff += Cplx::new(0.0, b_siemens * zb_from / 2.0);
             q.ytt += Cplx::new(0.0, b_siemens * zb_to / 2.0);
-            let (r0, x0) = if r0_ohm.abs() < 1e-12 && x0_ohm.abs() < 1e-12 {
+            let (r0_missing, x0_missing) = (r0_ohm.abs() < 1e-12, x0_ohm.abs() < 1e-12);
+            let (r0, x0) = if r0_missing && x0_missing {
                 { warnings.push(format!("line {}: R0=3R1 and X0=3X1 assumed", branch.id)); (3.0 * r_ohm, 3.0 * x_ohm) }
             } else {
+                if r0_missing || x0_missing {
+                    // Kept as entered; a cable with only one zero-sequence term is unusual.
+                    let (entered, zero) = if r0_missing { ("X0", "R0") } else { ("R0", "X0") };
+                    warnings.push(format!("line {}: only {entered} entered; {zero}=0 used for the zero sequence", branch.id));
+                }
                 (*r0_ohm, *x0_ohm)
             };
             if *b_siemens != 0.0 { warnings.push(format!("line {}: zero-sequence charging omitted; B0 was not supplied", branch.id)); }

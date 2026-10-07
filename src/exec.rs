@@ -71,8 +71,8 @@ pub enum Command {
         mva_sc: f64,
         #[serde(default)] decrement_curve: Vec<DecrementPoint>,
         xr: f64,
-        #[serde(default = "one")] x0_over_x1: f64,
-        #[serde(default = "one")] r0_over_r1: f64,
+        #[serde(default)] x0_over_x1: Option<f64>,
+        #[serde(default)] r0_over_r1: Option<f64>,
         #[serde(default)] is_slack: bool,
         #[serde(default = "default_true")] in_service: bool,
         #[serde(default)] p_mw: f64,
@@ -83,10 +83,10 @@ pub enum Command {
         bus: String,
         hp: f64,
         kv: f64,
-        #[serde(default = "default_pf")] pf: f64,
-        #[serde(default = "default_eff")] efficiency: f64,
-        #[serde(default = "default_xd")] x_subtransient_pu: f64,
-        #[serde(default = "default_xr")] xr: f64,
+        #[serde(default)] pf: Option<f64>,
+        #[serde(default)] efficiency: Option<f64>,
+        #[serde(default)] x_subtransient_pu: Option<f64>,
+        #[serde(default)] xr: Option<f64>,
     },
     AddDevice { id: String, #[serde(default)] name: String, bus: String, curve: CurveSpec, #[serde(default)] basis: String, #[serde(default)] protected_branch: Option<String>, #[serde(default)] breaker_interrupting_s: Option<f64>, #[serde(default)] fuse_total_clearing: bool },
     AddSwitch { id: String, #[serde(default)] name: String, branch_id: String, kind: SwitchKind, closed: bool },
@@ -129,6 +129,7 @@ pub enum Command {
         #[serde(default)] xr: Option<f64>,
         #[serde(default)] v_pu: Option<f64>,
         #[serde(default)] x0_over_x1: Option<f64>,
+        #[serde(default)] r0_over_r1: Option<f64>,
         #[serde(default)] is_slack: Option<bool>,
         #[serde(default)] in_service: Option<bool>,
     },
@@ -142,10 +143,6 @@ pub enum Command {
 
 fn one() -> f64 { 1.0 }
 fn default_true() -> bool { true }
-fn default_pf() -> f64 { 0.85 }
-fn default_eff() -> f64 { 0.94 }
-fn default_xd() -> f64 { 0.17 }
-fn default_xr() -> f64 { 6.0 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ExecResponse {
@@ -307,6 +304,9 @@ fn apply_one(
         }
         Command::AddSource { id, name, bus, v_pu, angle_deg, mva_sc, decrement_curve, xr, x0_over_x1, r0_over_r1, is_slack, in_service, p_mw } => {
             fresh(id, project)?;
+            let mut defaulted = Vec::new();
+            let mut entered = |value: &Option<f64>, field: &str| value.unwrap_or_else(|| { defaulted.push(field.to_string()); Source::default_value(field).unwrap() });
+            let (x0_over_x1, r0_over_r1) = (entered(x0_over_x1, "x0_over_x1"), entered(r0_over_r1, "r0_over_r1"));
             project.sources.push(Source {
                 id: id.clone(),
                 name: named(name, id),
@@ -316,27 +316,32 @@ fn apply_one(
                 mva_sc: *mva_sc,
                 decrement_curve: decrement_curve.clone(),
                 xr: *xr,
-                x0_over_x1: *x0_over_x1,
-                r0_over_r1: *r0_over_r1,
+                x0_over_x1,
+                r0_over_r1,
                 is_slack: *is_slack,
                 in_service: *in_service,
                 p_mw: *p_mw,
                 qmin_mvar: None,
                 qmax_mvar: None,
+                defaulted,
             });
         }
         Command::AddMotor { id, name, bus, hp, kv, pf, efficiency, x_subtransient_pu, xr } => {
             fresh(id, project)?;
+            let mut defaulted = Vec::new();
+            let mut entered = |value: &Option<f64>, field: &str| value.unwrap_or_else(|| { defaulted.push(field.to_string()); Motor::default_value(field).unwrap() });
+            let (pf, efficiency, x_subtransient_pu, xr) = (entered(pf, "pf"), entered(efficiency, "efficiency"), entered(x_subtransient_pu, "x_subtransient_pu"), entered(xr, "xr"));
             project.motors.push(Motor {
                 id: id.clone(),
                 name: named(name, id),
                 bus: bus.clone(),
                 hp: *hp,
                 kv: *kv,
-                pf: *pf,
-                efficiency: *efficiency,
-                x_subtransient_pu: *x_subtransient_pu,
-                xr: *xr,
+                pf,
+                efficiency,
+                x_subtransient_pu,
+                xr,
+                defaulted,
             });
         }
         Command::AddDevice { id, name, bus, curve, basis, protected_branch, breaker_interrupting_s, fuse_total_clearing } => {
@@ -385,13 +390,14 @@ fn apply_one(
             if let Some(ka) = bracing_ka { bus.bracing_ka = Some(*ka); }
             if let Some(amps) = main_rating_a { bus.main_rating_a = Some(*amps); }
         }
-        Command::SetSource { id, mva_sc, decrement_curve, xr, v_pu, x0_over_x1, is_slack, in_service } => {
+        Command::SetSource { id, mva_sc, decrement_curve, xr, v_pu, x0_over_x1, r0_over_r1, is_slack, in_service } => {
             let source = project.sources.iter_mut().find(|s| s.id == *id).ok_or_else(|| format!("no source '{id}'"))?;
             if let Some(v) = mva_sc { source.mva_sc = *v; }
             if let Some(v) = decrement_curve { source.decrement_curve = v.clone(); }
             if let Some(v) = xr { source.xr = *v; }
             if let Some(v) = v_pu { source.v_pu = *v; }
-            if let Some(v) = x0_over_x1 { source.x0_over_x1 = *v; }
+            if let Some(v) = x0_over_x1 { source.x0_over_x1 = *v; source.defaulted.retain(|f| f != "x0_over_x1"); }
+            if let Some(v) = r0_over_r1 { source.r0_over_r1 = *v; source.defaulted.retain(|f| f != "r0_over_r1"); }
             if let Some(v) = is_slack { source.is_slack = *v; }
             if let Some(v) = in_service { source.in_service = *v; }
         }

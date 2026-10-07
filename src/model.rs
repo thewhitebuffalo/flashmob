@@ -186,39 +186,102 @@ pub struct Load {
     pub basis: String,
 }
 
+/// JSON shape is unchanged from the plain derive; `defaulted` records which
+/// engineering inputs were omitted so the assumption can be reported.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "SourceWire", into = "SourceWire")]
 pub struct Source {
     pub id: String,
     pub name: String,
     pub bus: String,
     /// Whether this utility or generator is available in the current state.
-    #[serde(default = "default_true")]
     pub in_service: bool,
-    #[serde(default = "default_vpu")]
     pub v_pu: f64,
-    #[serde(default)]
     pub angle_deg: f64,
     pub mva_sc: f64,
     /// Optional symmetrical three-phase short-circuit current profile at this
     /// source's terminals. Ratios are relative to the initial `mva_sc` value.
     /// An empty profile retains a constant source strength.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub decrement_curve: Vec<DecrementPoint>,
     pub xr: f64,
-    #[serde(default = "default_one")]
+    /// Defaults to 1.0 when omitted (reported as an assumption).
     pub x0_over_x1: f64,
-    #[serde(default = "default_one")]
+    /// Defaults to 1.0 when omitted (reported as an assumption).
     pub r0_over_r1: f64,
-    #[serde(default)]
     pub is_slack: bool,
     /// Positive is generation. Ignored on the slack bus.
-    #[serde(default)]
     pub p_mw: f64,
-    #[serde(default)]
     pub qmin_mvar: Option<f64>,
-    #[serde(default)]
     pub qmax_mvar: Option<f64>,
+    /// Names of fields omitted from the input and filled with defaults. Not a
+    /// JSON field: a defaulted value that is still at its default is omitted
+    /// again when saved, so the assumption stays visible.
+    pub defaulted: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceWire {
+    id: String,
+    name: String,
+    bus: String,
+    #[serde(default = "default_true")]
+    in_service: bool,
+    #[serde(default = "default_vpu")]
+    v_pu: f64,
+    #[serde(default)]
+    angle_deg: f64,
+    mva_sc: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    decrement_curve: Vec<DecrementPoint>,
+    xr: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    x0_over_x1: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    r0_over_r1: Option<f64>,
+    #[serde(default)]
+    is_slack: bool,
+    #[serde(default)]
+    p_mw: f64,
+    #[serde(default)]
+    qmin_mvar: Option<f64>,
+    #[serde(default)]
+    qmax_mvar: Option<f64>,
+}
+
+/// Take an entered value, or record the field as defaulted.
+fn entered_or(value: Option<f64>, name: &str, default: f64, defaulted: &mut Vec<String>) -> f64 {
+    value.unwrap_or_else(|| { defaulted.push(name.to_string()); default })
+}
+
+/// Omit a value on output only while it is still an unedited default.
+fn unless_default(value: f64, name: &str, default: f64, defaulted: &[String]) -> Option<f64> {
+    if value == default && defaulted.iter().any(|d| d == name) { None } else { Some(value) }
+}
+
+impl From<SourceWire> for Source {
+    fn from(w: SourceWire) -> Self {
+        let mut defaulted = Vec::new();
+        let x0_over_x1 = entered_or(w.x0_over_x1, "x0_over_x1", default_one(), &mut defaulted);
+        let r0_over_r1 = entered_or(w.r0_over_r1, "r0_over_r1", default_one(), &mut defaulted);
+        Self {
+            id: w.id, name: w.name, bus: w.bus, in_service: w.in_service, v_pu: w.v_pu, angle_deg: w.angle_deg,
+            mva_sc: w.mva_sc, decrement_curve: w.decrement_curve, xr: w.xr, x0_over_x1, r0_over_r1,
+            is_slack: w.is_slack, p_mw: w.p_mw, qmin_mvar: w.qmin_mvar, qmax_mvar: w.qmax_mvar, defaulted,
+        }
+    }
+}
+
+impl From<Source> for SourceWire {
+    fn from(s: Source) -> Self {
+        Self {
+            x0_over_x1: unless_default(s.x0_over_x1, "x0_over_x1", default_one(), &s.defaulted),
+            r0_over_r1: unless_default(s.r0_over_r1, "r0_over_r1", default_one(), &s.defaulted),
+            id: s.id, name: s.name, bus: s.bus, in_service: s.in_service, v_pu: s.v_pu, angle_deg: s.angle_deg,
+            mva_sc: s.mva_sc, decrement_curve: s.decrement_curve, xr: s.xr,
+            is_slack: s.is_slack, p_mw: s.p_mw, qmin_mvar: s.qmin_mvar, qmax_mvar: s.qmax_mvar,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -320,22 +383,87 @@ pub struct OperatingCase {
     pub equipment_states: Vec<EquipmentState>,
 }
 
+/// JSON shape is unchanged from the plain derive; omitted ratings take the
+/// typical values below and are reported as assumptions.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "MotorWire", into = "MotorWire")]
 pub struct Motor {
     pub id: String,
     pub name: String,
     pub bus: String,
     pub hp: f64,
     pub kv: f64,
-    #[serde(default = "default_pf")]
+    /// Defaults to 0.85 when omitted.
     pub pf: f64,
-    #[serde(default = "default_eff")]
+    /// Defaults to 0.94 when omitted.
     pub efficiency: f64,
-    #[serde(default = "default_xd")]
+    /// Defaults to 0.17 pu when omitted.
     pub x_subtransient_pu: f64,
-    #[serde(default = "default_mxr")]
+    /// Defaults to 6 when omitted.
     pub xr: f64,
+    /// Names of fields omitted from the input and filled with defaults; see `Source::defaulted`.
+    pub defaulted: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MotorWire {
+    id: String,
+    name: String,
+    bus: String,
+    hp: f64,
+    kv: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pf: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    efficiency: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    x_subtransient_pu: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    xr: Option<f64>,
+}
+
+impl From<MotorWire> for Motor {
+    fn from(w: MotorWire) -> Self {
+        let mut defaulted = Vec::new();
+        let pf = entered_or(w.pf, "pf", default_pf(), &mut defaulted);
+        let efficiency = entered_or(w.efficiency, "efficiency", default_eff(), &mut defaulted);
+        let x_subtransient_pu = entered_or(w.x_subtransient_pu, "x_subtransient_pu", default_xd(), &mut defaulted);
+        let xr = entered_or(w.xr, "xr", default_mxr(), &mut defaulted);
+        Self { id: w.id, name: w.name, bus: w.bus, hp: w.hp, kv: w.kv, pf, efficiency, x_subtransient_pu, xr, defaulted }
+    }
+}
+
+impl From<Motor> for MotorWire {
+    fn from(m: Motor) -> Self {
+        Self {
+            pf: unless_default(m.pf, "pf", default_pf(), &m.defaulted),
+            efficiency: unless_default(m.efficiency, "efficiency", default_eff(), &m.defaulted),
+            x_subtransient_pu: unless_default(m.x_subtransient_pu, "x_subtransient_pu", default_xd(), &m.defaulted),
+            xr: unless_default(m.xr, "xr", default_mxr(), &m.defaulted),
+            id: m.id, name: m.name, bus: m.bus, hp: m.hp, kv: m.kv,
+        }
+    }
+}
+
+impl Source {
+    /// Typical value used for an omitted source field, for assumption reports.
+    pub fn default_value(field: &str) -> Option<f64> {
+        matches!(field, "x0_over_x1" | "r0_over_r1").then(default_one)
+    }
+}
+
+impl Motor {
+    /// Typical value used for an omitted motor field, for assumption reports.
+    pub fn default_value(field: &str) -> Option<f64> {
+        match field {
+            "pf" => Some(default_pf()),
+            "efficiency" => Some(default_eff()),
+            "x_subtransient_pu" => Some(default_xd()),
+            "xr" => Some(default_mxr()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -598,6 +726,7 @@ impl Project {
                 p_mw: 0.0,
                 qmin_mvar: None,
                 qmax_mvar: None,
+                defaulted: Vec::new(),
             }],
             motors: vec![Motor {
                 id: "m1".into(),
@@ -609,6 +738,7 @@ impl Project {
                 efficiency: 0.94,
                 x_subtransient_pu: 0.17,
                 xr: 6.0,
+                defaulted: Vec::new(),
             }],
             devices: vec![
                 Device {
