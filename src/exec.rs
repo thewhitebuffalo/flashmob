@@ -2,9 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::connectivity::{self, Topology};
 use crate::model::{ArcEquipment, Branch, BranchKind, Bus, CurveSpec, DecrementPoint, Device, Electrode, EquipmentState, Load, Motor, OperatingCase, Project, Source, SourceState, Switch, SwitchGroup, SwitchKind, SwitchState, XfmrConn};
-use crate::sld::{self, Diagram};
+use crate::sld;
 use crate::study::{self, Studies, StudyOutput};
-use crate::tcc::{self, TccPlot};
+use crate::tcc;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -136,8 +136,9 @@ pub enum Command {
     Topology,
     Sld,
     Tcc { #[serde(default)] ref_kv: Option<f64>, #[serde(default)] devices: Vec<String> },
-    /// Write the engineering data package for mapping. `output` is a directory, or an `.xml` path.
-    ExportSkm { #[serde(default)] output: Option<String> },
+    /// Write the engineering data package for mapping. `output` is a directory, or an `.xml`
+    /// path (other files are written beside it). Existing files are an error unless `overwrite`.
+    ExportSkm { #[serde(default)] output: Option<String>, #[serde(default)] overwrite: bool },
 }
 
 fn one() -> f64 { 1.0 }
@@ -152,6 +153,8 @@ pub struct ExecResponse {
     pub ok: bool,
     pub error: Option<String>,
     pub warnings: Vec<String>,
+    /// `Project::validate()` errors for the final project. Any entry makes `ok` false.
+    pub validation_errors: Vec<String>,
     pub project: Project,
     pub results: Option<StudyOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -171,6 +174,7 @@ pub fn exec_request(json: &str) -> ExecResponse {
                 ok: false,
                 error: Some(format!("could not read the request: {err}")),
                 warnings: Vec::new(),
+                validation_errors: Vec::new(),
                 project: Project::default(),
                 results: None,
                 topology: None,
@@ -184,53 +188,61 @@ pub fn exec_request(json: &str) -> ExecResponse {
     apply(request.project.unwrap_or_default(), &request.commands)
 }
 
-pub fn apply(mut project: Project, commands: &[Command]) -> ExecResponse {
-    let mut results = None;
-    let mut topology = None;
-    let mut sld_svg = None;
-    let mut tcc_svg = None;
-    let mut tcc_csv = None;
-    let mut skm = None;
-    for (n, command) in commands.iter().enumerate() {
-        let step = apply_one(&mut project, command, &mut results, &mut topology, &mut sld_svg, &mut tcc_svg, &mut tcc_csv, &mut skm);
-        if let Err(err) = step {
-            return ExecResponse {
-                ok: false,
-                error: Some(format!("command {n} ({}) : {err}", op_name(command))),
-                warnings: Vec::new(),
-                project,
-                results,
-                topology,
-                sld_svg,
-                tcc_svg,
-                tcc_csv,
-                skm,
-            };
-        }
-    }
-    let warnings = results.as_ref().map(|r| r.warnings.clone()).unwrap_or_default();
-    ExecResponse { ok: true, error: None, warnings, project, results, topology, sld_svg, tcc_svg, tcc_csv, skm }
+/// Study outputs and derived views carried between commands.
+#[derive(Default)]
+struct Outputs {
+    results: Option<StudyOutput>,
+    /// `results` came from a full study run. sld/tcc reuse it even when one
+    /// study (such as load flow) failed, rather than rerunning every study.
+    full: bool,
+    topology: Option<Topology>,
+    sld_svg: Option<String>,
+    tcc_svg: Option<String>,
+    tcc_csv: Option<String>,
+    skm: Option<crate::skm::SkmExport>,
 }
 
-fn apply_one(
-    project: &mut Project,
-    command: &Command,
-    results: &mut Option<StudyOutput>,
-    topology: &mut Option<Topology>,
-    sld_svg: &mut Option<String>,
-    tcc_svg: &mut Option<String>,
-    tcc_csv: &mut Option<String>,
-    skm: &mut Option<crate::skm::SkmExport>,
-) -> Result<(), String> {
-    if !matches!(command, Command::Topology | Command::Sld | Command::Tcc { .. } | Command::ExportSkm { .. }) {
-        *results = None;
-        *sld_svg = None;
-        *tcc_svg = None;
-        *tcc_csv = None;
-        *skm = None;
+/// Apply commands in order. Intermediate states may be incomplete; the final
+/// project is validated, and any validation error makes the response `ok: false`.
+pub fn apply(mut project: Project, commands: &[Command]) -> ExecResponse {
+    let mut out = Outputs::default();
+    let mut failure = None;
+    for (n, command) in commands.iter().enumerate() {
+        if let Err(err) = apply_one(&mut project, command, &mut out) {
+            failure = Some(format!("command {n} ({}) : {err}", op_name(command)));
+            break;
+        }
     }
-    if !matches!(command, Command::Run { .. } | Command::Topology | Command::Sld | Command::Tcc { .. } | Command::ExportSkm { .. }) {
-        *topology = None;
+    let validation_errors = project.validate();
+    let mut warnings = out.results.as_ref().map(|r| r.warnings.clone()).unwrap_or_default();
+    if !validation_errors.is_empty() {
+        let message = format!("project is invalid: {}", validation_errors.join("; "));
+        if failure.is_none() { failure = Some(message); } else { warnings.push(message); }
+    }
+    ExecResponse {
+        ok: failure.is_none(),
+        error: failure,
+        warnings,
+        validation_errors,
+        project,
+        results: out.results,
+        topology: out.topology,
+        sld_svg: out.sld_svg,
+        tcc_svg: out.tcc_svg,
+        tcc_csv: out.tcc_csv,
+        skm: out.skm,
+    }
+}
+
+/// Commands that only read the model. Every other command is a model edit
+/// and invalidates results and every derived view.
+fn is_view(command: &Command) -> bool {
+    matches!(command, Command::Run { .. } | Command::Topology | Command::Sld | Command::Tcc { .. } | Command::ExportSkm { .. })
+}
+
+fn apply_one(project: &mut Project, command: &Command, out: &mut Outputs) -> Result<(), String> {
+    if !is_view(command) {
+        *out = Outputs::default();
     }
     match command {
         Command::Sample => *project = Project::sample(),
@@ -396,39 +408,61 @@ fn apply_one(
             if let Some(v) = in_service { source.in_service = *v; }
         }
         Command::Run { studies } => {
-            let which = Studies::parse(studies)?;
-            *results = Some(study::run(project, which)?);
+            // A successful run does not change the model, so sld/tcc/skm views
+            // stay valid. A failed run leaves no results and no derived views.
+            match Studies::parse(studies).and_then(|which| study::run(project, which).map(|r| (which, r))) {
+                Ok((which, results)) => {
+                    out.results = Some(results);
+                    out.full = which.loadflow && which.fault && which.arcflash && which.coordination;
+                }
+                Err(err) => {
+                    let topology = out.topology.take();
+                    *out = Outputs { topology, ..Outputs::default() };
+                    return Err(err);
+                }
+            }
         }
         Command::Topology => {
-            *topology = Some(connectivity::topology(project)?);
+            out.topology = Some(connectivity::topology(project)?);
         }
         Command::Sld => {
-            let study = ensure_study(project, results)?;
-            *sld_svg = Some(sld::to_svg(&sld::diagram(project, study)));
+            let study = ensure_study(project, out)?;
+            let svg = sld::to_svg(&sld::diagram(project, study));
+            out.sld_svg = Some(svg);
         }
         Command::Tcc { ref_kv, devices } => {
-            let study = ensure_study(project, results)?;
+            let study = ensure_study(project, out)?;
             let drawn = tcc::plot(project, Some(study), *ref_kv, devices)?;
-            *tcc_svg = Some(tcc::to_svg(&drawn));
-            *tcc_csv = Some(tcc::to_csv(&drawn));
+            out.tcc_svg = Some(tcc::to_svg(&drawn));
+            out.tcc_csv = Some(tcc::to_csv(&drawn));
         }
-        Command::ExportSkm { output } => {
+        Command::ExportSkm { output, overwrite } => {
+            let errors = project.validate();
+            if !errors.is_empty() {
+                return Err(format!("project is invalid; nothing exported: {}", errors.join("; ")));
+            }
             let exported = crate::skm::export(project);
             if let Some(path) = output {
-                crate::skm::write_dir(project, std::path::Path::new(path))?;
+                let options = crate::skm::WriteOptions { overwrite: *overwrite, protect: None };
+                crate::skm::write_dir(project, std::path::Path::new(path), options)?;
             }
-            *skm = Some(exported);
+            out.skm = Some(exported);
         }
     }
     Ok(())
 }
 
-fn ensure_study<'a>(project: &Project, results: &'a mut Option<StudyOutput>) -> Result<&'a StudyOutput, String> {
-    if results.as_ref().map_or(true, |r| r.loadflow.is_none() || r.fault.is_none() || r.arc_flash.is_none() || r.coordination.is_none()) {
-        *results = None;
-        *results = Some(study::run(project, Studies::all())?);
+/// Reuse the last full study. A partial `run` (or none) triggers one full run.
+/// A full run in which a study failed (for example, load flow without a slack
+/// source) is kept, so repeated sld/tcc commands do not recompute everything.
+fn ensure_study<'a>(project: &Project, out: &'a mut Outputs) -> Result<&'a StudyOutput, String> {
+    if out.results.is_none() || !out.full {
+        out.results = None;
+        out.full = false;
+        out.results = Some(study::run(project, Studies::all())?);
+        out.full = true;
     }
-    Ok(results.as_ref().unwrap())
+    Ok(out.results.as_ref().expect("study was just stored"))
 }
 
 fn fresh(id: &str, project: &Project) -> Result<(), String> {
@@ -552,7 +586,7 @@ pub fn schema() -> serde_json::Value {
             "exec": "flashmob exec request.json    # or stdin",
             "sld": "flashmob sld project.json -o diagram.svg",
             "tcc": "flashmob tcc project.json -o curves.svg --csv curves.csv --ref-kv 0.48",
-            "export_skm": "flashmob export-skm project.json -o skm-export"
+            "export_skm": "flashmob export-skm project.json -o skm-export    # --force to replace existing files"
         },
         "exec_request": {
             "project": null,
@@ -569,16 +603,18 @@ pub fn schema() -> serde_json::Value {
             ]
         },
         "exec_request_note": "The project field is optional; omit it or set it to null to start empty. The example commands build on the built-in sample.",
-        "exec_response": ["ok", "error", "warnings", "project", "results", "topology", "sld_svg", "tcc_svg", "tcc_csv", "skm"],
+        "exec_response": ["ok", "error", "warnings", "validation_errors", "project", "results", "topology", "sld_svg", "tcc_svg", "tcc_csv", "skm"],
+        "exec_semantics": "Commands run in order; intermediate states may be incomplete. The final project is validated: any validation error is listed in validation_errors and makes ok false (the CLI exits 1). Model edits clear results and every derived view; run, topology, sld, tcc, and export_skm do not. sld and tcc reuse the last full study, including one whose load flow failed, instead of rerunning.",
+        "export_skm_options": "output: directory, or an .xml path whose siblings are written beside it; other file-like paths (.json, .csv, .txt, .tab, .svg) are rejected. Existing files are refused unless \"overwrite\": true. The project must validate.",
         "topology": "Validated entered connections only: every bus lists branch terminal and neighbor plus attached source, load, motor, device, and arc equipment IDs. Global records give branch endpoints and switch link, source base in-service state, switch base closed state, group rules, named operating cases, and each device's entered protected branch terminal. Null placement means it was not entered. No study or protection inference is performed.",
         "source_decrement": "Optional add_source/set_source decrement_curve is an array of {time_s,current_ratio} for symmetrical three-phase RMS short-circuit current at source terminals relative to initial mva_sc. First point must be {time_s:0,current_ratio:1}; times increase strictly and ratios stay positive. Linear interpolation in time holds the first/last value outside entered points. An empty array clears the curve; omission retains the constant-current model. Arc energy uses at most 10 ms midpoint, quasi-steady network samples. For an isolating upstream breaker with an entered trip-only curve, protected terminal, and breaker_interrupting_s, relay trip elements integrate separately over full and reduced sampled arcing currents; breaker interruption is added after trip. Timers assume immediate reset below pickup and the result is marked assumed if a reset occurs. A fuse total-clearing curve does not establish dynamic clearing. Optional clearing_s overrides automatic clearing; fallback_duration_s applies only when clearing is unresolved. arc_duration_cap_s bounds the study, never supplies a field clearing setting.",
         "motor_backfeed": "A motor remains a possible fault contributor while connected to the arc, even after the selected utility/generator main opens. Automatic single-device arc clearing fails visibly if any motor is still reachable after that branch opens. An already-open motor feeder branch disconnects its motor. A breaker that trips during the arc is not yet treated as an opening event; its time and motor-current decay require staged modeling. Place the motor on a separate bus behind a finite-impedance feeder branch with a switch/device to represent the breaker. The built-in sample has no motor feeder breaker, so its MCC arc-flash result is unresolved. An explicit equipment clearing_s may override only when it represents total exposure from all paths.",
         "operating_cases": "Base switch.closed and source.in_service values define normal operation. Each named operating case overrides listed switch/source states. Its arc equipment starts with no inherited upstream_device, clearing_s, or fallback_duration_s; list case-specific values in equipment_states, or leave them absent for automatic protection selection or an explicit failure. At most one switch can control a branch. A switch group limits simultaneous closures using max_closed. `run` evaluates the base configuration and each named valid case; inspect per-case failures before using an arc-flash maximum.",
         "switch_model": "Opening a switch removes its entire referenced branch, including any transformer grounding shunt or line charging on that branch. For an independent breaker or ATS contact, use a separate short finite-impedance branch with separate bus nodes; put transformers and other equipment on their own branches. The closed field is required for every switch, especially normally open ties and ATS contacts.",
         "switch_kinds": ["breaker", "tie", "ats"],
-        "skm": "Engineering data package for mapping; PTW import unverified: project.xml, per-component CSV, components.tab, and Revit panel/circuit schedules. See IMPORT.txt.",
-        "sld": "SVG single-line diagram. Each bus card shows nominal voltage, load-flow pu voltage, symmetrical 3P and LG fault current, and the governing IEEE 1584-2018 incident energy and arc-flash boundary.",
-        "tcc": "SVG log-log time-current curve plus CSV points. Current is referred to ref_kv. Fault and arcing-current markers are included when a study has been run.",
+        "skm": "Engineering data package for mapping; PTW import unverified: project.xml, per-component CSV (including switch normal state and source service status), components.tab, and Revit panel/circuit schedules. Operating cases remain only in project.json. See IMPORT.txt.",
+        "sld": "SVG single-line diagram. Each bus card shows nominal voltage, load-flow pu voltage, symmetrical 3P and LG fault current, and the governing IEEE 1584-2018 incident energy and arc-flash boundary; with operating cases, also the worst-case incident energy and its governing case. Normally open branches are dashed with an open switch symbol; out-of-service sources are grey.",
+        "tcc": "SVG log-log time-current curve plus CSV points. Current is referred to ref_kv. Fault and arcing-current markers are included when a study has been run; arcing markers from assumed inputs are labeled assumed.",
         "electrodes": ["VCB", "VCBB", "HCB", "VOA", "HOA"],
         "transformer_connections": ["dyn", "ynd", "ynyn", "dd"],
         "sample_project": serde_json::to_value(Project::sample()).unwrap(),
@@ -587,19 +623,6 @@ pub fn schema() -> serde_json::Value {
 
 pub fn load_project(text: &str) -> Result<Project, String> {
     serde_json::from_str(text).map_err(|err| format!("could not read the project: {err}"))
-}
-
-pub fn draw_sld(project: &Project, study: &StudyOutput) -> (Diagram, String) {
-    let diagram = sld::diagram(project, study);
-    let svg = sld::to_svg(&diagram);
-    (diagram, svg)
-}
-
-pub fn draw_tcc(project: &Project, study: &StudyOutput, ref_kv: Option<f64>, devices: &[String]) -> Result<(TccPlot, String, String), String> {
-    let plot = tcc::plot(project, Some(study), ref_kv, devices)?;
-    let svg = tcc::to_svg(&plot);
-    let csv = tcc::to_csv(&plot);
-    Ok((plot, svg, csv))
 }
 
 #[cfg(test)]
@@ -734,5 +757,68 @@ mod tests {
         ]}"#);
         assert!(!response.ok);
         assert!(response.error.unwrap().contains("decrement_curve point 1"));
+    }
+
+    #[test]
+    fn final_project_is_validated_and_invalid_models_are_not_ok() {
+        let response = exec_request(r#"{"commands":[{"op":"sample"},{"op":"set_bus","id":"pnl","kv":-1}]}"#);
+        assert!(!response.ok);
+        assert!(response.validation_errors.iter().any(|e| e.contains("pnl")), "{:?}", response.validation_errors);
+        assert!(response.error.unwrap().contains("project is invalid"));
+
+        // An incomplete intermediate state is fine when the final model validates.
+        let response = exec_request(r#"{"commands":[{"op":"sample"},{"op":"set_bus","id":"pnl","kv":-1},{"op":"set_bus","id":"pnl","kv":0.48}]}"#);
+        assert!(response.ok, "{:?}", response.error);
+        assert!(response.validation_errors.is_empty());
+        let json = serde_json::to_value(&response).unwrap();
+        assert!(json["validation_errors"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn export_skm_validates_and_refuses_to_overwrite_without_permission() {
+        let response = exec_request(r#"{"commands":[{"op":"sample"},{"op":"set_bus","id":"pnl","kv":0},{"op":"export_skm"}]}"#);
+        assert!(!response.ok);
+        assert!(response.error.unwrap().contains("nothing exported"));
+        assert!(response.skm.is_none());
+
+        let dir = std::env::temp_dir().join(format!("flashmob-exec-skm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let request = |overwrite: bool| serde_json::json!({"commands":[{"op":"sample"},{"op":"export_skm","output":dir.display().to_string(),"overwrite":overwrite}]}).to_string();
+        let first = exec_request(&request(false));
+        assert!(first.ok, "{:?}", first.error);
+        assert!(dir.join("buses.csv").is_file());
+        let second = exec_request(&request(false));
+        assert!(!second.ok);
+        assert!(second.error.unwrap().contains("refusing to overwrite"));
+        let third = exec_request(&request(true));
+        assert!(third.ok, "{:?}", third.error);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_keeps_views_and_only_edits_invalidate() {
+        let response = exec_request(r#"{"commands":[{"op":"sample"},{"op":"sld"},{"op":"tcc"},{"op":"export_skm"},{"op":"run","studies":["fault"]}]}"#);
+        assert!(response.ok, "{:?}", response.error);
+        assert!(response.sld_svg.is_some() && response.tcc_svg.is_some() && response.skm.is_some());
+        let response = exec_request(r#"{"commands":[{"op":"sample"},{"op":"sld"},{"op":"set_options","name":"Edited"}]}"#);
+        assert!(response.ok);
+        assert!(response.sld_svg.is_none() && response.results.is_none());
+    }
+
+    #[test]
+    fn views_reuse_a_full_study_even_when_load_flow_failed() {
+        let project = Project::sample();
+        let mut out = Outputs::default();
+        let mut cached = study::run(&project, Studies::all()).unwrap();
+        cached.loadflow = None; // as when load flow could not be solved
+        cached.case_id = "cached".into();
+        out.results = Some(cached);
+        out.full = true;
+        assert_eq!(ensure_study(&project, &mut out).unwrap().case_id, "cached");
+        assert_eq!(ensure_study(&project, &mut out).unwrap().case_id, "cached");
+        // A partial run is replaced by one full run.
+        out.full = false;
+        assert_eq!(ensure_study(&project, &mut out).unwrap().case_id, "normal");
+        assert!(out.full);
     }
 }
