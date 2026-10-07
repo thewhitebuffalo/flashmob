@@ -100,8 +100,13 @@ pub fn write_dir(project: &Project, output: &Path, options: WriteOptions) -> Res
     let protected = options.protect.and_then(|p| std::fs::canonicalize(p).ok());
     let mut existing = Vec::new();
     for (path, _) in &targets {
-        if !path.exists() {
-            continue;
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(format!("could not inspect {}: {err}", path.display())),
+        };
+        if !metadata.file_type().is_file() {
+            return Err(format!("export target {} is not a regular file; choose another output", path.display()));
         }
         if protected.is_some() && std::fs::canonicalize(path).ok() == protected {
             return Err(format!("refusing to overwrite the input project file {}; choose another output", path.display()));
@@ -115,8 +120,27 @@ pub fn write_dir(project: &Project, output: &Path, options: WriteOptions) -> Res
         ));
     }
     std::fs::create_dir_all(&dir).map_err(|err| format!("could not create {}: {err}", dir.display()))?;
-    for (path, content) in &targets {
-        std::fs::write(path, content).map_err(|err| format!("could not write {}: {err}", path.display()))?;
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_err(|err| format!("could not name export staging directory: {err}"))?.as_nanos();
+    let staging = dir.join(format!(".flashmob-export-{}-{nanos}", std::process::id()));
+    std::fs::create_dir(&staging).map_err(|err| format!("could not create {}: {err}", staging.display()))?;
+    let result = (|| {
+        for (i, (path, content)) in targets.iter().enumerate() {
+            std::fs::write(staging.join(i.to_string()), content)
+                .map_err(|err| format!("could not stage {}: {err}", path.display()))?;
+        }
+        for (i, (path, _)) in targets.iter().enumerate() {
+            std::fs::rename(staging.join(i.to_string()), path)
+                .map_err(|err| format!("could not replace {}: {err}", path.display()))?;
+        }
+        Ok(())
+    })();
+    let cleanup = std::fs::remove_dir_all(&staging)
+        .map_err(|err| format!("could not remove export staging directory {}: {err}", staging.display()));
+    match (result, cleanup) {
+        (Err(err), Err(cleanup)) => return Err(format!("{err}; {cleanup}")),
+        (Err(err), _) | (_, Err(err)) => return Err(err),
+        _ => {}
     }
     Ok(dir)
 }
