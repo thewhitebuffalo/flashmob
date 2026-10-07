@@ -409,15 +409,24 @@ enum Neutral {
 
 /// Grounding of a source or transformer winding; no entry means solid.
 fn neutral(project: &Project, element_id: &str, winding: Option<Winding>, bus_kv: f64) -> Neutral {
+    let (method, ohms) = resolved_neutral(project, element_id, winding);
+    match method {
+        GroundingMethod::Solid => Neutral::Grounded(Cplx::ZERO),
+        GroundingMethod::Ungrounded => Neutral::Ungrounded,
+        GroundingMethod::Impedance => {
+            let zb = zbase_ohm(bus_kv, project.s_base_mva);
+            Neutral::Grounded(Cplx::new(ohms.re / zb, ohms.im / zb))
+        }
+    }
+}
+
+/// Resolved neutral method and physical ohms; an omitted entry means solid.
+pub(crate) fn resolved_neutral(project: &Project, element_id: &str, winding: Option<Winding>) -> (GroundingMethod, Cplx) {
     match project.grounding_of(element_id, winding) {
-        None => Neutral::Grounded(Cplx::ZERO),
+        None => (GroundingMethod::Solid, Cplx::ZERO),
         Some(g) => match g.method {
-            GroundingMethod::Solid => Neutral::Grounded(Cplx::ZERO),
-            GroundingMethod::Ungrounded => Neutral::Ungrounded,
-            GroundingMethod::Impedance => {
-                let zb = zbase_ohm(bus_kv, project.s_base_mva);
-                Neutral::Grounded(Cplx::new(g.r_ohm / zb, g.x_ohm / zb))
-            }
+            GroundingMethod::Solid | GroundingMethod::Ungrounded => (g.method, Cplx::ZERO),
+            GroundingMethod::Impedance => (g.method, Cplx::new(g.r_ohm, g.x_ohm)),
         },
     }
 }

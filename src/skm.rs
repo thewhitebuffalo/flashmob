@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::model::{Branch, BranchKind, CurveSpec, Electrode, Project, XfmrConn};
+use crate::model::{Branch, BranchKind, CurveSpec, Electrode, GroundingMethod, Project, Winding, XfmrConn};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct SkmExport {
@@ -158,6 +158,34 @@ struct XfmrEnds<'a> {
     sec_bus: &'a str,
     pri_conn: &'static str,
     sec_conn: &'static str,
+    pri_ground: GroundingFields,
+    sec_ground: GroundingFields,
+}
+
+struct GroundingFields {
+    method: &'static str,
+    r: String,
+    x: String,
+}
+
+fn grounding_fields(project: &Project, id: &str, winding: Option<Winding>, delta: bool) -> GroundingFields {
+    if delta { return GroundingFields { method: "N/A", r: String::new(), x: String::new() }; }
+    let (method, ohms) = crate::network::resolved_neutral(project, id, winding);
+    let (method, r, x) = match method {
+        GroundingMethod::Solid => ("Solid", String::new(), String::new()),
+        GroundingMethod::Ungrounded => ("Ungrounded", String::new(), String::new()),
+        GroundingMethod::Impedance => ("Impedance", fmt(ohms.re), fmt(ohms.im)),
+    };
+    GroundingFields { method, r, x }
+}
+
+fn grounded_connection(connection: &'static str, grounding: &GroundingFields) -> &'static str {
+    if connection == "Delta" { return connection; }
+    match grounding.method {
+        "Ungrounded" => "Wye-Ungrounded",
+        "Impedance" => "Wye-Impedance",
+        _ => "Wye-Ground",
+    }
 }
 
 fn xfmr_ends<'a>(project: &Project, branch: &'a Branch, hv_kv: f64, lv_kv: f64, connection: XfmrConn) -> XfmrEnds<'a> {
@@ -168,11 +196,15 @@ fn xfmr_ends<'a>(project: &Project, branch: &'a Branch, hv_kv: f64, lv_kv: f64, 
     let near_hv = |kv: f64| (kv / hv_kv).ln().abs() <= (kv / lv_kv).ln().abs();
     let (from_hv, to_hv) = (near_hv(from_kv), near_hv(to_kv));
     let from_is_primary = if from_hv != to_hv { from_hv } else { from_kv >= to_kv };
-    if from_is_primary {
-        XfmrEnds { pri_bus: &branch.from, sec_bus: &branch.to, pri_conn: from_conn, sec_conn: to_conn }
+    let (pri_bus, sec_bus, pri_conn, sec_conn) = if from_is_primary {
+        (&branch.from, &branch.to, from_conn, to_conn)
     } else {
-        XfmrEnds { pri_bus: &branch.to, sec_bus: &branch.from, pri_conn: to_conn, sec_conn: from_conn }
-    }
+        (&branch.to, &branch.from, to_conn, from_conn)
+    };
+    let pri_ground = grounding_fields(project, &branch.id, Some(Winding::Hv), pri_conn == "Delta");
+    let sec_ground = grounding_fields(project, &branch.id, Some(Winding::Lv), sec_conn == "Delta");
+    XfmrEnds { pri_bus, sec_bus, pri_conn: grounded_connection(pri_conn, &pri_ground),
+        sec_conn: grounded_connection(sec_conn, &sec_ground), pri_ground, sec_ground }
 }
 
 /// FromBus/ToBus as exported: transformers HV to LV, other branches as entered.
@@ -260,6 +292,7 @@ fn xml(project: &Project, names: &Names) -> String {
         ));
     }
     for source in &project.sources {
+        let ground = grounding_fields(project, &source.id, None, false);
         body.push_str(&format!(
             "  <Component Type=\"Source\" Name=\"{}\" Bus=\"{}\">\n{}  </Component>\n",
             xml_escape(&names.of(&source.id)),
@@ -268,6 +301,9 @@ fn xml(project: &Project, names: &Names) -> String {
                 ("ServiceStatus", "", service_status(source.in_service).into()),
                 ("IsSlack", "", source.is_slack.to_string()),
                 ("SourceKindNote", "", SOURCE_KIND_NOTE.into()),
+                ("GroundingMethod", "", ground.method.into()),
+                ("NeutralR_ohm", "ohm", ground.r),
+                ("NeutralX_ohm", "ohm", ground.x),
                 ("NominalSystemVoltage", "V", fmt_scaled(bus_kv(project, &source.bus), 3)),
                 ("VoltagePU", "pu", fmt(source.v_pu)),
                 ("Angle", "deg", fmt(source.angle_deg)),
@@ -319,6 +355,12 @@ fn xml(project: &Project, names: &Names) -> String {
                         ("SecondaryVoltage", "V", fmt_scaled(*lv_kv, 3)),
                         ("PrimaryConnection", "", ends.pri_conn.into()),
                         ("SecondaryConnection", "", ends.sec_conn.into()),
+                        ("PrimaryGroundingMethod", "", ends.pri_ground.method.into()),
+                        ("PrimaryNeutralR_ohm", "ohm", ends.pri_ground.r),
+                        ("PrimaryNeutralX_ohm", "ohm", ends.pri_ground.x),
+                        ("SecondaryGroundingMethod", "", ends.sec_ground.method.into()),
+                        ("SecondaryNeutralR_ohm", "ohm", ends.sec_ground.r),
+                        ("SecondaryNeutralX_ohm", "ohm", ends.sec_ground.x),
                         ("PercentZ", "%", fmt(*z_percent)),
                         ("PercentR", "%", fmt(pct_r)),
                         ("PercentX", "%", fmt(pct_x)),
@@ -533,6 +575,8 @@ fn transformers_csv(project: &Project, names: &Names) -> String {
         "VoltageUnit",
         "PrimaryConnection",
         "SecondaryConnection",
+        "PrimaryGroundingMethod", "PrimaryNeutralR_ohm", "PrimaryNeutralX_ohm",
+        "SecondaryGroundingMethod", "SecondaryNeutralR_ohm", "SecondaryNeutralX_ohm",
         "PercentZ",
         "PercentR",
         "PercentX",
@@ -561,6 +605,8 @@ fn transformers_csv(project: &Project, names: &Names) -> String {
             "V",
             ends.pri_conn,
             ends.sec_conn,
+            ends.pri_ground.method, &ends.pri_ground.r, &ends.pri_ground.x,
+            ends.sec_ground.method, &ends.sec_ground.r, &ends.sec_ground.x,
             &fmt(*z_percent),
             &fmt(pct_r),
             &fmt(pct_x),
@@ -578,8 +624,10 @@ fn utilities_csv(project: &Project, names: &Names) -> String {
     let mut s = csv_line(&[
         "Name", "Type", "ServiceStatus", "IsSlack", "Bus", "NominalSystemVoltage", "VoltageUnit", "VoltagePU", "AngleDeg", "ThreePhaseShortCircuitMVA", "XR",
         "X0OverX1", "R0OverR1", "PMW", "DecrementCurvePoints", "SourceKindNote",
+        "GroundingMethod", "NeutralR_ohm", "NeutralX_ohm",
     ]);
     for source in &project.sources {
+        let ground = grounding_fields(project, &source.id, None, false);
         s.push_str(&csv_line(&[
             &names.of(&source.id),
             "Source",
@@ -597,6 +645,7 @@ fn utilities_csv(project: &Project, names: &Names) -> String {
             &fmt(source.p_mw),
             &source.decrement_curve.len().to_string(),
             SOURCE_KIND_NOTE,
+            ground.method, &ground.r, &ground.x,
         ]));
     }
     s
@@ -734,7 +783,7 @@ fn supplying_lv_connection(project: &Project, bus: &str) -> Option<&'static str>
 fn distribution_system(project: &Project, bus: &crate::model::Bus) -> (String, &'static str, &'static str) {
     let volts = (bus.kv * 1000.0).round();
     match supplying_lv_connection(project, &bus.id) {
-        Some("Wye-Ground") => (format!("{volts:.0}Y/{:.0} V", (volts / 3f64.sqrt()).round()), "3", "4"),
+        Some("Wye-Ground" | "Wye-Ungrounded" | "Wye-Impedance") => (format!("{volts:.0}Y/{:.0} V", (volts / 3f64.sqrt()).round()), "3", "4"),
         Some(_) => (format!("{volts:.0} V Delta"), "3", "3"),
         // No transformer secondary supplies this bus; the grounding is not modeled.
         None => (format!("{volts:.0} V"), "3", ""),
@@ -815,7 +864,7 @@ fn revit_circuits_csv(project: &Project, names: &Names) -> String {
     s
 }
 
-const TAB_COLUMNS: [&str; 15] = [
+const TAB_COLUMNS: [&str; 24] = [
     "ComponentType",
     "Name",
     "FromBus",
@@ -831,20 +880,25 @@ const TAB_COLUMNS: [&str; 15] = [
     "X1",
     "NormalState",
     "ServiceStatus",
+    "GroundingMethod", "NeutralR_ohm", "NeutralX_ohm",
+    "PrimaryGroundingMethod", "PrimaryNeutralR_ohm", "PrimaryNeutralX_ohm",
+    "SecondaryGroundingMethod", "SecondaryNeutralR_ohm", "SecondaryNeutralX_ohm",
 ];
 
 fn components_tab(project: &Project, names: &Names) -> String {
-    let row = |cols: [&str; TAB_COLUMNS.len()]| {
+    let row = |cols: &[&str]| {
         let mut line = cols.iter().map(|c| tab_cell(c)).collect::<Vec<_>>().join("\t");
+        for _ in cols.len()..TAB_COLUMNS.len() { line.push('\t'); }
         line.push('\n');
         line
     };
-    let mut s = row(TAB_COLUMNS);
+    let mut s = row(&TAB_COLUMNS);
     for bus in &project.buses {
-        s.push_str(&row(["Bus", &names.of(&bus.id), "", "", &fmt_scaled(bus.kv, 3), "", "", "", "", "", "", "", "", "", ""]));
+        s.push_str(&row(&["Bus", &names.of(&bus.id), "", "", &fmt_scaled(bus.kv, 3), "", "", "", "", "", "", "", "", "", ""]));
     }
     for source in &project.sources {
-        s.push_str(&row([
+        let ground = grounding_fields(project, &source.id, None, false);
+        s.push_str(&row(&[
             "Source",
             &names.of(&source.id),
             &names.of(&source.bus),
@@ -860,13 +914,14 @@ fn components_tab(project: &Project, names: &Names) -> String {
             "",
             "",
             service_status(source.in_service),
+            ground.method, &ground.r, &ground.x,
         ]));
     }
     for branch in &project.branches {
         let state = normal_state(project, branch);
         let (from, to) = branch_ends(project, branch);
         match &branch.kind {
-            BranchKind::Line { r_ohm, x_ohm, .. } => s.push_str(&row([
+            BranchKind::Line { r_ohm, x_ohm, .. } => s.push_str(&row(&[
                 "Cable",
                 &names.of(&branch.id),
                 &names.of(from),
@@ -883,7 +938,9 @@ fn components_tab(project: &Project, names: &Names) -> String {
                 state,
                 "",
             ])),
-            BranchKind::Transformer { kva, z_percent, xr, .. } => s.push_str(&row([
+            BranchKind::Transformer { kva, z_percent, xr, hv_kv, lv_kv, connection, .. } => {
+                let ends = xfmr_ends(project, branch, *hv_kv, *lv_kv, *connection);
+                s.push_str(&row(&[
                 "Transformer",
                 &names.of(&branch.id),
                 &names.of(from),
@@ -899,11 +956,15 @@ fn components_tab(project: &Project, names: &Names) -> String {
                 "",
                 state,
                 "",
-            ])),
+                "", "", "",
+                ends.pri_ground.method, &ends.pri_ground.r, &ends.pri_ground.x,
+                ends.sec_ground.method, &ends.sec_ground.r, &ends.sec_ground.x,
+            ]));
+            }
         }
     }
     for load in &project.loads {
-        s.push_str(&row([
+        s.push_str(&row(&[
             "Load",
             &names.of(&load.id),
             &names.of(&load.bus),
@@ -980,6 +1041,16 @@ Transformers
   primary (HV) bus and ToBus the secondary (LV) bus; PrimaryConnection and
   SecondaryConnection belong to those buses. PrimaryTapPercent changes HV
   winding turns.
+
+Neutral grounding
+  GroundingMethod is Solid, Impedance, or Ungrounded for sources. Transformer
+  winding columns/attributes use Primary (HV) and Secondary (LV) prefixes:
+  PrimaryGroundingMethod, PrimaryNeutralR_ohm, PrimaryNeutralX_ohm and the
+  corresponding Secondary fields. Delta grounding is N/A. NeutralR_ohm and
+  NeutralX_ohm are physical ohms (not 3Zn or per unit), blank for solid,
+  ungrounded, and delta. Omitted neutral_grounding entries resolve to Solid,
+  as in the study network. Wye connections are Wye-Ground, Wye-Ungrounded,
+  or Wye-Impedance according to the resolved neutral method.
 
 Normal operating state
   NormalState is Closed or Open for each branch. A branch with no switch is
