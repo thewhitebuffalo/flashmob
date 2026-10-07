@@ -142,7 +142,7 @@ pub(crate) fn solve_with_model(project: &Project, model: &network::SystemModel) 
     let mut iterations = 0;
     let mut max_mismatch = f64::MAX;
     let mut message = None;
-    let tol = mismatch_tolerance(&model.loadflow, &spec, sbase);
+    let (tol, roundoff_limited) = mismatch_tolerance(&model.loadflow, &spec, &model.energized, sbase);
 
     for iter in 1..=100 {
         iterations = iter;
@@ -232,6 +232,10 @@ pub(crate) fn solve_with_model(project: &Project, model: &network::SystemModel) 
     if !converged && message.is_none() {
         message = Some(format!("load flow did not converge (mismatch {max_mismatch:.3e} pu)"));
     }
+    if !converged && roundoff_limited {
+        message = Some(format!("{}; roundoff estimate exceeds the 1e-5 pu roundoff limit on the system base",
+            message.unwrap_or_default()));
+    }
     if converged {
         let skipped = model.energized.iter().filter(|&&on| !on).count();
         if skipped > 0 {
@@ -301,16 +305,16 @@ pub(crate) fn solve_with_model(project: &Project, model: &network::SystemModel) 
     Ok(LoadflowResult { converged, iterations, max_mismatch_pu: max_mismatch, buses, branches, message })
 }
 
-/// Convergence tolerance in per unit: 1e-8 MW/Mvar physically, but never below
-/// the roundoff floor of `|Y_ii| V^2` products. A very small branch impedance
-/// (for example a 1e-5 ohm contact at 13.8 kV) has an admittance large enough
-/// that the fixed tolerance would be unreachable in double precision.
-fn mismatch_tolerance(y: &SparseY, spec: &[Spec], sbase: f64) -> f64 {
+/// Physical tolerance raised to the active equations' roundoff floor, capped at 1e-5 pu.
+fn mismatch_tolerance(y: &SparseY, spec: &[Spec], energized: &[bool], sbase: f64) -> (f64, bool) {
     let y_max = y.rows().iter().enumerate()
+        .filter(|(i, _)| energized[*i] && spec[*i].kind != Kind::Slack)
         .flat_map(|(i, row)| row.iter().filter(move |(j, _)| *j == i).map(|(_, v)| v.abs()))
         .fold(0.0, f64::max);
-    let v_max = spec.iter().map(|s| s.v.abs()).fold(1.0, f64::max);
-    (1e-8 / sbase).max(1e3 * f64::EPSILON * y_max * v_max * v_max)
+    let v_max = spec.iter().enumerate().filter(|(i, _)| energized[*i])
+        .map(|(_, s)| s.v.abs()).fold(1.0, f64::max);
+    let roundoff = 1e3 * f64::EPSILON * y_max * v_max * v_max;
+    ((1e-8 / sbase).max(roundoff).min(1e-5), roundoff > 1e-5)
 }
 
 /// Largest absolute value, or None when any entry is NaN or infinite.
