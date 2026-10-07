@@ -59,6 +59,48 @@ fn transformer_ratio_loaded_loss_reversal_taps_and_mva_base() {
     let mut p = transformer(); p.buses[1].kv = 0.48;
     near(loadflow::solve(&p).unwrap().buses[1].v_pu, 11.0/12.47, 1e-7);
 }
+fn set_connection(p: &mut Project, branch: usize, conn: XfmrConn) {
+    if let BranchKind::Transformer { connection, .. } = &mut p.branches[branch].kind { *connection = conn; }
+}
+#[test]
+fn delta_wye_lv_lags_hv_by_thirty_degrees_in_either_orientation() {
+    // ANSI C57.12.00: HV leads LV by 30 degrees for both delta-wye and wye-delta.
+    for conn in [XfmrConn::Dyn, XfmrConn::Ynd] {
+        for reverse in [false, true] {
+            let mut p = transformer(); p.buses[0].kv = 12.47; p.buses[1].kv = 0.48;
+            set_connection(&mut p, 0, conn);
+            if reverse { let b = &mut p.branches[0]; std::mem::swap(&mut b.from, &mut b.to); }
+            let lf = loadflow::solve(&p).unwrap(); assert!(lf.converged, "{:?}", lf.message);
+            near(lf.buses[0].angle_deg, 0.0, 1e-9);
+            near(lf.buses[1].angle_deg, -30.0, 1e-7);
+            assert!(!network::build(&p).unwrap().warnings.iter().any(|w| w.contains("more than 10%")));
+        }
+    }
+    // The helper's 11 kV bus is 11.8% below the 12.47 kV winding.
+    let warnings = network::build(&transformer()).unwrap().warnings;
+    assert!(warnings.iter().any(|w| w.contains("bus util") && w.contains("more than 10%")), "{warnings:?}");
+}
+#[test]
+fn utility_dyn_and_parallel_ynd_gsu_do_not_circulate_at_no_load() {
+    for gsu_drawn_lv_to_hv in [false, true] {
+        let mut p = transformer(); p.buses[0].kv = 12.47; p.buses[1].kv = 0.48;
+        // Utility step-down: HV delta (from) to LV grounded wye (to).
+        let mut gsu = p.branches[0].clone();
+        gsu.id = "gsu".into(); gsu.name = "GSU".into();
+        p.branches.push(gsu);
+        if gsu_drawn_lv_to_hv {
+            // HV grounded wye, LV delta drawn from the LV bus: from-bus delta.
+            let b = &mut p.branches[1]; std::mem::swap(&mut b.from, &mut b.to);
+            set_connection(&mut p, 1, XfmrConn::Dyn);
+        } else {
+            // Same unit drawn from the HV bus: from-bus grounded wye.
+            set_connection(&mut p, 1, XfmrConn::Ynd);
+        }
+        let lf = loadflow::solve(&p).unwrap(); assert!(lf.converged, "{:?}", lf.message);
+        near(lf.buses[1].angle_deg, -30.0, 1e-7);
+        for branch in &lf.branches { near(branch.i_from_a, 0.0, 1e-6); }
+    }
+}
 fn pv_project() -> Project {
     let mut p = transformer();
     p.buses[0].kv = 13.8; p.buses[1].kv = 13.8;

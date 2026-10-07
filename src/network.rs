@@ -300,10 +300,23 @@ fn stamp_branch(project: &Project, index: &Index, branch: &Branch, warnings: &mu
             let z1 = Cplx::from_mag_xr(z_mag, *xr);
             tiny_impedance_warning(branch, z1, warnings);
             let y1 = z1.inv().ok_or_else(|| format!("transformer '{}' has zero impedance", branch.id))?;
+            for (bus, rated) in [(i, from_rated), (j, to_rated)] {
+                if (index.kv[bus] / rated - 1.0).abs() > 0.10 {
+                    warnings.push(format!(
+                        "transformer {}: bus {} nominal {:.3} kV differs from its matched {:.3} kV winding by more than 10%",
+                        branch.id, index.id_of[bus], index.kv[bus], rated
+                    ));
+                }
+            }
             let a_mag = (from_turns / index.kv[i]) * (index.kv[j] / to_turns);
+            // ANSI C57.12.00: for delta-wye and wye-delta units the HV
+            // positive-sequence voltage leads the LV by 30 degrees, whichever
+            // winding is delta and whichever way the branch is drawn. With
+            // V_to = V_from / a at no load, the from-to angle is +30 degrees
+            // when the from bus is HV and -30 degrees when it is LV.
+            let from_is_hv = from_rated == *hv_kv;
             let phi = match connection {
-                XfmrConn::Dyn => 30.0_f64.to_radians(),
-                XfmrConn::Ynd => -30.0_f64.to_radians(),
+                XfmrConn::Dyn | XfmrConn::Ynd => if from_is_hv { 30.0_f64.to_radians() } else { -30.0_f64.to_radians() },
                 XfmrConn::Ynyn | XfmrConn::Dd => 0.0,
             };
             let positive = quad(y1, Cplx::from_polar(a_mag, phi))?;

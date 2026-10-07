@@ -117,7 +117,9 @@ pub enum BranchKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum XfmrConn {
-    /// From-bus delta, to-bus grounded wye. Positive-sequence from-side leads by 30°.
+    /// From-bus delta, to-bus grounded wye. The phase shift follows ANSI
+    /// C57.12.00 (HV positive sequence leads LV by 30°) for either winding
+    /// arrangement and either branch orientation.
     Dyn,
     /// From-bus grounded wye, to-bus delta.
     Ynd,

@@ -158,7 +158,7 @@ This is a study tool for building and checking a model. It does not include a ma
 
 ## Engineering input and result conventions
 
-- A transformer tap changes **HV winding turns** by `1 + tap_percent/100`, independent of branch orientation. `Dyn`/`Ynd` describe from/to connections; reverse those connections when reversing a branch. Leakage impedance is based on the untapped LV winding rating. `r0_over_r1` defaults to 1 independently of `x0_over_x1`.
+- A transformer tap changes **HV winding turns** by `1 + tap_percent/100`, independent of branch orientation. `Dyn`/`Ynd` describe from/to connections; reverse those connections when reversing a branch. For either delta-wye arrangement and either drawing direction, the positive-sequence HV voltage leads the LV by 30° (ANSI C57.12.00); negative sequence shifts the opposite way. A bus voltage more than 10% from its matched winding voltage is reported as a warning. Leakage impedance is based on the untapped LV winding rating. `r0_over_r1` defaults to 1 independently of `x0_over_x1`.
 - Missing cable R0/X0 uses 3R1/3X1, reported as an assumption. Zero-sequence cable charging is omitted and reported when positive-sequence charging is entered.
 - A line's impedance is entered in physical ohms. When its terminal buses use different nominal kV bases, the solver converts both ends to the same physical voltage and current relationship; a greater than 2% base mismatch still produces a warning for model review.
 - Load flow excludes source-free islands from the Newton equations and reports their buses as `unenergized` at 0 pu. Each energized island needs its own slack source; otherwise load flow reports the island and bus that lacks a reference.
