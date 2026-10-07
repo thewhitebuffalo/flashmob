@@ -91,8 +91,14 @@ pub fn clearing_time(device: &Device, amps: f64) -> Option<f64> {
 pub struct DynamicRelay {
     curve: CurveSpec,
     progress: [f64; 3],
+    /// Progress each element would have if it held (never reset) below
+    /// pickup: the opposite bound of the unknown reset characteristic.
+    held_progress: [f64; 3],
+    /// Which elements lost accumulated progress at a pickup dropout.
+    element_reset: [bool; 3],
     operated: bool,
     reset_occurred: bool,
+    reset_affects_result: bool,
 }
 
 impl DynamicRelay {
@@ -140,11 +146,25 @@ impl DynamicRelay {
                 return Err("trip settings not collected".into());
             }
         }
-        Ok(Self { curve: curve.clone(), progress: [0.0; 3], operated: false, reset_occurred: false })
+        Ok(Self { curve: curve.clone(), progress: [0.0; 3], held_progress: [0.0; 3],
+            element_reset: [false; 3], operated: false, reset_occurred: false, reset_affects_result: false })
     }
 
     /// Whether a timed element with accumulated operation reset below pickup.
+    /// Diagnostic only: the reset may not change the operating time.
     pub fn reset_occurred(&self) -> bool { self.reset_occurred }
+
+    /// Whether the immediate-reset assumption changed the outcome so far: an
+    /// element that lost progress would, had it held its progress instead,
+    /// have operated earlier than the relay actually did (or at all, if the
+    /// relay has not yet operated). The true reset characteristic lies between
+    /// these bounds, so only this case makes the operating time depend on it.
+    pub fn reset_affects_result(&self) -> bool { self.reset_affects_result }
+
+    /// Whether any element is timing (at or above its pickup) at this current.
+    pub fn timing_at(&self, amps: f64) -> Result<bool, String> {
+        Ok(self.element_times(amps)?.iter().any(Option::is_some))
+    }
 
     /// Entered current pickups, including optional short-time and instantaneous elements.
     /// Callers can split sampled-current intervals at these thresholds before advancing.
@@ -178,7 +198,51 @@ impl DynamicRelay {
         if !amps.is_finite() || amps < 0.0 || !dt_s.is_finite() || dt_s <= 0.0 {
             return Err("sampled current must be finite and nonnegative, and slice duration must be positive and finite".into());
         }
-        let times = match &self.curve {
+        let times = self.element_times(amps)?;
+        let mut earliest: Option<f64> = None;
+        let mut earliest_held: Option<f64> = None;
+        for (n, time) in times.into_iter().enumerate() {
+            match time {
+                None => {
+                    if self.progress[n] > 0.0 {
+                        self.reset_occurred = true;
+                        self.element_reset[n] = true;
+                    }
+                    self.progress[n] = 0.0;
+                }
+                Some(time) if time.is_infinite() => {},
+                Some(time) if time > 0.0 => {
+                    let remaining = (1.0 - self.progress[n]).max(0.0) * time;
+                    if remaining <= dt_s {
+                        earliest = Some(earliest.map_or(remaining, |prior| prior.min(remaining)));
+                    } else {
+                        self.progress[n] += dt_s / time;
+                    }
+                    if self.element_reset[n] {
+                        let held = (1.0 - self.held_progress[n]).max(0.0) * time;
+                        if held <= dt_s {
+                            earliest_held = Some(earliest_held.map_or(held, |prior| prior.min(held)));
+                        }
+                    }
+                    self.held_progress[n] += dt_s / time;
+                }
+                Some(_) => return Err("calculated relay operating time is invalid at the sampled current".into()),
+            }
+        }
+        // A held element completing strictly before the actual operation (or
+        // with no actual operation in this slice) means the result depends on
+        // the reset assumption. Equal times leave the operating time unchanged.
+        if let Some(held) = earliest_held {
+            if earliest.map_or(true, |actual| held < actual - 1e-12) {
+                self.reset_affects_result = true;
+            }
+        }
+        self.operated = earliest.is_some();
+        Ok(earliest)
+    }
+
+    fn element_times(&self, amps: f64) -> Result<[Option<f64>; 3], String> {
+        Ok(match &self.curve {
             CurveSpec::Iec { kind, pickup_a, tms, inst_a, inst_s } => {
                 let inverse = if amps > *pickup_a {
                     let (k, alpha) = iec_constants(*kind);
@@ -210,28 +274,7 @@ impl DynamicRelay {
                 [long, short, immediate]
             }
             CurveSpec::SettingsNotCollected { .. } => unreachable!("rejected by new"),
-        };
-        let mut earliest: Option<f64> = None;
-        for (progress, time) in self.progress.iter_mut().zip(times) {
-            match time {
-                None => {
-                    self.reset_occurred |= *progress > 0.0;
-                    *progress = 0.0;
-                }
-                Some(time) if time.is_infinite() => {},
-                Some(time) if time > 0.0 => {
-                    let remaining = (1.0 - *progress).max(0.0) * time;
-                    if remaining <= dt_s {
-                        earliest = Some(earliest.map_or(remaining, |prior| prior.min(remaining)));
-                    } else {
-                        *progress += dt_s / time;
-                    }
-                }
-                Some(_) => return Err("calculated relay operating time is invalid at the sampled current".into()),
-            }
-        }
-        self.operated = earliest.is_some();
-        Ok(earliest)
+        })
     }
 }
 
@@ -384,6 +427,33 @@ mod tests {
         assert!(relay.reset_occurred());
         assert_eq!(relay.advance(150.0, 0.6).unwrap(), None);
         assert!((relay.advance(150.0, 0.5).unwrap().unwrap() - 0.4).abs() < 1e-12);
+    }
+
+    #[test]
+    fn reset_of_a_non_governing_element_does_not_mark_the_result() {
+        // The instantaneous timer accrues progress and resets, but the inverse
+        // element trips before a held instantaneous timer could have.
+        let curve = CurveSpec::Iec {
+            kind: IecKind::Si, pickup_a: 100.0, tms: 0.01,
+            inst_a: Some(700.0), inst_s: Some(0.1),
+        };
+        let mut relay = DynamicRelay::new(&curve).unwrap();
+        assert_eq!(relay.advance(800.0, 0.02).unwrap(), None);
+        assert!(relay.advance(600.0, 0.1).unwrap().is_some());
+        assert!(relay.reset_occurred());
+        assert!(!relay.reset_affects_result());
+
+        // A definite-time element that would have operated earlier had it held
+        // its progress makes the operating time depend on the reset assumption.
+        let mut definite = DynamicRelay::new(&CurveSpec::Definite { pickup_a: 100.0, time_s: 1.0 }).unwrap();
+        assert_eq!(definite.advance(150.0, 0.6).unwrap(), None);
+        assert_eq!(definite.advance(90.0, 0.1).unwrap(), None);
+        assert!(definite.reset_occurred() && !definite.reset_affects_result());
+        assert_eq!(definite.advance(150.0, 0.3).unwrap(), None);
+        assert!(!definite.reset_affects_result(), "held progress 0.9 has not yet operated");
+        assert_eq!(definite.advance(150.0, 0.3).unwrap(), None);
+        assert!(definite.reset_affects_result());
+        assert!(definite.timing_at(150.0).unwrap() && !definite.timing_at(90.0).unwrap());
     }
 
     #[test]
