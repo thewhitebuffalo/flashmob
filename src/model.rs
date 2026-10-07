@@ -1183,7 +1183,15 @@ mod tests {
     }
 }
 
+/// Electrode configurations evaluated for a bus without collected equipment.
+/// The arc-flash study reports the maximum incident energy and boundary among
+/// them, because the actual configuration is unknown.
+pub const ASSUMED_ENCLOSURE_ELECTRODES: [Electrode; 3] = [Electrode::VCB, Electrode::VCBB, Electrode::HCB];
+
 /// Typical IEEE 1584 enclosure, gap, and working distance for a bus voltage.
+/// The returned electrode is only a nominal label (used by exports); arc-flash
+/// studies of assumed enclosures evaluate every `ASSUMED_ENCLOSURE_ELECTRODES`
+/// configuration with this geometry and report the governing maximum.
 pub fn typical_equipment(kv: f64) -> (Electrode, f64, f64, f64, f64, f64, &'static str) {
     if kv <= 0.6 {
         (Electrode::VCB, 25.0, 457.2, 355.6, 304.8, 250.0, "low-voltage equipment")

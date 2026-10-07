@@ -4,7 +4,7 @@ use crate::arcflash::{self, EnergySegment, IeeeInput};
 use crate::curves::{self, curve_label};
 use crate::fault::{self, FaultResult};
 use crate::loadflow::{self, LoadflowResult};
-use crate::model::{typical_equipment, ArcEquipment, Project};
+use crate::model::{typical_equipment, ArcEquipment, Project, ASSUMED_ENCLOSURE_ELECTRODES};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Studies {
@@ -142,8 +142,9 @@ pub struct ArcRow {
     pub bus_name: String,
     pub assumed: bool,
     pub electrode: String,
-    /// Bolted and arcing currents at fault inception. Integrated energy below
-    /// uses the full entered decrement profile when decrement_applied is true.
+    /// Bolted and arcing currents at fault inception (t = 0). Integrated
+    /// energy below uses the full entered decrement profile when
+    /// decrement_applied is true; such rows say so in `warnings`.
     pub bolted_ka: f64,
     pub arcing_ka: f64,
     pub arcing_min_ka: f64,
@@ -169,6 +170,17 @@ pub struct ArcRow {
     pub decrement_applied: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub decrement_source_ids: Vec<String>,
+    /// With decrement only: bolted current in the last integration slice of
+    /// the full-arcing-current duration (slice midpoint).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_bolted_ka: Option<f64>,
+    /// With decrement only: arcing current in the last slice of the full case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_arcing_ka: Option<f64>,
+    /// With decrement only: reduced arcing current in the last slice of the
+    /// reduced-current duration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_arcing_min_ka: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -181,6 +193,10 @@ pub struct CoordRow {
     pub bolted_ka: Option<f64>,
     pub trip_at_bolted_s: Option<f64>,
     pub total_clearing_s: Option<f64>,
+    /// Bus faulted to obtain `bolted_ka`: the protected-side terminal of the
+    /// device's protected branch.
+    #[serde(default)]
+    pub fault_bus_id: String,
     pub note: String,
 }
 
@@ -419,104 +435,165 @@ fn arc_flash(project: &Project, loadflow: Option<&LoadflowResult>, fault: &Fault
     let equipment_cases = cases(project, protection);
     let mut decrement_cache = DecrementFaultCache::for_cases(project, &equipment_cases);
     for case in equipment_cases {
-        let mut fail = |error: String| {
+        // A bus without collected equipment has an unknown electrode
+        // configuration: evaluate each candidate with the default geometry
+        // and report the maximum, rather than a single nonconservative choice.
+        let assumed_enclosure = case.id.starts_with("assumed:");
+        let electrodes = if assumed_enclosure { ASSUMED_ENCLOSURE_ELECTRODES.to_vec() } else { vec![case.electrode] };
+        let mut evaluated = Vec::new();
+        let mut error = None;
+        for electrode in electrodes {
+            let variant = ArcEquipment { electrode, ..case.clone() };
+            match evaluate_equipment(project, loadflow, fault, protection, &variant, &mut decrement_cache) {
+                Ok(result) => evaluated.push(result),
+                Err(e) => {
+                    error = Some(if assumed_enclosure {
+                        format!("assumed {} electrode configuration: {e}; the maximum over assumed configurations is unavailable", electrode.as_str())
+                    } else { e });
+                    break;
+                }
+            }
+        }
+        if let Some(error) = error {
             warnings.push(format!("{}: {error}", case.name));
             failures.push(ArcFailure { equipment_id: case.id.clone(), name: case.name.clone(), bus_id: case.bus.clone(), error });
-        };
-        let assumed = case.id.starts_with("assumed:") || case.basis == "assumed";
-        let Some(bus) = project.bus(&case.bus) else { fail("unknown bus".into()); continue };
-        let decrement_source_ids = curved_sources_reaching(project, &case.bus);
-        let Some(bus_fault) = fault.buses.iter().find(|b| b.id == bus.id) else { fail("missing fault result".into()); continue };
-        let Some(bolted) = bus_fault.three_phase.as_ref().map(|p| p.symmetrical_ka) else {
-            fail(bus_fault.note.clone().unwrap_or_else(|| "no three-phase fault current".into()));
-            continue;
-        };
-        if !(0.208..=15.0).contains(&bus.kv) {
-            fail(format!("{:.2} kV is outside the IEEE 1584-2018 range of 208 V to 15 kV", bus.kv));
             continue;
         }
-        let template = preview_input(&case, bus.kv, bolted);
-        let preview = match arcflash::calculate(&template) {
-            Ok(v) => v,
-            Err(err) => {
-                fail(err);
-                continue;
+        let mut ieee_warnings: Vec<String> = Vec::new();
+        for (_, items) in &evaluated {
+            for w in items {
+                if !ieee_warnings.contains(w) { ieee_warnings.push(w.clone()); }
             }
-        };
-        let protection = protection.iter().find(|p| p.bus_id == case.bus).expect("validated bus has protection status");
-        let full_clear = match if decrement_source_ids.is_empty() {
-            duration(project, &case, bus_fault, preview.i_arc_ka, protection)
-        } else {
-            decrement_duration(project, loadflow, &case, bus_fault, preview.i_arc_ka, protection,
-                &template, false, &decrement_source_ids, &mut decrement_cache)
-        } {
-            Ok(v) => v, Err(e) => { fail(e); continue; }
-        };
-        let min_clear = match if decrement_source_ids.is_empty() {
-            duration(project, &case, bus_fault, preview.i_arc_min_ka, protection)
-        } else {
-            decrement_duration(project, loadflow, &case, bus_fault, preview.i_arc_min_ka, protection,
-                &template, true, &decrement_source_ids, &mut decrement_cache)
-        } {
-            Ok(v) => v, Err(e) => { fail(e); continue; }
-        };
-        let input = IeeeInput { time_s: full_clear.seconds, time_min_s: min_clear.seconds, ..preview_input(&case, bus.kv, bolted) };
-        let integrated = if decrement_source_ids.is_empty() {
-            arcflash::calculate(&input)
-        } else {
-            calculate_decrement_arc(project, loadflow, &case.bus, &input, &decrement_source_ids, &mut decrement_cache)
-        };
-        match integrated {
-            Ok(out) => {
-                if assumed {
-                    warnings.push(format!(
-                        "{} enclosure dimensions were not collected; the values used are an assumption, not a field measurement.",
-                        case.name
-                    ));
-                }
-                for w in &out.warnings {
-                    warnings.push(format!("{}: {w}", case.name));
-                }
-                let governing_clear = if out.governing == "reduced_arcing" { &min_clear } else { &full_clear };
-                rows.push(ArcRow {
-                    equipment_id: case.id,
-                    name: case.name,
-                    bus_id: bus.id.clone(),
-                    bus_name: bus.name.clone(),
-                    assumed: assumed || full_clear.assumed || min_clear.assumed,
-                    electrode: case.electrode.as_str().into(),
-                    bolted_ka: bolted,
-                    arcing_ka: out.i_arc_ka,
-                    arcing_min_ka: out.i_arc_min_ka,
-                    time_s: out.time_s,
-                    time_min_s: out.time_min_s,
-                    energy_cal_cm2: out.energy_cal_cm2,
-                    energy_min_cal_cm2: out.energy_min_cal_cm2,
-                    governing_cal_cm2: out.governing_cal_cm2,
-                    afb_full_mm: out.afb_full_mm,
-                    afb_reduced_mm: out.afb_reduced_mm,
-                    afb_in: out.afb_in,
-                    afb_mm: out.afb_mm,
-                    governing: out.governing.into(),
-                    duration_capped: governing_clear.capped,
-                    duration_note: governing_clear.note.clone(),
-                    upstream_device: case.upstream_device.clone(),
-                    standard: out.standard.into(),
-                    decrement_applied: !decrement_source_ids.is_empty(),
-                    decrement_source_ids: decrement_source_ids.clone(),
-                    warnings: {
-                        let mut notes = out.warnings;
-                        for clear in [&full_clear, &min_clear] {
-                            if clear.assumed && !notes.contains(&clear.note) { notes.push(clear.note.clone()); }
-                        }
-                        notes
-                    },
-                });
-            }
-            Err(err) => fail(err),
         }
+        let row = if assumed_enclosure {
+            let (row, note) = governing_assumed_enclosure(evaluated.into_iter().map(|(row, _)| row).collect());
+            warnings.push(format!(
+                "{} enclosure dimensions were not collected; the values used are an assumption, not a field measurement. {note}",
+                case.name
+            ));
+            row
+        } else {
+            let row = evaluated.pop().expect("one electrode evaluated").0;
+            if case.basis == "assumed" {
+                warnings.push(format!(
+                    "{} enclosure dimensions were not collected; the values used are an assumption, not a field measurement.",
+                    case.name
+                ));
+            }
+            row
+        };
+        for w in &ieee_warnings {
+            warnings.push(format!("{}: {w}", case.name));
+        }
+        rows.push(row);
     }
     rows
+}
+
+/// Select the configuration with the greatest governing incident energy and
+/// take the greatest boundary over all configurations independently.
+fn governing_assumed_enclosure(rows: Vec<ArcRow>) -> (ArcRow, String) {
+    let energies = rows.iter().map(|row| format!("{} {:.2} cal/cm2", row.electrode, row.governing_cal_cm2))
+        .collect::<Vec<_>>().join(", ");
+    let boundary_row = rows.iter().max_by(|a, b| a.afb_mm.total_cmp(&b.afb_mm)).expect("assumed configurations");
+    let boundary_electrode = boundary_row.electrode.clone();
+    let afb_full_mm = rows.iter().map(|row| row.afb_full_mm).fold(f64::MIN, f64::max);
+    let afb_reduced_mm = rows.iter().map(|row| row.afb_reduced_mm).fold(f64::MIN, f64::max);
+    let mut governing = rows.into_iter()
+        .reduce(|best, row| if row.governing_cal_cm2 > best.governing_cal_cm2 { row } else { best })
+        .expect("assumed configurations");
+    let configurations = ASSUMED_ENCLOSURE_ELECTRODES.map(|e| e.as_str()).join(", ");
+    let note = format!(
+        "Assumed enclosure: electrode configurations {configurations} were evaluated with the default geometry; {} governs incident energy ({energies}) and {boundary_electrode} governs the arc-flash boundary. The maximum of each is reported.",
+        governing.electrode
+    );
+    governing.afb_full_mm = afb_full_mm;
+    governing.afb_reduced_mm = afb_reduced_mm;
+    governing.afb_mm = afb_full_mm.max(afb_reduced_mm);
+    governing.afb_in = governing.afb_mm / 25.4;
+    governing.assumed = true;
+    governing.warnings.insert(0, note.clone());
+    (governing, note)
+}
+
+/// One IEEE 1584 evaluation of an equipment item (or one assumed electrode
+/// configuration). Returns the row and the IEEE model warnings for the study.
+fn evaluate_equipment(project: &Project, loadflow: Option<&LoadflowResult>, fault: &FaultResult,
+    protection: &[crate::protection::Protection], case: &ArcEquipment,
+    decrement_cache: &mut DecrementFaultCache) -> Result<(ArcRow, Vec<String>), String> {
+    let assumed = case.id.starts_with("assumed:") || case.basis == "assumed";
+    let Some(bus) = project.bus(&case.bus) else { return Err("unknown bus".into()) };
+    let decrement_source_ids = curved_sources_reaching(project, &case.bus);
+    let Some(bus_fault) = fault.buses.iter().find(|b| b.id == bus.id) else { return Err("missing fault result".into()) };
+    let Some(bolted) = bus_fault.three_phase.as_ref().map(|p| p.symmetrical_ka) else {
+        return Err(bus_fault.note.clone().unwrap_or_else(|| "no three-phase fault current".into()));
+    };
+    if !(0.208..=15.0).contains(&bus.kv) {
+        return Err(format!("{:.2} kV is outside the IEEE 1584-2018 range of 208 V to 15 kV", bus.kv));
+    }
+    let template = preview_input(case, bus.kv, bolted);
+    let preview = arcflash::calculate(&template)?;
+    let protection = protection.iter().find(|p| p.bus_id == case.bus).expect("validated bus has protection status");
+    let full_clear = if decrement_source_ids.is_empty() {
+        duration(project, case, bus_fault, preview.i_arc_ka, protection)
+    } else {
+        decrement_duration(project, loadflow, case, bus_fault, preview.i_arc_ka, protection,
+            &template, false, &decrement_source_ids, decrement_cache)
+    }?;
+    let min_clear = if decrement_source_ids.is_empty() {
+        duration(project, case, bus_fault, preview.i_arc_min_ka, protection)
+    } else {
+        decrement_duration(project, loadflow, case, bus_fault, preview.i_arc_min_ka, protection,
+            &template, true, &decrement_source_ids, decrement_cache)
+    }?;
+    let input = IeeeInput { time_s: full_clear.seconds, time_min_s: min_clear.seconds, ..preview_input(case, bus.kv, bolted) };
+    let (out, final_slice) = if decrement_source_ids.is_empty() {
+        (arcflash::calculate(&input)?, None)
+    } else {
+        let (out, last) = calculate_decrement_arc(project, loadflow, &case.bus, &input, &decrement_source_ids, decrement_cache)?;
+        (out, Some(last))
+    };
+    let governing_clear = if out.governing == "reduced_arcing" { &min_clear } else { &full_clear };
+    let ieee_warnings = out.warnings.clone();
+    let mut notes = out.warnings;
+    for clear in [&full_clear, &min_clear] {
+        if clear.assumed && !notes.contains(&clear.note) { notes.push(clear.note.clone()); }
+    }
+    if final_slice.is_some() {
+        notes.push("Arcing currents shown are initial (t=0) values; incident energy and boundary integrate the time-varying decrement profile. final_* fields give the last integration slice.".into());
+    }
+    let row = ArcRow {
+        equipment_id: case.id.clone(),
+        name: case.name.clone(),
+        bus_id: bus.id.clone(),
+        bus_name: bus.name.clone(),
+        assumed: assumed || full_clear.assumed || min_clear.assumed || out.bolted_out_of_range,
+        electrode: case.electrode.as_str().into(),
+        bolted_ka: bolted,
+        arcing_ka: out.i_arc_ka,
+        arcing_min_ka: out.i_arc_min_ka,
+        time_s: out.time_s,
+        time_min_s: out.time_min_s,
+        energy_cal_cm2: out.energy_cal_cm2,
+        energy_min_cal_cm2: out.energy_min_cal_cm2,
+        governing_cal_cm2: out.governing_cal_cm2,
+        afb_full_mm: out.afb_full_mm,
+        afb_reduced_mm: out.afb_reduced_mm,
+        afb_in: out.afb_in,
+        afb_mm: out.afb_mm,
+        governing: out.governing.into(),
+        duration_capped: governing_clear.capped,
+        duration_note: governing_clear.note.clone(),
+        upstream_device: case.upstream_device.clone(),
+        standard: out.standard.into(),
+        decrement_applied: !decrement_source_ids.is_empty(),
+        decrement_source_ids: decrement_source_ids.clone(),
+        final_bolted_ka: final_slice.as_ref().map(|last| last.bolted_ka),
+        final_arcing_ka: final_slice.as_ref().map(|last| last.arcing_ka),
+        final_arcing_min_ka: final_slice.as_ref().map(|last| last.arcing_min_ka),
+        warnings: notes,
+    };
+    Ok((row, ieee_warnings))
 }
 
 /// Advance each entered relay element using the current at its protected
@@ -546,6 +623,10 @@ fn decrement_duration(project: &Project, loadflow: Option<&LoadflowResult>, equi
             return fallback(format!("selected upstream device '{}' is on open branch '{}' in this operating case", device.id, branch.id));
         }
     }
+    if device.protected_branch.is_none() {
+        // Same as the constant-current path: no placement, no device current.
+        return fallback(format!("protected branch terminal current unavailable for upstream device {} [{}]; enter protected_branch and terminal bus", device.name, device.id));
+    }
     if !isolates_sources(project, device, &equipment.bus) {
         return Err("opening the selected device does not isolate all utility/generator paths to the fault; a multi-device clearing study is required".into());
     }
@@ -565,18 +646,18 @@ fn decrement_duration(project: &Project, loadflow: Option<&LoadflowResult>, equi
         return fallback(format!("protected branch terminal current unavailable for upstream device {} [{}]; enter protected_branch and terminal bus", device.name, device.id));
     };
     let current_case = if reduced { "reduced" } else { "full" };
-    let finish_trip = |trip_s: f64, reset_occurred: bool| -> Result<Clearing, String> {
+    let not_a_label = "This cap is not a field trip setting and is not for an arc-flash label.";
+    let reset_note = " Relay progress was reset immediately when sampled current fell below pickup, and an element holding its progress would have operated earlier; verify the device reset setting.";
+    // Total clearing beyond the study cap is capped exactly as in the
+    // constant-current path; the incident energy is integrated to the cap.
+    let finish_trip = |trip_s: f64, reset_matters: bool| -> Result<Clearing, String> {
         let raw = trip_s + interrupting_s;
-        if raw > project.arc_duration_cap_s {
-            return fallback(format!("{} [{}] trips at {trip_s:.3} s, but entered breaker interruption extends total clearing to {raw:.3} s beyond the {:.3} s study cap",
-                device.name, device.id, project.arc_duration_cap_s));
-        }
         let mut clear = finish_clearing(raw, project.arc_duration_cap_s,
-            &format!("{} [{}] {current_case}-arcing-current relay trip at {trip_s:.3} s plus entered breaker interruption of {interrupting_s:.3} s", device.name, device.id),
-            "This cap is not a field trip setting and is not for an arc-flash label.");
-        if reset_occurred {
+            &format!("{} [{}] {current_case}-arcing-current relay trip at {trip_s:.3} s plus entered breaker interruption of {interrupting_s:.3} s (total {raw:.3} s)", device.name, device.id),
+            not_a_label);
+        if reset_matters {
             clear.assumed = true;
-            clear.note.push_str(" Relay progress was reset immediately when sampled current fell below pickup; verify the device reset setting.");
+            clear.note.push_str(reset_note);
         }
         Ok(clear)
     };
@@ -601,7 +682,7 @@ fn decrement_duration(project: &Project, loadflow: Option<&LoadflowResult>, equi
         let midpoint_s = interval_start_s + (end_s - interval_start_s) / 2.0;
         let amps = sampled_amps(midpoint_s)?;
         match advance_relay_over_ramp(&mut relay, prior_amps, amps, midpoint_s - prior_sample_s) {
-            Ok(Some(within_s)) => return finish_trip(prior_sample_s + within_s, relay.reset_occurred()),
+            Ok(Some(within_s)) => return finish_trip(prior_sample_s + within_s, relay.reset_affects_result()),
             Ok(None) => {},
             Err(error) => return fallback(format!("upstream device {} [{}]: {error}", device.name, device.id)),
         }
@@ -613,7 +694,7 @@ fn decrement_duration(project: &Project, loadflow: Option<&LoadflowResult>, equi
             // from generator excitation, instead of interpolating across it.
             let amps = sampled_amps(end_s)?;
             match advance_relay_over_ramp(&mut relay, prior_amps, amps, end_s - prior_sample_s) {
-                Ok(Some(within_s)) => return finish_trip(prior_sample_s + within_s, relay.reset_occurred()),
+                Ok(Some(within_s)) => return finish_trip(prior_sample_s + within_s, relay.reset_affects_result()),
                 Ok(None) => {},
                 Err(error) => return fallback(format!("upstream device {} [{}]: {error}", device.name, device.id)),
             }
@@ -628,13 +709,36 @@ fn decrement_duration(project: &Project, loadflow: Option<&LoadflowResult>, equi
     if project.arc_duration_cap_s - prior_sample_s > 1e-12 {
         let amps = sampled_amps(project.arc_duration_cap_s)?;
         match advance_relay_over_ramp(&mut relay, prior_amps, amps, project.arc_duration_cap_s - prior_sample_s) {
-            Ok(Some(within_s)) => return finish_trip(prior_sample_s + within_s, relay.reset_occurred()),
+            Ok(Some(within_s)) => return finish_trip(prior_sample_s + within_s, relay.reset_affects_result()),
             Ok(None) => {},
             Err(error) => return fallback(format!("upstream device {} [{}]: {error}", device.name, device.id)),
         }
+        prior_amps = amps;
     }
-    fallback(format!("upstream device {} [{}] did not trip within the {:.3} s study cap under the sampled {} arcing-current profile; total clearing is unresolved",
-        device.name, device.id, project.arc_duration_cap_s, if reduced { "reduced" } else { "full" }))
+    // Still timing at the cap: the device operates later than the study limit,
+    // which the constant-current path reports as a capped duration. A device
+    // below every pickup at the cap (held final current) may never operate and
+    // stays unresolved, as a static curve with no operating time does.
+    match relay.timing_at(prior_amps) {
+        Ok(true) => {
+            let cap = project.arc_duration_cap_s;
+            let mut clear = Clearing {
+                seconds: cap,
+                capped: true,
+                assumed: false,
+                note: format!("Arc duration is the {cap:.1} s cap. {} [{}] {current_case}-arcing-current relay operation plus entered breaker interruption of {interrupting_s:.3} s exceeds the cap: the relay is still timing at {prior_amps:.0} A through its protected terminal under the sampled decrement profile. {not_a_label}",
+                    device.name, device.id),
+            };
+            if relay.reset_affects_result() {
+                clear.assumed = true;
+                clear.note.push_str(reset_note);
+            }
+            Ok(clear)
+        }
+        Ok(false) => fallback(format!("upstream device {} [{}] did not trip within the {:.3} s study cap under the sampled {} arcing-current profile and is below every entered pickup at {prior_amps:.0} A at the cap; total clearing is unresolved",
+            device.name, device.id, project.arc_duration_cap_s, current_case)),
+        Err(error) => fallback(format!("upstream device {} [{}]: {error}", device.name, device.id)),
+    }
 }
 
 /// Interpolate between adjacent network-current samples and split at each
@@ -685,7 +789,14 @@ mod relay_ramp_regression {
     }
 }
 
-fn calculate_decrement_arc(project: &Project, loadflow: Option<&LoadflowResult>, bus_id: &str, input: &IeeeInput, decrement_source_ids: &[String], cache: &mut DecrementFaultCache) -> Result<arcflash::IeeeOutput, String> {
+/// Currents in the last integration slice of a decrement profile.
+struct FinalSlice {
+    bolted_ka: f64,
+    arcing_ka: f64,
+    arcing_min_ka: f64,
+}
+
+fn calculate_decrement_arc(project: &Project, loadflow: Option<&LoadflowResult>, bus_id: &str, input: &IeeeInput, decrement_source_ids: &[String], cache: &mut DecrementFaultCache) -> Result<(arcflash::IeeeOutput, FinalSlice), String> {
     let mut out = arcflash::calculate(input)?;
     let full_segments = decrement_segments(project, loadflow, bus_id, input.time_s, decrement_source_ids, cache)?;
     let reduced_segments = if (input.time_s - input.time_min_s).abs() < 1e-12 {
@@ -695,6 +806,16 @@ fn calculate_decrement_arc(project: &Project, loadflow: Option<&LoadflowResult>,
     };
     let full = arcflash::integrate_profile(input, &full_segments, false)?;
     let reduced = arcflash::integrate_profile(input, &reduced_segments, true)?;
+    let last_current = |segments: &[EnergySegment]| segments.last().map(|s| s.ibf_ka)
+        .ok_or_else(|| "decrement profile has no slices".to_string());
+    let final_bolted_ka = last_current(&full_segments)?;
+    let final_reduced_bolted_ka = last_current(&reduced_segments)?;
+    let final_slice = FinalSlice {
+        bolted_ka: final_bolted_ka,
+        arcing_ka: arcflash::calculate(&IeeeInput { ibf_ka: final_bolted_ka, ..input.clone() })?.i_arc_ka,
+        arcing_min_ka: arcflash::calculate(&IeeeInput { ibf_ka: final_reduced_bolted_ka, ..input.clone() })?.i_arc_min_ka,
+    };
+    out.bolted_out_of_range |= full.bolted_out_of_range || reduced.bolted_out_of_range;
     out.energy_cal_cm2 = full.energy_cal_cm2;
     out.energy_min_cal_cm2 = reduced.energy_cal_cm2;
     out.energy_j_cm2 = full.energy_cal_cm2 * 4.184;
@@ -715,7 +836,7 @@ fn calculate_decrement_arc(project: &Project, loadflow: Option<&LoadflowResult>,
         if !out.warnings.contains(&warning) { out.warnings.push(warning); }
     }
     out.warnings.push("Source-current decrement was applied with repeated quasi-steady three-phase network solves and piecewise IEEE 1584 incident-energy integration; source X/R was held constant.".into());
-    Ok(out)
+    Ok((out, final_slice))
 }
 
 fn curved_sources_reaching(project: &Project, bus_id: &str) -> Vec<String> {
@@ -906,7 +1027,9 @@ fn duration(project: &Project, case: &ArcEquipment, fault: &crate::fault::BusFau
         }
     }
     let bolted = fault.three_phase.as_ref().ok_or("fault current unavailable")?.symmetrical_ka;
-    let amps = device_current(project, device, fault, i_ka / bolted).ok_or("protected branch terminal current unavailable; enter protected_branch and terminal bus")?;
+    let Some(amps) = device_current(project, device, fault, i_ka / bolted) else {
+        return fallback(format!("protected branch terminal current unavailable for upstream device {} [{}]; enter protected_branch and terminal bus", device.name, device.id));
+    };
     if !isolates_sources(project, device, &case.bus) {
         return Err("opening the selected device does not isolate all utility/generator paths to the fault; a multi-device clearing study is required".into());
     }
@@ -985,7 +1108,8 @@ fn coordination(project: &Project, fault: &FaultResult) -> Vec<CoordRow> {
         .iter()
         .map(|device| {
             let kv = project.bus(&device.bus).map(|b| b.kv).unwrap_or(1.0);
-            let bus_fault = fault.buses.iter().find(|b| b.id == device.bus);
+            let (fault_bus, location) = coordination_fault_bus(project, device);
+            let bus_fault = fault.buses.iter().find(|b| b.id == fault_bus);
             let amps = bus_fault.and_then(|b| device_current(project, device, b, 1.0));
             let bolted = amps.map(|a| a / 1000.0);
             let trip = amps.and_then(|a| curves::trip_time_device(device, a));
@@ -999,10 +1123,33 @@ fn coordination(project: &Project, fault: &FaultResult) -> Vec<CoordRow> {
                 bolted_ka: bolted,
                 trip_at_bolted_s: trip,
                 total_clearing_s: total,
-                note: "Current is the protected branch terminal contribution for a fault at the device bus; operating and total-clearing times are separate. Unassigned terminals/times are unavailable.".into(),
+                fault_bus_id: fault_bus.clone(),
+                note: format!("Current is the protected branch terminal contribution for a three-phase fault at bus '{fault_bus}' ({location}); operating and total-clearing times are separate. Unassigned terminals/times are unavailable."),
             }
         })
         .collect()
+}
+
+/// Bus faulted for a device's coordination row: the terminal of its protected
+/// branch on the source-free (protected) side. A device entered at its
+/// line-side bus would otherwise see only backfeed for a fault at its own bus.
+fn coordination_fault_bus(project: &Project, device: &crate::model::Device) -> (String, String) {
+    let branch = device.protected_branch.as_deref()
+        .and_then(|id| project.branches.iter().find(|b| b.id == id))
+        .filter(|b| (b.from == device.bus || b.to == device.bus) && project.branch_closed(b));
+    let Some(branch) = branch else {
+        return (device.bus.clone(), "the device bus; protected branch terminal not available".into());
+    };
+    let far = if branch.from == device.bus { &branch.to } else { &branch.from };
+    let sourced = |terminal: &str| {
+        let seen = buses_after_device_opens(project, device, terminal);
+        project.sources.iter().any(|s| s.in_service && seen.contains(&s.bus))
+    };
+    match (sourced(&device.bus), sourced(far)) {
+        (true, false) => (far.clone(), format!("far terminal of protected branch '{}', away from the device bus, on the source-free side", branch.id)),
+        (false, true) => (device.bus.clone(), format!("device bus, the source-free terminal of protected branch '{}'", branch.id)),
+        _ => (device.bus.clone(), format!("device bus; both terminals of protected branch '{}' have the same source connectivity, so the protected side is not determined", branch.id)),
+    }
 }
 
 pub fn text_report(project: &Project, out: &StudyOutput) -> String {
@@ -1139,6 +1286,142 @@ mod terminal_regression {
         // At half fault injection, terminal current is (60+j80) A, magnitude 100 A.
         let current = device_current(&p, &p.devices[0], &f, 0.5).unwrap();
         assert!((current-100.0).abs() < 1e-12);
+    }
+}
+
+#[cfg(test)]
+mod audit_regression {
+    use super::*;
+    use crate::model::{CurveSpec, DecrementPoint, Electrode};
+
+    fn arc_only() -> Studies { Studies { loadflow: false, fault: true, arcflash: true, coordination: false } }
+
+    fn row<'a>(out: &'a StudyOutput, id: &str) -> &'a ArcRow {
+        out.arc_flash.as_ref().unwrap().iter().find(|r| r.equipment_id == id)
+            .unwrap_or_else(|| panic!("no row {id}; failures {:?}", out.arc_flash_failures))
+    }
+
+    #[test]
+    fn assumed_enclosure_reports_maximum_over_box_electrode_configurations() {
+        let mut p = Project::sample();
+        p.equipment.retain(|e| e.id != "af-pnl");
+        let out = run(&p, arc_only()).unwrap();
+        let assumed = row(&out, "assumed:pnl").clone();
+        assert!(assumed.assumed);
+
+        // Evaluate each configuration explicitly with the default geometry.
+        let (_, gap, distance, height, width, depth, _) = typical_equipment(0.48);
+        let mut by_electrode = Vec::new();
+        for electrode in ASSUMED_ENCLOSURE_ELECTRODES {
+            let mut q = p.clone();
+            q.equipment.push(ArcEquipment {
+                id: "explicit".into(), name: "explicit".into(), bus: "pnl".into(), electrode,
+                gap_mm: gap, distance_mm: distance, height_mm: height, width_mm: width, depth_mm: depth,
+                upstream_device: None, clearing_s: None, fallback_duration_s: None, basis: "assumed".into(),
+            });
+            by_electrode.push(row(&run(&q, arc_only()).unwrap(), "explicit").clone());
+        }
+        let max_energy = by_electrode.iter().map(|r| r.governing_cal_cm2).fold(0.0, f64::max);
+        let max_boundary = by_electrode.iter().map(|r| r.afb_mm).fold(0.0, f64::max);
+        let governing = by_electrode.iter().find(|r| r.governing_cal_cm2 == max_energy).unwrap();
+        assert_eq!(assumed.governing_cal_cm2, max_energy);
+        assert_eq!(assumed.afb_mm, max_boundary);
+        assert_eq!(assumed.electrode, governing.electrode);
+        // VCB alone, the former assumption, is not the conservative choice here.
+        let vcb = by_electrode.iter().find(|r| r.electrode == "VCB").unwrap();
+        assert!(max_energy > vcb.governing_cal_cm2, "VCB {} max {max_energy}", vcb.governing_cal_cm2);
+        assert!(assumed.warnings[0].contains(&format!("{} governs incident energy", governing.electrode)), "{:?}", assumed.warnings);
+        assert!(out.warnings.iter().any(|w| w.contains("Assumed enclosure") && w.contains("VCB, VCBB, HCB")));
+        // Explicit equipment keeps its entered configuration.
+        assert_eq!(row(&run(&Project::sample(), arc_only()).unwrap(), "af-pnl").electrode, Electrode::VCB.as_str());
+    }
+
+    #[test]
+    fn coordination_faults_the_protected_side_of_a_line_side_device() {
+        let studies = Studies { loadflow: false, fault: true, arcflash: false, coordination: true };
+        let coord = |p: &Project, id: &str| run(p, studies).unwrap().coordination.unwrap()
+            .into_iter().find(|r| r.device_id == id).unwrap();
+        let mut p = Project::sample();
+        let load_side = coord(&p, "brk-feeder");
+        assert_eq!(load_side.fault_bus_id, "pnl");
+        p.devices.iter_mut().find(|d| d.id == "brk-feeder").unwrap().bus = "mcc".into();
+        let line_side = coord(&p, "brk-feeder");
+        assert_eq!(line_side.fault_bus_id, "pnl");
+        assert!(line_side.note.contains("'pnl'") && line_side.note.contains("far terminal"), "{}", line_side.note);
+        let pnl_ka = run(&p, studies).unwrap().fault.unwrap().buses.into_iter()
+            .find(|b| b.id == "pnl").unwrap().three_phase.unwrap().symmetrical_ka;
+        let line_ka = line_side.bolted_ka.unwrap();
+        // Series feeder without shunt elements: same current at either terminal,
+        // and it carries the whole panel fault (utility plus MCC motor).
+        assert!((line_ka - load_side.bolted_ka.unwrap()).abs() < 1e-9 * line_ka);
+        assert!((line_ka - pnl_ka).abs() < 1e-6 * pnl_ka, "{line_ka} vs {pnl_ka}");
+        assert!(line_side.trip_at_bolted_s.is_some());
+        // The main breaker (load-side terminal of T1) is still faulted at its own bus.
+        let main = coord(&p, "brk-main");
+        assert_eq!(main.fault_bus_id, "mcc");
+        assert!(main.note.contains("source-free terminal"), "{}", main.note);
+    }
+
+    fn unplaced_main() -> Project {
+        let mut p = Project::sample();
+        p.motors.clear();
+        p.equipment.truncate(1);
+        p.equipment[0].upstream_device = Some("brk-main".into());
+        p.devices[0].protected_branch = None;
+        p
+    }
+
+    #[test]
+    fn missing_device_terminal_current_uses_authorized_fallback_in_both_paths() {
+        let mut p = unplaced_main();
+        let out = run(&p, arc_only()).unwrap();
+        let failure = out.arc_flash_failures.iter().find(|f| f.equipment_id == "af-mcc").unwrap();
+        assert!(failure.error.contains("terminal current unavailable"), "{}", failure.error);
+
+        p.equipment[0].fallback_duration_s = Some(0.5);
+        for decrement in [false, true] {
+            if decrement {
+                p.sources[0].decrement_curve = vec![
+                    DecrementPoint { time_s: 0.0, current_ratio: 1.0 },
+                    DecrementPoint { time_s: 1.0, current_ratio: 1.0 },
+                ];
+            }
+            let out = run(&p, arc_only()).unwrap();
+            let r = row(&out, "af-mcc");
+            assert_eq!(r.time_s, 0.5, "decrement {decrement}");
+            assert_eq!(r.time_min_s, 0.5);
+            assert!(r.assumed);
+            assert!(r.duration_note.contains("assumed exposure fallback") && r.duration_note.contains("terminal current unavailable"), "{}", r.duration_note);
+            assert_eq!(r.decrement_applied, decrement);
+        }
+    }
+
+    #[test]
+    fn decrement_rows_state_that_arcing_currents_are_initial_values() {
+        let mut p = Project::sample();
+        p.motors.clear();
+        p.equipment.truncate(1);
+        p.devices[0].curve = CurveSpec::Definite { pickup_a: 1.0, time_s: 0.05 };
+        p.devices[0].breaker_interrupting_s = Some(0.04);
+        let constant = run(&p, arc_only()).unwrap();
+        let constant = row(&constant, "af-mcc");
+        assert!(constant.final_arcing_ka.is_none() && constant.final_bolted_ka.is_none());
+        assert!(!constant.warnings.iter().any(|w| w.contains("initial (t=0)")));
+
+        p.sources[0].decrement_curve = vec![
+            DecrementPoint { time_s: 0.0, current_ratio: 1.0 },
+            DecrementPoint { time_s: 0.05, current_ratio: 0.5 },
+        ];
+        let out = run(&p, arc_only()).unwrap();
+        let r = row(&out, "af-mcc");
+        assert!(r.warnings.iter().any(|w| w.contains("arcing currents shown are initial (t=0) values")
+            || w.contains("Arcing currents shown are initial (t=0) values")), "{:?}", r.warnings);
+        assert_eq!(r.arcing_ka, constant.arcing_ka, "initial value is retained");
+        let final_bolted = r.final_bolted_ka.unwrap();
+        // Half the source strength behind T1 lowers the MCC current by about 13 %.
+        assert!(final_bolted < 0.95 * r.bolted_ka, "final {final_bolted}, initial {}", r.bolted_ka);
+        assert!(r.final_arcing_ka.unwrap() < r.arcing_ka);
+        assert!(r.final_arcing_min_ka.unwrap() < r.arcing_min_ka);
     }
 }
 

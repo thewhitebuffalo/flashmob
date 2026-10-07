@@ -58,6 +58,9 @@ pub struct IeeeOutput {
     pub afb_mm: f64,
     pub afb_in: f64,
     pub warnings: Vec<String>,
+    /// The bolted current lies outside the IEEE 1584-2018 model range, so the
+    /// result extrapolates the equations and must be reported as assumed.
+    pub bolted_out_of_range: bool,
 }
 
 /// A constant bolted-current interval in a time-varying fault profile.
@@ -72,6 +75,24 @@ pub struct ProfileEnergy {
     pub energy_cal_cm2: f64,
     pub boundary_mm: f64,
     pub warnings: Vec<String>,
+    /// At least one segment's bolted current is outside the model range.
+    pub bolted_out_of_range: bool,
+}
+
+const LV_BOLTED_RANGE_KA: std::ops::RangeInclusive<f64> = 0.5..=106.0;
+const MV_BOLTED_RANGE_KA: std::ops::RangeInclusive<f64> = 0.2..=65.0;
+/// IEEE 1584-2018 clamps enclosure height and width above this size.
+const MAX_ENCLOSURE_DIM_MM: f64 = 1244.6;
+
+fn bolted_range(voc_kv: f64) -> (std::ops::RangeInclusive<f64>, &'static str) {
+    if voc_kv <= 0.6 { (LV_BOLTED_RANGE_KA, "0.5–106 kA low-voltage") } else { (MV_BOLTED_RANGE_KA, "0.2–65 kA medium-voltage") }
+}
+
+fn bolted_range_warning(low_ka: f64, high_ka: f64, voc_kv: f64) -> String {
+    let (_, label) = bolted_range(voc_kv);
+    let current = if (high_ka - low_ka).abs() < 5e-4 { format!("bolted current {low_ka:.3} kA is") }
+        else { format!("bolted current {low_ka:.3}–{high_ka:.3} kA is") };
+    format!("{current} outside the {label} model range; the IEEE 1584-2018 equations are extrapolated and the result is assumed, not within the validated range")
 }
 
 /// Integrate IEEE 1584 incident energy over constant-current intervals.
@@ -91,6 +112,7 @@ pub fn integrate_profile(
     let mut energy_j = 0.0;
     let mut reference_energy_j = [0.0; 3];
     let mut warnings = Vec::new();
+    let mut out_of_range: Option<(f64, f64)> = None;
     let levels = [0.6, 2.7, 14.3];
     let var_cf = variation_factor(template.electrode, template.voc_kv);
 
@@ -105,18 +127,18 @@ pub fn integrate_profile(
             time_min_s: segment.duration_s,
             ..template.clone()
         };
-        let calibrated_current = if input.voc_kv <= 0.6 { 0.5..=106.0 } else { 0.2..=65.0 };
-        if !calibrated_current.contains(&segment.ibf_ka) {
-            return Err(format!(
-                "arc-flash current profile segment {} has {:.3} kA outside the IEEE 1584-2018 bolted-current model range; integrated energy is unavailable",
-                index + 1, segment.ibf_ka,
-            ));
-        }
         // Reuse the established IEEE input validation and model-range warnings.
+        // An out-of-range bolted current is computed and flagged exactly as in
+        // the constant-current calculation, summarized once for the profile.
         let result = calculate(&input)
             .map_err(|error| format!("arc-flash current profile segment {}: {error}", index + 1))?;
+        if result.bolted_out_of_range {
+            out_of_range = Some(out_of_range.map_or((segment.ibf_ka, segment.ibf_ka),
+                |(low, high): (f64, f64)| (low.min(segment.ibf_ka), high.max(segment.ibf_ka))));
+        }
         energy_j += if reduced { result.energy_min_j_cm2 } else { result.energy_j_cm2 };
         for warning in result.warnings {
+            if warning.starts_with("bolted current ") { continue; }
             if !warnings.contains(&warning) { warnings.push(warning); }
         }
 
@@ -145,7 +167,11 @@ pub fn integrate_profile(
     if !energy_j.is_finite() || energy_j <= 0.0 || !boundary_mm.is_finite() || boundary_mm <= 0.0 {
         return Err("non-finite or non-positive integrated IEEE 1584 result".into());
     }
-    Ok(ProfileEnergy { energy_cal_cm2: energy_j / J_PER_CAL, boundary_mm, warnings })
+    if let Some((low, high)) = out_of_range {
+        warnings.insert(0, format!("current profile: {}", bolted_range_warning(low, high, template.voc_kv)));
+    }
+    Ok(ProfileEnergy { energy_cal_cm2: energy_j / J_PER_CAL, boundary_mm, warnings,
+        bolted_out_of_range: out_of_range.is_some() })
 }
 
 pub fn calculate(input: &IeeeInput) -> Result<IeeeOutput, String> {
@@ -162,32 +188,29 @@ pub fn calculate(input: &IeeeInput) -> Result<IeeeOutput, String> {
     if input.ibf_ka <= 0.0 || input.gap_mm <= 0.0 || input.distance_mm <= 0.0 || input.time_s <= 0.0 {
         return Err("bolted current, gap, distance, and arc duration must be positive".into());
     }
+    let bolted_out_of_range = !bolted_range(input.voc_kv).0.contains(&input.ibf_ka);
+    if bolted_out_of_range {
+        warnings.push(bolted_range_warning(input.ibf_ka, input.ibf_ka, input.voc_kv));
+    }
     if input.voc_kv <= 0.6 {
-        if !(0.5..=106.0).contains(&input.ibf_ka) {
-            warnings.push(format!(
-                "bolted current {:.3} kA is outside the 0.5–106 kA low-voltage model range",
-                input.ibf_ka
-            ));
-        }
         if !(6.35..=76.2).contains(&input.gap_mm) {
             warnings.push(format!("gap {:.1} mm is outside the 6.35–76.2 mm low-voltage model range", input.gap_mm));
         }
-    } else {
-        if !(0.2..=65.0).contains(&input.ibf_ka) {
-            warnings.push(format!(
-                "bolted current {:.3} kA is outside the 0.2–65 kA medium-voltage model range",
-                input.ibf_ka
-            ));
-        }
-        if !(19.05..=254.0).contains(&input.gap_mm) {
-            warnings.push(format!("gap {:.1} mm is outside the 19.05–254 mm medium-voltage model range", input.gap_mm));
-        }
+    } else if !(19.05..=254.0).contains(&input.gap_mm) {
+        warnings.push(format!("gap {:.1} mm is outside the 19.05–254 mm medium-voltage model range", input.gap_mm));
     }
     if input.distance_mm < 305.0 {
         warnings.push("working distance is below 305 mm".into());
     }
     if input.electrode.is_box() && input.width_mm < 4.0 * input.gap_mm {
         warnings.push("enclosure width is less than four times the gap".into());
+    }
+    if input.electrode.is_box() {
+        for (name, value) in [("height", input.height_mm), ("width", input.width_mm)] {
+            if value > MAX_ENCLOSURE_DIM_MM {
+                warnings.push(format!("enclosure {name} {value:.1} mm exceeds the IEEE 1584-2018 range; the enclosure-size correction uses the clamped value of {MAX_ENCLOSURE_DIM_MM} mm"));
+            }
+        }
     }
 
     let enc = enclosure(input)?;
@@ -221,6 +244,7 @@ pub fn calculate(input: &IeeeInput) -> Result<IeeeOutput, String> {
         afb_mm: boundary,
         afb_in: boundary / 25.4,
         warnings,
+        bolted_out_of_range,
     })
 }
 
@@ -404,7 +428,7 @@ fn equivalent_dim(dim: f64, voc: f64, a: f64, b: f64, shallow: bool, height: boo
     if dim <= 660.4 {
         return MM_TO_IN_PRINTED * dim;
     }
-    if dim <= 1244.6 {
+    if dim <= MAX_ENCLOSURE_DIM_MM {
         if height && ec == Electrode::VCB {
             return MM_TO_IN_PRINTED * dim;
         }
@@ -413,7 +437,7 @@ fn equivalent_dim(dim: f64, voc: f64, a: f64, b: f64, shallow: bool, height: boo
     if height && ec == Electrode::VCB {
         49.0
     } else {
-        eq_11_12(1244.6, voc, a, b)
+        eq_11_12(MAX_ENCLOSURE_DIM_MM, voc, a, b)
     }
 }
 
@@ -477,13 +501,18 @@ fn energy_coeff(ec: Electrode, voc: f64) -> K13 {
     K13 { k: row }
 }
 
+/// Coefficient table row for an IEEE 1584-2018 reference voltage. Callers pass
+/// only 0.6, 2.7, or 14.3 kV (low-voltage energy uses the 0.6 kV row for any
+/// voltage at or below 0.6 kV before calling this); anything else is a bug.
 fn voc_band(voc: f64) -> usize {
     if (voc - 0.6).abs() < 1e-9 {
         0
     } else if (voc - 2.7).abs() < 1e-9 {
         1
-    } else {
+    } else if (voc - 14.3).abs() < 1e-9 {
         2
+    } else {
+        unreachable!("IEEE 1584-2018 coefficients exist only for 0.6, 2.7, and 14.3 kV; got {voc} kV")
     }
 }
 
@@ -635,12 +664,72 @@ mod profile_regression {
     fn rejects_empty_and_invalid_profiles() {
         let template = input(0.48, 45.0);
         assert!(integrate_profile(&template, &[], false).is_err());
+        // An out-of-range bolted current (formerly rejected here) is now
+        // computed and flagged, as in `calculate`; see the test below.
         for segment in [
             EnergySegment { ibf_ka: 0.0, duration_s: 0.1 },
             EnergySegment { ibf_ka: 20.0, duration_s: f64::NAN },
-            EnergySegment { ibf_ka: 0.3, duration_s: 0.1 },
         ] {
             assert!(integrate_profile(&template, &[segment], false).is_err());
         }
+    }
+
+    #[test]
+    fn out_of_range_bolted_current_is_computed_and_flagged_in_both_paths() {
+        // Constant-current path, low and medium voltage.
+        for (voltage, current) in [(0.48, 0.3), (0.48, 120.0), (4.16, 0.15), (4.16, 70.0)] {
+            let out = calculate(&input(voltage, current)).unwrap();
+            assert!(out.bolted_out_of_range, "{voltage} kV {current} kA");
+            assert!(out.warnings.iter().any(|w| w.contains("outside the") && w.contains("result is assumed")), "{:?}", out.warnings);
+        }
+        assert!(!calculate(&input(0.48, 45.0)).unwrap().bolted_out_of_range);
+
+        // Profile path: computes, sums the same per-slice energies, flags once.
+        let template = input(0.48, 45.0);
+        let segments = [
+            EnergySegment { ibf_ka: 45.0, duration_s: 0.1 },
+            EnergySegment { ibf_ka: 0.4, duration_s: 0.1 },
+            EnergySegment { ibf_ka: 0.3, duration_s: 0.1 },
+        ];
+        let profile = integrate_profile(&template, &segments, false).unwrap();
+        assert!(profile.bolted_out_of_range);
+        let expected: f64 = segments.iter().map(|s| calculate(&IeeeInput {
+            ibf_ka: s.ibf_ka, time_s: s.duration_s, time_min_s: s.duration_s, ..template.clone()
+        }).unwrap().energy_cal_cm2).sum();
+        close(profile.energy_cal_cm2, expected);
+        let range_warnings: Vec<_> = profile.warnings.iter().filter(|w| w.contains("model range")).collect();
+        assert_eq!(range_warnings.len(), 1, "{:?}", profile.warnings);
+        assert!(range_warnings[0].contains("0.300–0.400 kA") && range_warnings[0].contains("assumed"), "{}", range_warnings[0]);
+        assert!(!integrate_profile(&template, &segments[..1], false).unwrap().bolted_out_of_range);
+    }
+
+    #[test]
+    fn oversize_enclosure_dimensions_warn_that_they_are_clamped() {
+        let mut big = input(4.16, 15.0);
+        big.height_mm = 1500.0;
+        big.width_mm = 1300.0;
+        let out = calculate(&big).unwrap();
+        assert!(out.warnings.iter().any(|w| w.contains("enclosure height 1500.0 mm") && w.contains("clamped")), "{:?}", out.warnings);
+        assert!(out.warnings.iter().any(|w| w.contains("enclosure width 1300.0 mm")), "{:?}", out.warnings);
+        // The clamp itself is unchanged: any size above 1244.6 mm gives the same correction.
+        let clamped = calculate(&IeeeInput { height_mm: 1300.0, width_mm: 1300.0, ..big.clone() }).unwrap();
+        let larger = calculate(&IeeeInput { height_mm: 2000.0, width_mm: 2000.0, ..big }).unwrap();
+        close(larger.cf, clamped.cf);
+        let at_limit = calculate(&IeeeInput { height_mm: 1244.6, width_mm: 1244.6, ..input(4.16, 15.0) }).unwrap();
+        assert!(!at_limit.warnings.iter().any(|w| w.contains("clamped")));
+        assert!(!calculate(&input(0.48, 45.0)).unwrap().warnings.iter().any(|w| w.contains("clamped")));
+    }
+
+    #[test]
+    fn voc_band_matches_only_reference_voltages() {
+        assert_eq!(voc_band(0.6), 0);
+        assert_eq!(voc_band(2.7), 1);
+        assert_eq!(voc_band(14.3), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "coefficients exist only for")]
+    fn voc_band_rejects_a_non_reference_voltage() {
+        voc_band(4.16);
     }
 }

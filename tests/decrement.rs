@@ -2,6 +2,8 @@ use flashmob::model::{
     Branch, BranchKind, Bus, CurveSpec, DecrementPoint, Device, EquipmentState, IecKind, OperatingCase, Project, SourceState,
     Switch, SwitchGroup, SwitchKind, SwitchState,
 };
+use flashmob::arcflash::{calculate, IeeeInput};
+use flashmob::model::Electrode;
 use flashmob::study::{self, ArcRow, Studies, StudyOutput};
 
 fn curve(final_ratio: f64) -> Vec<DecrementPoint> {
@@ -167,20 +169,51 @@ fn decrement_without_relay_operation_has_explicit_failure() {
     assert!(failure.error.contains("did not trip within"), "{}", failure.error);
 }
 
+fn assert_same_capped_result(static_row: &ArcRow, profiled: &ArcRow, cap: f64) {
+    assert!(static_row.duration_capped && profiled.duration_capped);
+    close(static_row.time_s, cap, 1e-12);
+    close(profiled.time_s, static_row.time_s, 1e-12);
+    close(profiled.time_min_s, static_row.time_min_s, 1e-12);
+    close(profiled.energy_cal_cm2, static_row.energy_cal_cm2, 1e-3);
+    close(profiled.energy_min_cal_cm2, static_row.energy_min_cal_cm2, 1e-3);
+    close(profiled.governing_cal_cm2, static_row.governing_cal_cm2, 1e-3);
+    close(profiled.afb_mm, static_row.afb_mm, 1e-3);
+    assert_eq!(profiled.assumed, static_row.assumed);
+    assert!(profiled.duration_note.contains("cap"), "{}", profiled.duration_note);
+    assert!(profiled.decrement_applied && !static_row.decrement_applied);
+}
+
+// Formerly a failure ("beyond the 0.080 s study cap"). The constant-current
+// path caps such a duration at the study limit, so decrement now does too.
 #[test]
-fn breaker_interruption_beyond_study_cap_is_not_claimed_as_clearing() {
+fn breaker_interruption_beyond_study_cap_is_capped_like_constant_current() {
     let mut project = Project::sample();
     project.motors.clear();
     project.equipment.truncate(1);
     project.arc_duration_cap_s = 0.08;
-    project.sources[0].decrement_curve = curve(1.0);
     project.devices[0].curve = CurveSpec::Definite { pickup_a: 1.0, time_s: 0.05 };
     project.devices[0].breaker_interrupting_s = Some(0.04);
+    let static_row = arc(&run_arc(&project), "af-mcc").clone();
+    project.sources[0].decrement_curve = curve(1.0);
     let output = run_arc(&project);
-    assert!(!output.arc_flash.as_ref().unwrap().iter().any(|row| row.equipment_id == "af-mcc"));
-    let failure = output.arc_flash_failures.iter()
-        .find(|failure| failure.equipment_id == "af-mcc").unwrap();
-    assert!(failure.error.contains("beyond the 0.080 s study cap"), "{}", failure.error);
+    assert!(!output.arc_flash_failures.iter().any(|failure| failure.equipment_id == "af-mcc"));
+    assert_same_capped_result(&static_row, arc(&output, "af-mcc"), 0.08);
+}
+
+#[test]
+fn slow_device_with_flat_decrement_is_capped_like_constant_current() {
+    let mut project = Project::sample();
+    project.motors.clear();
+    project.equipment.truncate(1);
+    project.devices[0].curve = CurveSpec::Definite { pickup_a: 1.0, time_s: 3.0 };
+    project.devices[0].breaker_interrupting_s = Some(0.04);
+    let static_row = arc(&run_arc(&project), "af-mcc").clone();
+    project.sources[0].decrement_curve = curve(1.0);
+    let output = run_arc(&project);
+    assert!(!output.arc_flash_failures.iter().any(|failure| failure.equipment_id == "af-mcc"));
+    let profiled = arc(&output, "af-mcc");
+    assert_same_capped_result(&static_row, profiled, 2.0);
+    assert!(profiled.duration_note.contains("still timing"), "{}", profiled.duration_note);
 }
 
 #[test]
@@ -217,10 +250,13 @@ fn short_initial_pickup_does_not_claim_a_trip_after_current_decays() {
     assert!(failure.error.contains("did not trip within"), "{}", failure.error);
 }
 
+// Formerly a hard failure. A constant out-of-range bolted current is computed
+// with a model-range warning, so the profile path now does the same and marks
+// the row assumed rather than validated.
 #[test]
-fn out_of_range_late_current_invalidates_arc_envelope() {
+fn out_of_range_late_current_is_computed_and_marked_assumed() {
     let mut project = manual_source_project();
-    project.sources[0].decrement_curve = curve(0.001);
+    project.sources[0].decrement_curve = curve(0.01);
     project.operating_cases.push(OperatingCase {
         id: "repeat".into(), name: "Repeat energized state".into(),
         switch_states: Vec::new(), source_states: Vec::new(),
@@ -230,14 +266,34 @@ fn out_of_range_late_current_invalidates_arc_envelope() {
         }],
     });
     let output = run_arc(&project);
-    let failure = output.arc_flash_failures.iter()
-        .find(|failure| failure.equipment_id == "af-mcc").unwrap();
-    assert!(failure.error.contains("outside the IEEE 1584-2018 bolted-current model range"), "{}", failure.error);
+    assert!(!output.arc_flash_failures.iter().any(|failure| failure.equipment_id == "af-mcc"));
+    let row = arc(&output, "af-mcc");
+    assert!(row.assumed);
+    assert!(row.warnings.iter().any(|w| w.contains("outside the 0.5–106 kA low-voltage model range")
+        && w.contains("assumed")), "{:?}", row.warnings);
+    assert!(output.warnings.iter().any(|w| w.contains("model range")));
+    let in_range = arc(&run_arc(&manual_source_project()), "af-mcc").clone();
+    assert!(!in_range.assumed);
+    assert!(row.governing_cal_cm2 < in_range.governing_cal_cm2);
     let envelope = output.worst_case.as_ref().unwrap().arc_equipment.iter()
         .find(|item| item.equipment_id == "af-mcc").unwrap();
-    assert!(!envelope.complete);
-    assert!(envelope.failed_case_ids.contains(&"normal".to_string()));
-    assert!(envelope.failed_case_ids.contains(&"repeat".to_string()));
+    assert!(envelope.complete);
+}
+
+#[test]
+fn out_of_range_profile_matches_constant_current_at_the_same_out_of_range_level() {
+    // A constant 0.5 % decrement stays below 0.5 kA throughout: the integrated
+    // result must equal the static calculation at that bolted current.
+    let mut static_project = manual_source_project();
+    static_project.sources[0].mva_sc = 20.0 * 0.005;
+    let static_row = arc(&run_arc(&static_project), "af-mcc").clone();
+    assert!(static_row.bolted_ka < 0.5 && static_row.assumed, "{}", static_row.bolted_ka);
+    let mut profiled = manual_source_project();
+    profiled.sources[0].mva_sc = 20.0 * 0.005;
+    profiled.sources[0].decrement_curve = curve(1.0);
+    let row = arc(&run_arc(&profiled), "af-mcc").clone();
+    assert!(row.assumed);
+    close(row.governing_cal_cm2, static_row.governing_cal_cm2, 1e-3);
 }
 
 #[test]
@@ -366,4 +422,83 @@ fn ats_transfer_calculates_each_active_breaker_without_manual_duration() {
     assert!(!alternate.assumed);
     assert!(output.worst_case.as_ref().unwrap().arc_equipment.iter()
         .find(|item| item.equipment_id == "load_gear").unwrap().complete);
+}
+
+// Hand-checked two-step profiles. Each slice's bolted current is the curved
+// source's scaled strength (the only contribution here), and each slice's
+// incident energy is calculated independently with the IEEE 1584 equations.
+fn two_step_curve() -> Vec<DecrementPoint> {
+    vec![
+        DecrementPoint { time_s: 0.0, current_ratio: 1.0 },
+        DecrementPoint { time_s: 0.2, current_ratio: 1.0 },
+        DecrementPoint { time_s: 0.21, current_ratio: 0.5 },
+    ]
+}
+
+/// (current ratio, seconds) for the two-step curve over `duration_s`: the
+/// 10 ms ramp slice is sampled at its midpoint ratio of 0.75.
+fn two_step_slices(duration_s: f64) -> [(f64, f64); 3] {
+    [(1.0, 0.2), (0.75, 0.01), (0.5, duration_s - 0.21)]
+}
+
+fn hand_integrated(project: &Project, duration_s: f64) -> (f64, f64) {
+    let equipment = &project.equipment[0];
+    let kv = project.bus(&equipment.bus).unwrap().kv;
+    let initial_ka = project.sources[0].mva_sc / (3f64.sqrt() * kv);
+    let mut full = 0.0;
+    let mut reduced = 0.0;
+    for (ratio, seconds) in two_step_slices(duration_s) {
+        let slice = calculate(&IeeeInput {
+            voc_kv: kv, ibf_ka: initial_ka * ratio, gap_mm: equipment.gap_mm,
+            distance_mm: equipment.distance_mm, height_mm: equipment.height_mm,
+            width_mm: equipment.width_mm, depth_mm: equipment.depth_mm,
+            electrode: equipment.electrode, time_s: seconds, time_min_s: seconds,
+        }).unwrap();
+        full += slice.energy_cal_cm2;
+        reduced += slice.energy_min_cal_cm2;
+    }
+    (full, reduced)
+}
+
+fn check_two_step(mut project: Project, duration_s: f64) {
+    let kv = project.bus(&project.equipment[0].bus).unwrap().kv;
+    let static_row = arc(&run_arc(&project), &project.equipment[0].id).clone();
+    let initial_ka = project.sources[0].mva_sc / (3f64.sqrt() * kv);
+    close(static_row.bolted_ka, initial_ka, 1e-6);
+    project.sources[0].decrement_curve = two_step_curve();
+    let row = arc(&run_arc(&project), &project.equipment[0].id).clone();
+    let (full, reduced) = hand_integrated(&project, duration_s);
+    close(row.time_s, duration_s, 1e-12);
+    close(row.energy_cal_cm2, full, 1e-9);
+    close(row.energy_min_cal_cm2, reduced, 1e-9);
+    close(row.governing_cal_cm2, full.max(reduced), 1e-9);
+    assert!(row.governing_cal_cm2 < static_row.governing_cal_cm2);
+    assert!(row.afb_mm < static_row.afb_mm);
+    close(row.final_bolted_ka.unwrap(), 0.5 * initial_ka, 1e-6);
+}
+
+#[test]
+fn low_voltage_two_step_decrement_matches_hand_summed_slice_energies() {
+    let project = manual_source_project();
+    check_two_step(project, 0.4);
+}
+
+#[test]
+fn medium_voltage_two_step_decrement_matches_hand_summed_slice_energies() {
+    let mut project = manual_source_project();
+    project.buses = vec![Bus { id: "swgr".into(), name: "4.16 kV switchgear".into(), kv: 4.16,
+        shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None }];
+    project.branches.clear();
+    project.sources[0].bus = "swgr".into();
+    project.sources[0].mva_sc = 150.0;
+    let equipment = &mut project.equipment[0];
+    equipment.bus = "swgr".into();
+    equipment.electrode = Electrode::VCB;
+    equipment.gap_mm = 104.0;
+    equipment.distance_mm = 914.4;
+    equipment.height_mm = 1143.0;
+    equipment.width_mm = 762.0;
+    equipment.depth_mm = 508.0;
+    equipment.clearing_s = Some(0.3);
+    check_two_step(project, 0.3);
 }

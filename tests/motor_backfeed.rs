@@ -1,4 +1,5 @@
 use flashmob::model::{Branch, BranchKind, Bus, CurveSpec, DecrementPoint, Device, Project, Switch, SwitchKind};
+use flashmob::arcflash::{calculate, IeeeInput};
 use flashmob::study::{self, Studies, StudyOutput};
 
 fn run_arc(project: &Project) -> StudyOutput {
@@ -90,4 +91,30 @@ fn motor_feeder_breaker_only_removes_backfeed_when_its_contact_is_open() {
     assert!(open.arc_flash_failures.iter().all(|failure| failure.equipment_id != "af-mcc"));
     assert!(mcc_bolted_ka(&closed) > mcc_bolted_ka(&open),
         "the closed motor feeder must actually contribute fault current");
+
+    // Absolute values for the open-feeder case: main relay definite 0.05 s
+    // plus entered breaker interruption 0.04 s, at both arcing currents, and
+    // the IEEE 1584 energy for the af-mcc geometry at the MCC bolted current.
+    let row = open.arc_flash.as_ref().unwrap().iter().find(|row| row.equipment_id == "af-mcc").unwrap();
+    assert_eq!(row.upstream_device.as_deref(), Some("brk-main"));
+    assert!((row.time_s - 0.09).abs() < 1e-12, "{}", row.time_s);
+    assert!((row.time_min_s - 0.09).abs() < 1e-12, "{}", row.time_min_s);
+    assert!(!row.duration_capped && !row.assumed);
+    assert!((row.bolted_ka - mcc_bolted_ka(&open)).abs() < 1e-12);
+    let equipment = &project.equipment[0];
+    let expected = calculate(&IeeeInput {
+        voc_kv: 0.48, ibf_ka: row.bolted_ka, gap_mm: equipment.gap_mm,
+        distance_mm: equipment.distance_mm, height_mm: equipment.height_mm,
+        width_mm: equipment.width_mm, depth_mm: equipment.depth_mm,
+        electrode: equipment.electrode, time_s: 0.09, time_min_s: 0.09,
+    }).unwrap();
+    for (got, want) in [(row.energy_cal_cm2, expected.energy_cal_cm2),
+        (row.energy_min_cal_cm2, expected.energy_min_cal_cm2),
+        (row.governing_cal_cm2, expected.governing_cal_cm2), (row.afb_mm, expected.afb_mm)] {
+        assert!((got - want).abs() < 1e-9 * want, "got {got}, expected {want}");
+    }
+    // The utility-only MCC fault through T1 (2500 kVA, 5.75 %, 250 MVA source)
+    // is about 47 kA; the resulting 0.09 s energy is a few cal/cm2.
+    assert!((40.0..55.0).contains(&row.bolted_ka), "{}", row.bolted_ka);
+    assert!((1.0..10.0).contains(&row.governing_cal_cm2), "{}", row.governing_cal_cm2);
 }
