@@ -2,6 +2,8 @@
 name = "flashmob"
 version = "0.1.0"
 edition = "2021"
+# eframe/egui 0.36 (the gui feature) declare rust-version 1.95; clap 4.6 needs 1.85.
+rust-version = "1.95"
 description = "Load flow, short circuit, coordination, and IEEE 1584-2018 arc flash studies"
 license = "MIT"
 readme = "README.md"

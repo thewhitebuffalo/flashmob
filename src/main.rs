@@ -31,7 +31,8 @@ struct Cli {
 enum Command {
     /// Open the macOS study window.
     Gui {
-        /// Project JSON to open. Omit to start with the built-in sample.
+        /// Project JSON to open. Omit to start with the built-in sample. If the file
+        /// cannot be read, the window starts with no project and shows the error.
         project: Option<PathBuf>,
     },
     /// Print the JSON contract: project shape, exec commands, and a sample.
@@ -96,11 +97,17 @@ enum Command {
         device: Vec<String>,
     },
     /// Write an engineering data package for mapping (PTW import unverified).
+    /// The project must validate. Existing files are never replaced without --force,
+    /// and the input project file is never replaced.
     ExportSkm {
         path: PathBuf,
-        /// Folder for the export, or an .xml file path.
+        /// Folder for the export, or an .xml path: project.xml is written there and the
+        /// other files beside it. Other file-like paths (.json, .csv, ...) are rejected.
         #[arg(short, long)]
         output: PathBuf,
+        /// Replace existing package files in the output.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -179,14 +186,23 @@ fn main() -> ExitCode {
             },
             Err(err) => fail(&err),
         },
-        Command::ExportSkm { path, output } => match read_project(&path) {
-            Ok(project) => match flashmob::skm::write_dir(&project, output.as_path()) {
-                Ok(dir) => {
-                    println!("{}", serde_json::json!({"ok": true, "directory": dir.display().to_string()}));
-                    ExitCode::SUCCESS
+        Command::ExportSkm { path, output, force } => match read_project(&path) {
+            Ok(project) => {
+                let errors = project.validate();
+                if !errors.is_empty() {
+                    return emit(&serde_json::json!({"ok": false, "error": "project is invalid; nothing exported", "errors": errors}), false)
+                        .max_code(ExitCode::from(1));
                 }
-                Err(err) => fail(&err),
-            },
+                let input = (path.as_os_str() != "-").then_some(path.as_path());
+                let options = flashmob::skm::WriteOptions { overwrite: force, protect: input };
+                match flashmob::skm::write_dir(&project, output.as_path(), options) {
+                    Ok(dir) => {
+                        println!("{}", serde_json::json!({"ok": true, "directory": dir.display().to_string()}));
+                        ExitCode::SUCCESS
+                    }
+                    Err(err) => fail(&err),
+                }
+            }
             Err(err) => fail(&err),
         },
     }
@@ -202,6 +218,7 @@ fn gui(project: Option<PathBuf>) -> ExitCode {
     }
     #[cfg(not(feature = "gui"))]
     {
+        let _ = project;
         fail("this build has no window. Rebuild with the gui feature.")
     }
 }

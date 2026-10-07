@@ -7,7 +7,9 @@ cd "/Users/whitebuffalo/Coding Projects/flashmob"
 cargo run --release -- gui
 ```
 
-The one-line shows each bus with symmetrical three-phase and line-to-ground fault current, then the governing incident energy and arc-flash boundary. Export SLD writes that drawing as SVG. The TCC tab draws the device curves, and Export TCC writes an SVG plus a CSV of the points.
+The one-line shows each bus with symmetrical three-phase and line-to-ground fault current, then the governing incident energy and arc-flash boundary. When the project has operating cases, each bus card also shows the worst-case incident energy and its governing case, marked incomplete if a case failed. Normally open branches are dashed with an open switch and an `N.O.` label, out-of-service sources are grey, and fuse-type devices (`fuse_total_clearing`) use a fuse symbol. Export SLD writes that drawing as SVG. The TCC tab draws the device curves, and Export TCC writes an SVG (light background) plus a CSV of the points.
+
+`flashmob gui plant.json` opens that file. If it cannot be read, the window starts with no project and keeps the error visible until dismissed; it does not substitute the sample.
 
 ## Headless use
 
@@ -29,7 +31,9 @@ cargo run --release -- sample -o plant.json
 cargo run --release -- export-skm plant.json -o skm-export
 ```
 
-Map and verify the package against the selected PTW version before using it. Voltages are in volts. Cable R and X are total ohms. Transformer percent impedance is on the transformer kVA base.
+Map and verify the package against the selected PTW version before using it. Voltages are in volts. Cable R and X are total ohms. Transformer percent impedance is on the transformer kVA base. Transformer Primary is always the HV winding (bus and connection), whatever the branch drawing direction. Numbers use the shortest text that round-trips (`2.5e-7` for very small values). Component names are unique across the package. Branch `NormalState` (Open/Closed, with the controlling switch) and source `ServiceStatus` record the normal operating state; operating cases and switch groups stay only in `project.json`.
+
+The project must validate before export; otherwise nothing is written and the CLI exits 1. `-o` is a directory, or an `.xml` path where `project.xml` is written with the other files beside it; other file-like paths (`.json`, `.csv`, ...) are rejected. Existing files are never replaced unless `--force` is given (exec: `"overwrite": true`), and the input project file is never replaced.
 
 `flashmob exec` reads a command list. This is the interface to drive from a model:
 
@@ -45,7 +49,7 @@ flashmob exec <<'EOF'
 EOF
 ```
 
-The response contains `project`, `results`, `sld_svg`, `tcc_svg`, and `tcc_csv`, plus `topology` when requested. `flashmob schema` includes a sample project and the command list.
+The response contains `project`, `results`, `sld_svg`, `tcc_svg`, and `tcc_csv`, plus `topology` when requested. Intermediate states may be incomplete, but the final project is validated: `validation_errors` lists any errors, and then `ok` is false and the CLI exits 1. Model edits clear results and every derived view; `run`, `topology`, `sld`, `tcc`, and `export_skm` do not. `sld` and `tcc` reuse the last full study, even one whose load flow failed. `flashmob schema` includes a sample project and the command list.
 
 The built-in sample has a motor directly on the MCC bus and no modeled motor feeder breaker. Its MCC arc-flash result therefore reports an explicit unresolved motor backfeed path instead of treating the main breaker opening as total arc clearing. The downstream panel's feeder breaker still separates its arc from that motor.
 
@@ -143,7 +147,7 @@ For arc flash with decrement, Flashmob changes the curved source's equivalent sh
 
 This is a quasi-steady approximation with fixed source X/R, not a full generator transient or arc simulation. A timed relay element is assumed to reset immediately when sampled current falls below its pickup; if an element that reset would have operated earlier had it held its progress, the result is marked assumed because the actual device reset characteristic may differ. A reset that cannot change the operating time does not mark the result. A fuse total-clearing curve alone does not describe dynamic melting and arcing, so a decrement case with `fuse_total_clearing: true` still needs a manual total duration or authorized fallback. `arc_duration_cap_s` only limits the study integration; it is never a field clearing setting. As with constant current, a relay still timing at the cap, or a trip plus breaker interruption beyond it, gives a capped duration (`duration_capped`) with energy integrated to the cap; a relay below every pickup at the cap (where the held final current may never operate it) leaves clearing unresolved, so the arc result fails and its case envelope is incomplete. A slice outside IEEE 1584's bolted-current model range is calculated with a model-range warning and the row is marked assumed, as for a constant out-of-range current. Decrement rows report initial (t = 0) bolted and arcing currents, say so in their warnings, and add `final_bolted_ka`, `final_arcing_ka`, and `final_arcing_min_ka` for the last integration slice. Initial short-circuit duty remains based on `mva_sc`. See the [Cummins generator protection guidance](https://www.cummins.com/sites/default/files/2021-02/PowerHour%20-%20Generator%20Set%20Overcurrent%20Protection%202020-11-12.pdf) for why excitation changes a decrement curve, and the [IEEE C37.112 scope](https://standards.ieee.org/ieee/C37.112/7036) for varying-current relay integration.
 
-Current on a TCC is referred to the chosen voltage, so a device on another winding can sit on the same plot. Fault-current and arcing-current markers are drawn when a study has been run.
+Current on a TCC is referred to the chosen voltage, so a device on another winding can sit on the same plot. Fault-current and arcing-current markers are drawn when a study has been run; arcing markers from assumed inputs are dotted and labeled `(assumed)`. The time axis starts at 0.01 s and extends down (to at most 0.1 ms) to show faster elements. `--device` names that match nothing are reported as such.
 
 ## Studies
 
@@ -189,8 +193,11 @@ cargo build --release --no-default-features
 python3 scripts/benchmark_studies.py /path/to/previous-flashmob target/release/flashmob
 ```
 
-The script checks all result fields except elapsed time, allowing numerical
-roundoff (`rel_tol=1e-8`, `abs_tol=1e-7`). It reports median engine times from five
+The script generates the sample once (or reads `--sample plant.json`) and feeds
+the same project to both binaries. It checks every result field both binaries
+return except elapsed time, allowing numerical roundoff (`rel_tol=1e-8`,
+`abs_tol=1e-7`); keys present in only one result are listed on stderr as added
+or removed instead of failing. It reports median engine times from five
 runs after one warm-up per binary. Engine timing excludes initial validation,
 process startup, and JSON serialization. Cases cover the sample's full studies
 with flat and loadflow prefault, plus synthetic radial and meshed fault studies.
