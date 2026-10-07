@@ -142,13 +142,14 @@ pub(crate) fn solve_with_model(project: &Project, model: &network::SystemModel) 
     let mut iterations = 0;
     let mut max_mismatch = f64::MAX;
     let mut message = None;
+    let tol = mismatch_tolerance(&model.loadflow, &spec, sbase);
 
     for iter in 1..=100 {
         iterations = iter;
         let (p, q) = injections(&model.loadflow, &v, &ang);
         let (ang_idx, v_idx, nunk) = unknowns(&spec, &model.energized);
-        max_mismatch = 0.0;
         if nunk == 0 {
+            max_mismatch = 0.0;
             converged = true;
             break;
         }
@@ -156,15 +157,21 @@ pub(crate) fn solve_with_model(project: &Project, model: &network::SystemModel) 
         for i in 0..n {
             if let Some(row) = ang_idx[i] {
                 mismatch[row] = spec[i].p - p[i];
-                max_mismatch = max_mismatch.max(mismatch[row].abs());
             }
             if let Some(row) = v_idx[i] {
                 mismatch[row] = spec[i].q - q[i];
-                max_mismatch = max_mismatch.max(mismatch[row].abs());
             }
         }
-        // Fixed physical MW/Mvar tolerance makes convergence independent of MVA base.
-        if max_mismatch < 1e-8 / sbase {
+        // f64::max ignores NaN, so a non-finite mismatch must be caught explicitly.
+        let Some(largest) = finite_max_abs(&mismatch) else {
+            max_mismatch = f64::MAX;
+            message = Some("load flow produced a non-finite power mismatch; not converged".into());
+            break;
+        };
+        max_mismatch = largest;
+        // A fixed physical MW/Mvar tolerance makes convergence independent of
+        // MVA base, raised to the roundoff floor of the largest admittance.
+        if max_mismatch < tol {
             // Change the active set only after solving the current equations.
             // A bound can be released if the resulting voltage contradicts it.
             let mut changed = false;
@@ -172,7 +179,7 @@ pub(crate) fn solve_with_model(project: &Project, model: &network::SystemModel) 
                 if !pv[i] { continue; }
                 if spec[i].kind == Kind::Pv {
                     let qgen = q[i] + demand[i];
-                    if qgen > spec[i].qmax + 1e-8 / sbase || qgen < spec[i].qmin - 1e-8 / sbase {
+                    if qgen > spec[i].qmax + tol || qgen < spec[i].qmin - tol {
                         limited[i] = if qgen > spec[i].qmax { 1 } else { -1 };
                         spec[i].q = qgen.clamp(spec[i].qmin, spec[i].qmax) - demand[i];
                         spec[i].kind = Kind::Pq;
@@ -292,6 +299,28 @@ pub(crate) fn solve_with_model(project: &Project, model: &network::SystemModel) 
     }
 
     Ok(LoadflowResult { converged, iterations, max_mismatch_pu: max_mismatch, buses, branches, message })
+}
+
+/// Convergence tolerance in per unit: 1e-8 MW/Mvar physically, but never below
+/// the roundoff floor of `|Y_ii| V^2` products. A very small branch impedance
+/// (for example a 1e-5 ohm contact at 13.8 kV) has an admittance large enough
+/// that the fixed tolerance would be unreachable in double precision.
+fn mismatch_tolerance(y: &SparseY, spec: &[Spec], sbase: f64) -> f64 {
+    let y_max = y.rows().iter().enumerate()
+        .flat_map(|(i, row)| row.iter().filter(move |(j, _)| *j == i).map(|(_, v)| v.abs()))
+        .fold(0.0, f64::max);
+    let v_max = spec.iter().map(|s| s.v.abs()).fold(1.0, f64::max);
+    (1e-8 / sbase).max(1e3 * f64::EPSILON * y_max * v_max * v_max)
+}
+
+/// Largest absolute value, or None when any entry is NaN or infinite.
+fn finite_max_abs(values: &[f64]) -> Option<f64> {
+    let mut largest = 0.0_f64;
+    for value in values {
+        if !value.is_finite() { return None; }
+        largest = largest.max(value.abs());
+    }
+    Some(largest)
 }
 
 fn injections(y: &SparseY, v: &[f64], ang: &[f64]) -> (Vec<f64>, Vec<f64>) {
@@ -442,6 +471,39 @@ mod tests {
         assert!((bus.v_pu - v_expected).abs() < 1e-5, "v = {}, expected {v_expected}", bus.v_pu);
         assert!((bus.angle_deg - ang_expected).abs() < 1e-3, "angle = {}, expected {ang_expected}", bus.angle_deg);
         assert!(result.max_mismatch_pu < 1e-8);
+    }
+
+    #[test]
+    fn tiny_contact_impedance_converges_and_warns_below_one_micro_pu() {
+        for (contact_ohm, warns) in [(1e-5, false), (1e-6, true), (1e-7, true)] {
+            let mut project = Project::sample();
+            project.motors.clear(); project.devices.clear(); project.equipment.clear(); project.loads.clear();
+            for bus in &mut project.buses { bus.kv = 13.8; }
+            project.branches[0].kind = BranchKind::Line {
+                r_ohm: contact_ohm, x_ohm: contact_ohm, b_siemens: 0.0, r0_ohm: 0.0, x0_ohm: 0.0, ampacity_a: None,
+            };
+            if let BranchKind::Line { r_ohm, x_ohm, .. } = &mut project.branches[1].kind { *r_ohm = 0.2; *x_ohm = 0.4; }
+            project.loads.push(Load { id: "ld".into(), name: "load".into(), bus: "pnl".into(), kw: 2000.0, kvar: 800.0, basis: String::new() });
+            let model = network::build(&project).unwrap();
+            assert_eq!(model.warnings.iter().any(|w| w.contains("below 1e-6 pu")), warns, "{:?}", model.warnings);
+            let result = solve_with_model(&project, &model).unwrap();
+            assert!(result.converged, "{contact_ohm} ohm: {:?}", result.message);
+            let a = &result.buses[0];
+            let b = &result.buses[1];
+            // The contact carries the full load with a negligible drop.
+            assert!((a.v_pu - b.v_pu).abs() < 1e-6 && (a.angle_deg - b.angle_deg).abs() < 1e-4);
+            assert!((result.branches[0].p_from_mw - result.branches[1].p_from_mw).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn non_finite_mismatch_is_never_converged() {
+        assert_eq!(finite_max_abs(&[1.0, -3.0, 2.0]), Some(3.0));
+        assert_eq!(finite_max_abs(&[]), Some(0.0));
+        // f64::max(0.0, NaN) returns 0.0, which used to look converged.
+        assert_eq!(0.0_f64.max(f64::NAN), 0.0);
+        assert_eq!(finite_max_abs(&[0.0, f64::NAN]), None);
+        assert_eq!(finite_max_abs(&[f64::INFINITY]), None);
     }
 
     #[test]

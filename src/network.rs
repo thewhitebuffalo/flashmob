@@ -258,6 +258,7 @@ fn stamp_branch(project: &Project, index: &Index, branch: &Branch, warnings: &mu
             // voltage bases; treating them as equal creates zero-current lines
             // between unequal physical voltages.
             let z1 = Cplx::new(r_ohm / zb_to, x_ohm / zb_to);
+            tiny_impedance_warning(branch, z1, warnings);
             let y = z1.inv().ok_or_else(|| format!("line '{}' has zero impedance", branch.id))?;
             let mut q = quad(y, base_ratio)?;
             q.yff += Cplx::new(0.0, b_siemens * zb_from / 2.0);
@@ -297,6 +298,7 @@ fn stamp_branch(project: &Project, index: &Index, branch: &Branch, warnings: &mu
             let to_turns = to_rated * if to_rated == *hv_kv { tap } else { 1.0 };
             let z_mag = (z_percent / 100.0) * (project.s_base_mva / (kva / 1000.0)) * (to_turns / index.kv[j]).powi(2);
             let z1 = Cplx::from_mag_xr(z_mag, *xr);
+            tiny_impedance_warning(branch, z1, warnings);
             let y1 = z1.inv().ok_or_else(|| format!("transformer '{}' has zero impedance", branch.id))?;
             let a_mag = (from_turns / index.kv[i]) * (index.kv[j] / to_turns);
             let phi = match connection {
@@ -325,6 +327,19 @@ fn stamp_branch(project: &Project, index: &Index, branch: &Branch, warnings: &mu
                 rating_kva: Some(*kva),
             })
         }
+    }
+}
+
+/// Per-unit series impedance below which admittances approach double-precision
+/// roundoff relative to ordinary branches.
+const TINY_BRANCH_PU: f64 = 1e-6;
+
+fn tiny_impedance_warning(branch: &Branch, z: Cplx, warnings: &mut Vec<String>) {
+    if z.abs() < TINY_BRANCH_PU {
+        warnings.push(format!(
+            "branch {}: series impedance {:.2e} pu is below 1e-6 pu; results near this branch are limited by numerical roundoff",
+            branch.id, z.abs()
+        ));
     }
 }
 
