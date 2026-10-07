@@ -101,6 +101,102 @@ fn utility_dyn_and_parallel_ynd_gsu_do_not_circulate_at_no_load() {
         for branch in &lf.branches { near(branch.i_from_a, 0.0, 1e-6); }
     }
 }
+fn grounded(element_id: &str, winding: Option<Winding>, method: GroundingMethod, r_ohm: f64) -> NeutralGrounding {
+    NeutralGrounding { element_id: element_id.into(), winding, method, r_ohm, x_ohm: 0.0 }
+}
+fn lv_ground_fault_a(p: &Project) -> (f64, Option<String>) {
+    let f = fault::solve(p, None).unwrap();
+    let lv = f.buses.iter().find(|b| b.id == "mcc").unwrap();
+    (lv.line_to_ground.as_ref().unwrap().symmetrical_ka * 1000.0, lv.note.clone())
+}
+#[test]
+fn high_resistance_grounded_480v_wye_limits_ground_fault_to_about_5a() {
+    // 277 V / 5 A = 55.4 ohm neutral resistor on a 480 V wye secondary.
+    let r = 0.48e3 / 3.0_f64.sqrt() / 5.0;
+    for (conn, reverse, on_hv) in [(XfmrConn::Dyn, false, false), (XfmrConn::Ynd, true, false), (XfmrConn::Ynyn, false, false), (XfmrConn::Ynyn, true, false), (XfmrConn::Ynyn, false, true), (XfmrConn::Ynyn, true, true)] {
+        let mut p = transformer(); p.buses[0].kv = 12.47; p.buses[1].kv = 0.48;
+        if let BranchKind::Transformer { xr, .. } = &mut p.branches[0].kind { *xr = 5.0; }
+        set_connection(&mut p, 0, conn);
+        if reverse { let b = &mut p.branches[0]; std::mem::swap(&mut b.from, &mut b.to); }
+        let (solid, _) = lv_ground_fault_a(&p);
+        assert!(solid > 10_000.0, "{solid}");
+        // A resistor on the HV neutral of a YNyn unit refers to the LV side by the turns ratio squared.
+        let (winding, ohms) = if on_hv { (Winding::Hv, r * (12.47_f64 / 0.48).powi(2)) } else { (Winding::Lv, r) };
+        p.neutral_grounding.push(grounded("t1", Some(winding), GroundingMethod::Impedance, ohms));
+        assert!(p.validate().is_empty(), "{:?}", p.validate());
+        let (hrg, _) = lv_ground_fault_a(&p);
+        assert!((hrg - 5.0).abs() < 0.02, "{conn:?} reverse {reverse}: {hrg} A");
+        // Three-phase duty is unchanged by the neutral.
+        let f = fault::solve(&p, None).unwrap();
+        near(f.buses[1].three_phase.as_ref().unwrap().symmetrical_ka, fault::solve(&{ let mut q = p.clone(); q.neutral_grounding.clear(); q }, None).unwrap().buses[1].three_phase.as_ref().unwrap().symmetrical_ka, 1e-12);
+    }
+}
+#[test]
+fn ungrounded_source_or_winding_gives_zero_ground_fault_with_note() {
+    let mut p = transformer(); p.buses[0].kv = 12.47; p.buses[1].kv = 0.48;
+    p.neutral_grounding.push(grounded("t1", Some(Winding::Lv), GroundingMethod::Ungrounded, 0.0));
+    let (ig, note) = lv_ground_fault_a(&p);
+    assert_eq!(ig, 0.0);
+    assert!(note.unwrap().contains("no zero-sequence path"));
+
+    // A 480 V generator with an ungrounded neutral and no zero-sequence data.
+    let mut p = transformer(); p.buses.truncate(1); p.branches.clear(); p.buses[0].kv = 0.48;
+    p.sources[0].r0_over_r1 = 0.0; p.sources[0].x0_over_x1 = 0.0;
+    assert!(!p.validate().is_empty(), "solid grounding still needs a nonzero Z0");
+    p.neutral_grounding.push(grounded("grid", None, GroundingMethod::Ungrounded, 0.0));
+    assert!(p.validate().is_empty(), "{:?}", p.validate());
+    let f = fault::solve(&p, None).unwrap();
+    assert_eq!(f.buses[0].line_to_ground.as_ref().unwrap().symmetrical_ka, 0.0);
+    assert!(f.buses[0].three_phase.as_ref().unwrap().symmetrical_ka > 0.0);
+    assert!(f.buses[0].note.as_ref().unwrap().contains("no zero-sequence path"));
+    // A source neutral resistor alone defines the zero-sequence shunt.
+    p.neutral_grounding[0] = grounded("grid", None, GroundingMethod::Impedance, 0.48e3 / 3.0_f64.sqrt() / 5.0);
+    assert!(p.validate().is_empty(), "{:?}", p.validate());
+    let f = fault::solve(&p, None).unwrap();
+    assert!((f.buses[0].line_to_ground.as_ref().unwrap().symmetrical_ka * 1000.0 - 5.0).abs() < 0.01);
+}
+#[test]
+fn neutral_grounding_entries_are_validated() {
+    let base = || { let mut p = transformer(); p.buses[0].kv = 12.47; p.buses[1].kv = 0.48; p };
+    let cases: [(NeutralGrounding, &str); 7] = [
+        (grounded("t1", Some(Winding::Hv), GroundingMethod::Ungrounded, 0.0), "delta"),
+        (grounded("t1", None, GroundingMethod::Solid, 0.0), "needs winding"),
+        (grounded("grid", Some(Winding::Lv), GroundingMethod::Solid, 0.0), "no winding"),
+        (grounded("nothing", None, GroundingMethod::Solid, 0.0), "unknown source or transformer"),
+        (grounded("t1", Some(Winding::Lv), GroundingMethod::Impedance, 0.0), "positive r_ohm"),
+        (grounded("t1", Some(Winding::Lv), GroundingMethod::Impedance, -1.0), "nonnegative"),
+        (grounded("t1", Some(Winding::Lv), GroundingMethod::Solid, 5.0), "only to impedance"),
+    ];
+    for (entry, expected) in cases {
+        let mut p = base(); p.neutral_grounding.push(entry);
+        assert!(p.validate().iter().any(|e| e.contains(expected)), "{expected}: {:?}", p.validate());
+    }
+    let mut p = base();
+    p.neutral_grounding.push(grounded("t1", Some(Winding::Lv), GroundingMethod::Solid, 0.0));
+    p.neutral_grounding.push(grounded("t1", Some(Winding::Lv), GroundingMethod::Ungrounded, 0.0));
+    assert!(p.validate().iter().any(|e| e.contains("more than once")));
+    let mut p = base(); p.neutral_grounding.push(grounded("t1", Some(Winding::Lv), GroundingMethod::Impedance, f64::NAN));
+    assert!(!p.validate().is_empty());
+}
+#[test]
+fn legacy_json_without_grounding_is_solid_and_unchanged() {
+    let sample = Project::sample();
+    let json = serde_json::to_value(&sample).unwrap();
+    assert!(json.get("neutral_grounding").is_none());
+    let parsed: Project = serde_json::from_value(json).unwrap();
+    assert!(parsed.neutral_grounding.is_empty());
+    let a = fault::solve(&sample, None).unwrap();
+    let mut explicit = sample.clone();
+    explicit.neutral_grounding.push(grounded("t1", Some(Winding::Lv), GroundingMethod::Solid, 0.0));
+    explicit.neutral_grounding.push(grounded("grid", None, GroundingMethod::Solid, 0.0));
+    let b = fault::solve(&explicit, None).unwrap();
+    for (x, y) in a.buses.iter().zip(&b.buses) {
+        near(x.line_to_ground.as_ref().unwrap().symmetrical_ka, y.line_to_ground.as_ref().unwrap().symmetrical_ka, 0.0);
+    }
+    let text = serde_json::to_string(&explicit).unwrap();
+    let back: Project = serde_json::from_str(&text).unwrap();
+    assert_eq!(back.neutral_grounding, explicit.neutral_grounding);
+}
 fn pv_project() -> Project {
     let mut p = transformer();
     p.buses[0].kv = 13.8; p.buses[1].kv = 13.8;

@@ -39,6 +39,50 @@ pub struct Project {
     /// Inputs that were not on the source document. The text report prints every entry.
     #[serde(default)]
     pub assumptions: Vec<Assumption>,
+    /// Neutral grounding of sources and transformer wye windings. A source or
+    /// wye winding without an entry is solidly grounded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub neutral_grounding: Vec<NeutralGrounding>,
+}
+
+/// Neutral connection of one source or one transformer wye winding.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NeutralGrounding {
+    /// A source id or a transformer branch id.
+    pub element_id: String,
+    /// Transformer winding (`hv` or `lv`); omit for a source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winding: Option<Winding>,
+    pub method: GroundingMethod,
+    /// Neutral resistor/reactor in physical ohms; only for `impedance`.
+    #[serde(default)]
+    pub r_ohm: f64,
+    #[serde(default)]
+    pub x_ohm: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Winding {
+    Hv,
+    Lv,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroundingMethod {
+    /// Neutral bonded directly to ground (the default when no entry exists).
+    Solid,
+    /// Neutral grounded through `r_ohm + j x_ohm`; 3Zn enters the zero sequence.
+    Impedance,
+    /// No neutral connection; the winding or source has no zero-sequence path.
+    Ungrounded,
+}
+
+/// The rated winding voltage nearest a bus voltage on a logarithmic scale.
+pub fn nearest_winding_kv(bus_kv: f64, hv: f64, lv: f64) -> f64 {
+    if (bus_kv / hv).ln().abs() <= (bus_kv / lv).ln().abs() { hv } else { lv }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -478,6 +522,7 @@ impl Default for Project {
             arc_duration_cap_s: default_cap(),
             prefault: Prefault::Flat,
             assumptions: Vec::new(),
+            neutral_grounding: Vec::new(),
         }
     }
 }
@@ -493,6 +538,7 @@ impl Project {
             switches: Vec::new(),
             switch_groups: Vec::new(),
             operating_cases: Vec::new(),
+            neutral_grounding: Vec::new(),
             buses: vec![
                 Bus { id: "util".into(), name: "Utility".into(), kv: 12.47, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None },
                 Bus { id: "mcc".into(), name: "MCC-1".into(), kv: 0.48, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None },
@@ -647,6 +693,20 @@ impl Project {
     /// Branches without an explicit switch are always connected.
     pub fn branch_closed(&self, branch: &Branch) -> bool {
         self.switches.iter().find(|s| s.branch_id == branch.id).map_or(true, |s| s.closed)
+    }
+
+    /// Neutral grounding entered for a source (`winding: None`) or for one
+    /// transformer winding. None means solidly grounded.
+    pub fn grounding_of(&self, element_id: &str, winding: Option<Winding>) -> Option<&NeutralGrounding> {
+        self.neutral_grounding.iter().find(|g| g.element_id == element_id && g.winding == winding)
+    }
+
+    /// Whether a transformer's HV winding is on its `from` bus, judged from
+    /// the bus voltages as the network builder does.
+    pub fn transformer_hv_is_from(&self, branch: &Branch) -> Option<bool> {
+        let BranchKind::Transformer { hv_kv, lv_kv, .. } = branch.kind else { return None };
+        let from = self.bus(&branch.from)?.kv;
+        Some(nearest_winding_kv(from, hv_kv, lv_kv) == hv_kv)
     }
 
     /// Apply a named state to a project snapshot, retaining interlocks while
@@ -918,8 +978,53 @@ impl Project {
                 }
             }
         }
+        self.validate_grounding(&mut errors);
         self.validate_physical(&mut errors);
         errors
+    }
+
+    fn validate_grounding(&self, errors: &mut Vec<String>) {
+        let mut entered = std::collections::HashSet::new();
+        for g in &self.neutral_grounding {
+            let label = match g.winding {
+                Some(Winding::Hv) => format!("neutral grounding {} hv", g.element_id),
+                Some(Winding::Lv) => format!("neutral grounding {} lv", g.element_id),
+                None => format!("neutral grounding {}", g.element_id),
+            };
+            if !entered.insert((g.element_id.as_str(), g.winding)) {
+                errors.push(format!("{label} is entered more than once"));
+            }
+            if !(g.r_ohm.is_finite() && g.r_ohm >= 0.0 && g.x_ohm.is_finite() && g.x_ohm >= 0.0) {
+                errors.push(format!("{label}: r_ohm and x_ohm must be finite and nonnegative"));
+            }
+            let has_impedance = g.r_ohm > 0.0 || g.x_ohm > 0.0;
+            match g.method {
+                GroundingMethod::Impedance if !has_impedance => errors.push(format!("{label}: impedance grounding needs a positive r_ohm or x_ohm")),
+                GroundingMethod::Solid | GroundingMethod::Ungrounded if has_impedance => errors.push(format!("{label}: r_ohm/x_ohm apply only to impedance grounding")),
+                _ => {}
+            }
+            if self.sources.iter().any(|s| s.id == g.element_id) {
+                if g.winding.is_some() { errors.push(format!("{label}: a source takes no winding")); }
+            } else if let Some(branch) = self.branches.iter().find(|b| b.id == g.element_id && matches!(b.kind, BranchKind::Transformer { .. })) {
+                let BranchKind::Transformer { connection, .. } = branch.kind else { unreachable!() };
+                match (g.winding, self.transformer_hv_is_from(branch)) {
+                    (None, _) => errors.push(format!("{label}: a transformer entry needs winding hv or lv")),
+                    (Some(winding), Some(hv_is_from)) => {
+                        let on_from = (winding == Winding::Hv) == hv_is_from;
+                        let wye = match connection {
+                            XfmrConn::Dyn => !on_from,
+                            XfmrConn::Ynd => on_from,
+                            XfmrConn::Ynyn => true,
+                            XfmrConn::Dd => false,
+                        };
+                        if !wye { errors.push(format!("{label}: that winding is delta and has no neutral")); }
+                    }
+                    (Some(_), None) => {} // unknown terminal bus is reported for the branch
+                }
+            } else {
+                errors.push(format!("{label} references unknown source or transformer '{}'", g.element_id));
+            }
+        }
     }
 
     fn group_state_errors(&self, label: &str, switches: &[Switch]) -> Vec<String> {
@@ -972,10 +1077,15 @@ impl Project {
             }
         }
         for s in &self.sources {
+            // An ungrounded or impedance-grounded neutral has no zero (or a
+            // nonzero) zero-sequence shunt even when the source Z0 is zero.
+            let zero_sequence_defined = matches!(self.grounding_of(&s.id, None).map(|g| g.method),
+                Some(GroundingMethod::Ungrounded | GroundingMethod::Impedance))
+                || s.r0_over_r1 > 0.0 || s.xr * s.x0_over_x1 > 0.0;
             check(positive(s.mva_sc) && positive(s.v_pu) && nonnegative(s.xr)
                 && s.angle_deg.is_finite() && s.p_mw.is_finite()
                 && nonnegative(s.r0_over_r1) && nonnegative(s.x0_over_x1)
-                && (s.r0_over_r1 > 0.0 || s.xr * s.x0_over_x1 > 0.0), &s.id, "source impedance or voltage");
+                && zero_sequence_defined, &s.id, "source impedance or voltage");
             check(s.qmin_mvar.map_or(true, f64::is_finite) && s.qmax_mvar.map_or(true, f64::is_finite)
                 && s.qmin_mvar.unwrap_or(f64::NEG_INFINITY) <= s.qmax_mvar.unwrap_or(f64::INFINITY), &s.id, "reactive limits");
         }

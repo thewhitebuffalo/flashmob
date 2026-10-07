@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::cplx::Cplx;
-use crate::model::{zbase_ohm, Branch, BranchKind, Project, XfmrConn};
+use crate::model::{nearest_winding_kv, zbase_ohm, Branch, BranchKind, GroundingMethod, Project, Winding, XfmrConn};
 
 #[derive(Clone, Debug)]
 pub struct Index {
@@ -206,9 +206,11 @@ pub(crate) fn build_validated(project: &Project) -> Result<SystemModel, String> 
         let y1 = z1.inv().ok_or_else(|| format!("source '{}' has zero impedance", source.id))?;
         pos.shunt(i, y1);
         neg.shunt(i, y1);
-        let z0 = Cplx::new(z1.re * source.r0_over_r1, z1.im * source.x0_over_x1);
-        let y0 = z0.inv().ok_or_else(|| format!("source {}: invalid zero-sequence impedance", source.id))?;
-        zero.shunt(i, y0);
+        if let Neutral::Grounded(zn) = neutral(project, &source.id, None, index.kv[i]) {
+            let z0 = Cplx::new(z1.re * source.r0_over_r1, z1.im * source.x0_over_x1) + zn * 3.0;
+            let y0 = z0.inv().ok_or_else(|| format!("source {}: invalid zero-sequence impedance", source.id))?;
+            zero.shunt(i, y0);
+        }
     }
 
     // Only utility/generator sources energize islands; passive shunts and motors do not.
@@ -284,8 +286,8 @@ fn stamp_branch(project: &Project, index: &Index, branch: &Branch, warnings: &mu
             })
         }
         BranchKind::Transformer { kva, z_percent, xr, hv_kv, lv_kv, connection, tap_percent, x0_over_x1, r0_over_r1 } => {
-            let from_rated = nearest(index.kv[i], *hv_kv, *lv_kv);
-            let to_rated = nearest(index.kv[j], *hv_kv, *lv_kv);
+            let from_rated = nearest_winding_kv(index.kv[i], *hv_kv, *lv_kv);
+            let to_rated = nearest_winding_kv(index.kv[j], *hv_kv, *lv_kv);
             if (from_rated - to_rated).abs() < 1e-9 {
                 return Err(format!(
                     "transformer '{}' buses both match the {:.3} kV winding",
@@ -321,12 +323,22 @@ fn stamp_branch(project: &Project, index: &Index, branch: &Branch, warnings: &mu
             };
             let positive = quad(y1, Cplx::from_polar(a_mag, phi))?;
             let negative = quad(y1, Cplx::from_polar(a_mag, -phi))?;
+            // z0 is on the to-bus base. A neutral impedance Zn adds 3Zn in
+            // series with its own wye winding's zero-sequence path; a
+            // from-side quantity is referred to the to side by 1/a^2.
             let z0 = Cplx::new(z1.re * r0_over_r1, z1.im * x0_over_x1);
             if z0.inv().is_none() { return Err(format!("transformer {}: zero or non-finite zero-sequence impedance", branch.id)); }
-            let zero = match (connection, z0.inv()) {
-                (XfmrConn::Dyn, Some(y0)) => ZeroStamp::Shunt { bus_is_from: false, y: y0 },
-                (XfmrConn::Ynd, Some(y0)) => ZeroStamp::Shunt { bus_is_from: true, y: y0 * (1.0 / a_mag.powi(2)) },
-                (XfmrConn::Ynyn, Some(y0)) => ZeroStamp::Series(quad(y0, Cplx::real(a_mag))?),
+            let (from_winding, to_winding) = if from_is_hv { (Winding::Hv, Winding::Lv) } else { (Winding::Lv, Winding::Hv) };
+            let from_neutral = neutral(project, &branch.id, Some(from_winding), index.kv[i]);
+            let to_neutral = neutral(project, &branch.id, Some(to_winding), index.kv[j]);
+            let invert = |z: Cplx| z.inv().ok_or_else(|| format!("transformer {}: zero or non-finite zero-sequence impedance", branch.id));
+            let a2 = a_mag.powi(2);
+            let zero = match (connection, from_neutral, to_neutral) {
+                (XfmrConn::Dyn, _, Neutral::Grounded(zn)) => ZeroStamp::Shunt { bus_is_from: false, y: invert(z0 + zn * 3.0)? },
+                (XfmrConn::Ynd, Neutral::Grounded(zn), _) => ZeroStamp::Shunt { bus_is_from: true, y: invert(z0 * a2 + zn * 3.0)? },
+                (XfmrConn::Ynyn, Neutral::Grounded(zf), Neutral::Grounded(zt)) =>
+                    ZeroStamp::Series(quad(invert(z0 + zt * 3.0 + zf * (3.0 / a2))?, Cplx::real(a_mag))?),
+                // Delta windings, and wye windings with an ungrounded neutral, block zero sequence.
                 _ => ZeroStamp::Open,
             };
             Ok(BranchStamp {
@@ -340,6 +352,28 @@ fn stamp_branch(project: &Project, index: &Index, branch: &Branch, warnings: &mu
                 rating_kva: Some(*kva),
             })
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Neutral {
+    /// Neutral impedance in per unit on the system base at the given bus kV.
+    Grounded(Cplx),
+    Ungrounded,
+}
+
+/// Grounding of a source or transformer winding; no entry means solid.
+fn neutral(project: &Project, element_id: &str, winding: Option<Winding>, bus_kv: f64) -> Neutral {
+    match project.grounding_of(element_id, winding) {
+        None => Neutral::Grounded(Cplx::ZERO),
+        Some(g) => match g.method {
+            GroundingMethod::Solid => Neutral::Grounded(Cplx::ZERO),
+            GroundingMethod::Ungrounded => Neutral::Ungrounded,
+            GroundingMethod::Impedance => {
+                let zb = zbase_ohm(bus_kv, project.s_base_mva);
+                Neutral::Grounded(Cplx::new(g.r_ohm / zb, g.x_ohm / zb))
+            }
+        },
     }
 }
 
@@ -365,10 +399,6 @@ fn quad(y: Cplx, a: Cplx) -> Result<Quad, String> {
         ytf: -(y / a),
         ytt: y,
     })
-}
-
-fn nearest(bus_kv: f64, hv: f64, lv: f64) -> f64 {
-    if (bus_kv / hv).ln().abs() <= (bus_kv / lv).ln().abs() { hv } else { lv }
 }
 
 pub fn reaches_shunt(net: &Net) -> Vec<bool> {
