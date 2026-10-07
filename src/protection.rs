@@ -86,12 +86,21 @@ fn identify_with_index(project: &Project, bus: &str, index: &Index) -> Protectio
         let Some(edge) = device.protected_branch.as_ref().and_then(|id| project.branches.iter().find(|b| b.id == *id && project.branch_closed(b))) else { continue };
         if device.bus != edge.from && device.bus != edge.to { continue; }
         let Some(&hops) = distance.get(&device.bus) else { continue };
+        // Rank by where the opened branch sits, not by which of its terminals
+        // the device was entered at: a feeder breaker entered at its line-side
+        // bus still opens the branch nearest the fault. The fault-side end of
+        // the protected branch is the nearer of its two terminals.
+        let (Some(&from_hops), Some(&to_hops)) = (distance.get(&edge.from), distance.get(&edge.to)) else { continue };
+        let position = from_hops.min(to_hops);
         let (side, source_count) = &index.cuts[&edge.id];
         let remaining = if side.contains_key(bus) { *source_count }
             else { live_sources.len() - source_count };
-        if remaining == 0 { candidates.push((hops, device)); }
+        if remaining == 0 { candidates.push(((position, hops), device)); }
         else if remaining < live_sources.len() { partial.push(device.id.clone()); }
     }
+    // Innermost isolating branch first; a device at that branch's fault-side
+    // terminal before one at its source-side terminal. Only devices equal in
+    // both keys (same branch terminal, or equally placed parallel paths) tie.
     candidates.sort_by(|(a, x), (b, y)| a.cmp(b).then(x.id.cmp(&y.id)));
     let Some((nearest, _)) = candidates.first() else {
         if !partial.is_empty() {
@@ -103,7 +112,7 @@ fn identify_with_index(project: &Project, bus: &str, index: &Index) -> Protectio
         }
         return result;
     };
-    result.candidates = candidates.iter().filter(|(hops, _)| hops == nearest).map(|(_, d)| d.id.clone()).collect();
+    result.candidates = candidates.iter().filter(|(rank, _)| rank == nearest).map(|(_, d)| d.id.clone()).collect();
     if result.candidates.len() != 1 {
         result.status = "ambiguous".into();
         result.detail = format!("Equally near upstream devices: {}; resolve device locations or explicitly select the governing device.", result.candidates.join(", "));
@@ -187,6 +196,36 @@ mod tests {
         assert!(identify(&p, "pnl").device_id.is_none());
         p.devices[2].protected_branch = None;
         assert_eq!(identify(&p, "pnl").device_id.as_deref(), Some("brk-feeder"));
+    }
+
+    #[test]
+    fn feeder_breaker_is_identified_at_either_terminal_of_its_branch() {
+        // Sample feeder breaker entered at the load-side (pnl) terminal, then
+        // at its physical line-side (mcc) terminal, shared with the main breaker.
+        for (feeder_bus, reversed) in [("pnl", false), ("mcc", false), ("mcc", true)] {
+            let mut p = Project::sample();
+            p.devices.iter_mut().find(|d| d.id == "brk-feeder").unwrap().bus = feeder_bus.into();
+            if reversed {
+                for b in &mut p.branches { std::mem::swap(&mut b.from, &mut b.to); }
+                p.devices.reverse();
+            }
+            let pnl = identify(&p, "pnl");
+            assert_eq!(pnl.status, "identified", "{feeder_bus}: {:?}", pnl.candidates);
+            assert_eq!(pnl.device_id.as_deref(), Some("brk-feeder"), "{feeder_bus}");
+            assert_eq!(identify(&p, "mcc").device_id.as_deref(), Some("brk-main"), "{feeder_bus}");
+        }
+    }
+
+    #[test]
+    fn fault_side_terminal_device_precedes_source_side_device_on_same_branch() {
+        let mut p = radial();
+        let mut line_side = p.devices[1].clone();
+        line_side.id = "aa-line-side".into(); line_side.bus = "mcc".into(); p.devices.push(line_side);
+        assert_eq!(identify(&p, "pnl").device_id.as_deref(), Some("brk-feeder"));
+        p.devices.retain(|d| d.id != "brk-feeder");
+        assert_eq!(identify(&p, "pnl").device_id.as_deref(), Some("aa-line-side"));
+        let mut twin = p.devices[1].clone(); twin.id = "line-side-twin".into(); p.devices.push(twin);
+        assert_eq!(identify(&p, "pnl").status, "ambiguous");
     }
 
     #[test]
