@@ -34,12 +34,25 @@ struct App {
     tab: Tab,
     selected: Option<String>,
     status: String,
+    /// A failed open/export. Shown prominently until dismissed or replaced by a
+    /// successful open; running a study never overwrites it.
+    error: Option<String>,
     show_warnings: bool,
     zoom: f32,
     /// Top-left of the diagram, in points inside the fixed one-line panel.
     pan: Vec2,
     fit_view: bool,
     tcc_kv: f64,
+    /// Derived from `project` and `results`; cleared whenever either changes.
+    diagram: Option<sld::Diagram>,
+    /// TCC for the reference voltage it was drawn at; cleared with the diagram.
+    tcc_plot: Option<(f64, Result<TccPlot, String>)>,
+}
+
+fn read_project_file(path: &std::path::Path) -> Result<Project, String> {
+    std::fs::read_to_string(path)
+        .map_err(|err| err.to_string())
+        .and_then(|text| flashmob::exec::load_project(&text))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -53,41 +66,52 @@ enum Tab {
 
 impl App {
     fn new(path: Option<std::path::PathBuf>) -> Self {
-        let opened = path.as_ref().and_then(|path| {
-            std::fs::read_to_string(path)
-                .map_err(|err| err.to_string())
-                .and_then(|text| flashmob::exec::load_project(&text))
-                .ok()
-                .map(|project| (path.clone(), project))
-        });
-        let failed = path.filter(|_| opened.is_none());
         let mut app = Self {
             project: Project::sample(),
             results: None,
             tab: Tab::Sld,
             selected: None,
-            status: "Sample plant is loaded. Short circuit and arc flash are on the one-line.".into(),
+            status: String::new(),
+            error: None,
             show_warnings: false,
             zoom: 1.0,
             pan: Vec2::ZERO,
             fit_view: true,
             tcc_kv: 0.48,
+            diagram: None,
+            tcc_plot: None,
         };
-        if let Some((path, project)) = opened {
-            app.project = project;
-            app.run_study();
-            app.status = format!("Opened {}. {}", path.display(), app.status);
-        } else if let Some(path) = failed {
-            app.status = format!("Could not open {}", path.display());
-            app.run_study();
-        } else {
-            app.run_study();
+        match path {
+            Some(path) => match read_project_file(&path) {
+                Ok(project) => {
+                    app.project = project;
+                    app.run_study();
+                    app.status = format!("Opened {}. {}", path.display(), app.status);
+                }
+                Err(err) => {
+                    // Do not substitute the sample for the file the user asked for.
+                    app.project = Project::default();
+                    app.error = Some(format!("Could not open {}: {err}", path.display()));
+                    app.status = "No project loaded. Use Open to retry or Sample for the built-in example.".into();
+                }
+            },
+            None => {
+                app.run_study();
+                app.status = format!("Built-in sample plant loaded. {}", app.status);
+            }
         }
         app
     }
 
-    fn run_study(&mut self) {
+    /// Drop results and every view derived from them (call after any model edit).
+    fn invalidate(&mut self) {
         self.results = None;
+        self.diagram = None;
+        self.tcc_plot = None;
+    }
+
+    fn run_study(&mut self) {
+        self.invalidate();
         match study::run(&self.project, Studies::all()) {
             Ok(results) => {
                 let ms = results.elapsed_ms;
@@ -153,7 +177,9 @@ impl eframe::App for App {
                     self.project = Project::sample();
                     self.selected = None;
                     self.fit_view = true;
+                    self.error = None;
                     self.run_study();
+                    self.status = format!("Built-in sample plant loaded. {}", self.status);
                 }
                 if ui.button("Open").clicked() {
                     self.open();
@@ -187,6 +213,14 @@ impl eframe::App for App {
             });
         });
         egui::Panel::bottom("status").show(ui, |ui| {
+            let mut dismiss = false;
+            if let Some(error) = &self.error {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("ERROR: {error}")).strong().size(14.0).color(color("#FF5555")));
+                    dismiss = ui.button("Dismiss").clicked();
+                });
+            }
+            if dismiss { self.error = None; }
             ui.horizontal(|ui| {
                 let n = self.results.as_ref().map(|r| r.warnings.len()).unwrap_or(0);
                 if n > 0 {
@@ -215,11 +249,21 @@ impl eframe::App for App {
 
 impl App {
     fn sld(&mut self, ui: &mut egui::Ui) {
-        let Some(results) = self.results.clone() else {
+        if self.diagram.is_none() {
+            if let Some(results) = &self.results {
+                self.diagram = Some(sld::diagram(&self.project, results));
+            }
+        }
+        // Taken for this frame and put back at the end; rebuilt only after results change.
+        let Some(diagram) = self.diagram.take() else {
             ui.label("Run the study to draw the one-line.");
             return;
         };
-        let diagram = sld::diagram(&self.project, &results);
+        self.draw_sld(ui, &diagram);
+        self.diagram = Some(diagram);
+    }
+
+    fn draw_sld(&mut self, ui: &mut egui::Ui, diagram: &sld::Diagram) {
         let old_zoom = self.zoom;
         let mut slider_changed = false;
         ui.horizontal(|ui| {
@@ -265,22 +309,48 @@ impl App {
         let map = |x: f64, y: f64| origin + Vec2::new(x as f32, y as f32) * z;
         draw_diagram_grid(&painter, rect, origin, z);
         let ink = color("#E2E8F0");
+        let warn = color("#FFB300");
         for branch in &diagram.branches {
             let stroke = Stroke::new((2.0 * z).clamp(0.8, 2.0), ink);
-            let pts = branch.points();
-            for pair in pts.windows(2) {
-                painter.line_segment([map(pair[0].0, pair[0].1), map(pair[1].0, pair[1].1)], stroke);
+            let pts: Vec<Pos2> = branch.points().iter().map(|&(x, y)| map(x, y)).collect();
+            if branch.closed {
+                for pair in pts.windows(2) {
+                    painter.line_segment([pair[0], pair[1]], stroke);
+                }
+            } else {
+                // Normally open: dashed, dimmed.
+                let dashed = Stroke::new(stroke.width, ink.gamma_multiply(0.6));
+                painter.extend(egui::Shape::dashed_line(&pts, dashed, (8.0 * z).max(2.0), (6.0 * z).max(2.0)));
             }
             let (wx, wy) = branch.winding_at();
             if branch.transformer {
                 painter.circle_stroke(map(wx, wy - 10.0), 12.0 * z, stroke);
                 painter.circle_stroke(map(wx, wy + 10.0), 12.0 * z, stroke);
             }
-            if branch.protector != "none" {
-                let (dx, dy) = branch.device_at();
-                let h = if branch.protector == "switch" { 10.0 } else { 14.0 };
-                let box_rect = Rect::from_center_size(map(dx, dy), Vec2::new(14.0, h) * z);
-                painter.rect_stroke(box_rect, 0.0, stroke, egui::StrokeKind::Inside);
+            let (dx, dy) = branch.device_at();
+            match branch.protector.as_str() {
+                "breaker" => {
+                    let box_rect = Rect::from_center_size(map(dx, dy), Vec2::splat(14.0) * z);
+                    painter.rect_filled(box_rect, 0.0, color("#0A0C10"));
+                    painter.rect_stroke(box_rect, 0.0, stroke, egui::StrokeKind::Inside);
+                }
+                "fuse" => {
+                    let body = Rect::from_center_size(map(dx, dy), Vec2::new(8.0, 18.0) * z);
+                    painter.rect_filled(body, 0.0, color("#0A0C10"));
+                    painter.rect_stroke(body, 0.0, stroke, egui::StrokeKind::Inside);
+                    painter.line_segment([map(dx, dy - 9.0), map(dx, dy + 9.0)], stroke);
+                }
+                "switch" => draw_switch(&painter, map, dx, dy, branch.closed, z),
+                _ => {}
+            }
+            if !branch.closed {
+                let (sx, sy) = branch.switch_at();
+                if branch.protector != "switch" { draw_switch(&painter, map, sx, sy, false, z); }
+                if diagram_detail(z) != DiagramDetail::Overview {
+                    let label = Rect::from_min_size(map(sx + 14.0, sy - 6.0), Vec2::new(150.0, 14.0) * z);
+                    let text = match &branch.switch_name { Some(name) => format!("N.O. {}", name.to_uppercase()), None => "N.O.".into() };
+                    paint_diagram_line(&painter, label, &text, 10.0 * z, warn);
+                }
             }
             if diagram_detail(z) == DiagramDetail::Full {
                 let label = Rect::from_min_size(map(wx + 20.0, wy - 8.0), Vec2::new(140.0, 18.0) * z);
@@ -307,7 +377,9 @@ impl App {
                 for arc in &bus.arcs {
                     ui.label(format!("{}: {:.2} cal/cm² · AFB {:.1} in · {:.3} s", arc.name, arc.cal_cm2, arc.afb_in, arc.time_s));
                 }
+                for worst in &bus.worst { ui.label(format!("{}: {}", worst.equipment_id, worst.label())); }
                 for failure in &bus.arc_failures { ui.label(format!("Arc flash FAILED: {failure}")); }
+                if bus.source_out_of_service { ui.label("Source out of service in the normal state."); }
                 ui.weak("Click to inspect this bus.");
             });
         }
@@ -399,19 +471,26 @@ impl App {
     fn tcc(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("Refer current to");
-            ui.add(egui::DragValue::new(&mut self.tcc_kv).speed(0.01).range(0.05..=40.0).suffix(" kV"));
+            // Wide range; existing values are never rewritten by the widget.
+            ui.add(egui::DragValue::new(&mut self.tcc_kv).speed(0.01).range(0.001..=1000.0).clamp_existing_to_range(false).suffix(" kV"));
         });
-        let Some(results) = self.results.clone() else {
+        let Some(results) = &self.results else {
             ui.label("Run the study before drawing curves.");
             return;
         };
-        let plot = match tcc::plot(&self.project, Some(&results), Some(self.tcc_kv), &[]) {
-            Ok(p) => p, Err(e) => { ui.label(e); return; }
-        };
-        egui::ScrollArea::both().show(ui, |ui| {
-            let (rect, _) = ui.allocate_exact_size(Vec2::new(980.0, 680.0), Sense::hover());
-            draw_tcc(ui, rect, &plot);
-        });
+        if self.tcc_plot.as_ref().map_or(true, |(kv, _)| *kv != self.tcc_kv) {
+            self.tcc_plot = Some((self.tcc_kv, tcc::plot(&self.project, Some(results), Some(self.tcc_kv), &[])));
+        }
+        match &self.tcc_plot {
+            Some((_, Ok(plot))) => {
+                egui::ScrollArea::both().show(ui, |ui| {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::new(980.0, 680.0), Sense::hover());
+                    draw_tcc(ui, rect, plot);
+                });
+            }
+            Some((_, Err(err))) => { ui.label(err.as_str()); }
+            None => {}
+        }
     }
 
     fn inspector(&mut self, ui: &mut egui::Ui) {
@@ -425,14 +504,15 @@ impl App {
             ui.label(RichText::new(&bus.name).strong());
             ui.horizontal(|ui| {
                 ui.label("kV");
-                edited |= ui.add(egui::DragValue::new(&mut bus.kv).speed(0.01).range(0.05..=40.0)).changed();
+                // A wide drag range that never rewrites an existing value; validate() owns limits.
+                edited |= ui.add(egui::DragValue::new(&mut bus.kv).speed(0.01).range(0.001..=1000.0).clamp_existing_to_range(false)).changed();
             });
             (bus.name.clone(), bus.kv)
         }) else {
             ui.label("That bus is no longer in the project.");
             return;
         };
-        if edited { self.results = None; self.status = "Results stale — model edited; run the study".into(); }
+        if edited { self.invalidate(); self.status = "Results stale — model edited; run the study".into(); }
         if let Some(results) = &self.results {
             if let Some(protection) = results.protection.iter().find(|p| p.bus_id == id) {
                 ui.separator();
@@ -463,6 +543,24 @@ impl App {
                     }
                 }
             }
+            if !results.operating_cases.is_empty() {
+                if let Some(envelope) = &results.worst_case {
+                    for item in envelope.arc_equipment.iter().filter(|e| e.bus_id == id) {
+                        ui.separator();
+                        ui.label(RichText::new(format!("Worst case · {}", item.equipment_id)).strong());
+                        match &item.incident_energy_cal_cm2 {
+                            Some(max) => { ui.label(RichText::new(format!("{:.2} cal/cm²  (case {})", max.value, max.case_id)).color(color(sld::energy_color(max.value)))); }
+                            None => { ui.label("Incident energy unavailable in every case."); }
+                        }
+                        if let Some(max) = &item.boundary_mm {
+                            ui.label(format!("AFB {:.0} in  (case {})", max.value / 25.4, max.case_id));
+                        }
+                        if !item.complete {
+                            ui.label(RichText::new(format!("INCOMPLETE — failed cases: {}", item.failed_case_ids.join(", "))).color(color("#FFB300")));
+                        }
+                    }
+                }
+            }
         }
         ui.separator();
         ui.label(RichText::new(format!("{name}  {kv:.3} kV")).weak());
@@ -471,14 +569,17 @@ impl App {
 
     fn open(&mut self) {
         if let Some(path) = rfd::FileDialog::new().add_filter("Flashmob project", &["json"]).pick_file() {
-            match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| flashmob::exec::load_project(&t)) {
+            match read_project_file(&path) {
                 Ok(project) => {
                     self.project = project;
                     self.selected = None;
                     self.fit_view = true;
+                    self.error = None;
                     self.run_study();
+                    self.status = format!("Opened {}. {}", path.display(), self.status);
                 }
-                Err(err) => self.status = err,
+                // The current project stays loaded; the failure stays visible.
+                Err(err) => self.error = Some(format!("Could not open {}: {err}", path.display())),
             }
         }
     }
@@ -504,16 +605,28 @@ impl App {
         }
         let Some(results) = &self.results else { return };
         if let Some(path) = rfd::FileDialog::new().set_file_name("flashmob-sld.svg").save_file() {
-            let svg = sld::to_svg(&sld::diagram(&self.project, results));
-            self.status = write_status(&path, &svg);
+            let svg = match &self.diagram {
+                Some(diagram) => sld::to_svg(diagram),
+                None => sld::to_svg(&sld::diagram(&self.project, results)),
+            };
+            match write_status(&path, &svg) {
+                Ok(message) => self.status = message,
+                Err(err) => self.error = Some(err),
+            }
         }
     }
 
     fn export_skm(&mut self) {
+        let errors = self.project.validate();
+        if !errors.is_empty() {
+            self.error = Some(format!("SKM export refused, project is invalid: {}", errors.join("; ")));
+            return;
+        }
         if let Some(path) = rfd::FileDialog::new().pick_folder() {
-            match flashmob::skm::write_dir(&self.project, &path) {
+            // Never replace existing files silently; ask for an empty folder instead.
+            match flashmob::skm::write_dir(&self.project, &path, flashmob::skm::WriteOptions::default()) {
                 Ok(dir) => self.status = format!("SKM export written to {}", dir.display()),
-                Err(err) => self.status = err,
+                Err(err) => self.error = Some(format!("SKM export failed: {err}")),
             }
         }
     }
@@ -527,12 +640,15 @@ impl App {
             Ok(p) => p, Err(e) => { self.status = e; return; }
         };
         if let Some(path) = rfd::FileDialog::new().set_file_name("flashmob-tcc.svg").save_file() {
-            self.status = write_status(&path, &tcc::to_svg(&plot));
             let csv_path = path.with_extension("csv");
-            if let Err(err) = std::fs::write(&csv_path, tcc::to_csv(&plot)) {
-                self.status = err.to_string();
-            } else {
-                self.status = format!("Wrote {} and {}", path.display(), csv_path.display());
+            let svg = std::fs::write(&path, tcc::to_svg(&plot)).map_err(|err| format!("could not write {}: {err}", path.display()));
+            let csv = std::fs::write(&csv_path, tcc::to_csv(&plot)).map_err(|err| format!("could not write {}: {err}", csv_path.display()));
+            // Report both outcomes; one success never hides the other failure.
+            match (svg, csv) {
+                (Ok(()), Ok(())) => self.status = format!("Wrote {} and {}", path.display(), csv_path.display()),
+                (Ok(()), Err(err)) => { self.status = format!("Wrote {}", path.display()); self.error = Some(err); }
+                (Err(err), Ok(())) => { self.status = format!("Wrote {}", csv_path.display()); self.error = Some(err); }
+                (Err(a), Err(b)) => self.error = Some(format!("{a}; {b}")),
             }
         }
     }
@@ -591,7 +707,16 @@ fn draw_bus(painter: &egui::Painter, bus: &sld::BusGlyph, origin: Pos2, z: f32, 
     let map = |x: f64, y: f64| origin + Vec2::new(x as f32, y as f32) * z;
     let ink = if selected { color("#00FF66") } else { color("#E2E8F0") };
     let stroke = Stroke::new((1.6 * z).clamp(0.8, 2.0), ink);
-    if bus.source { painter.circle_stroke(map(bus.x - 112.0, bus.y), 16.0 * z, stroke); }
+    if bus.source && bus.source_out_of_service {
+        let grey = Stroke::new(stroke.width, color("#64748B"));
+        painter.circle_stroke(map(bus.x - 112.0, bus.y), 16.0 * z, grey);
+        if diagram_detail(z) != DiagramDetail::Overview {
+            let label = Rect::from_min_size(map(bus.x - 150.0, bus.y + 22.0), Vec2::new(150.0, 14.0) * z);
+            paint_diagram_line(painter, label, "SOURCE OUT OF SERVICE", 10.0 * z, color("#64748B"));
+        }
+    } else if bus.source {
+        painter.circle_stroke(map(bus.x - 112.0, bus.y), 16.0 * z, stroke);
+    }
     if selected { painter.circle_stroke(map(bus.x, bus.y), (14.0 * z).max(4.0), Stroke::new(1.5, ink)); }
     painter.line_segment([map(bus.x - 80.0, bus.y), map(bus.x + 80.0, bus.y)], Stroke::new((4.0 * z).clamp(1.0, 6.0), ink));
     let detail = diagram_detail(z);
@@ -629,7 +754,21 @@ fn draw_bus(painter: &egui::Painter, bus: &sld::BusGlyph, origin: Pos2, z: f32, 
         line(format!("{:.1} CAL/CM2", arc.cal_cm2), size, color(sld::energy_color(arc.cal_cm2)));
         line(format!("AFB {:.0} IN  {:.3} S{}", arc.afb_in, arc.time_s, if arc.assumed { " ASSUMED" } else { "" }), size, data);
     }
+    for worst in &bus.worst {
+        let hot = !worst.complete || worst.cal_cm2.is_some_and(|c| c >= 8.0);
+        line(worst.label(), size, if hot { color("#FFB300") } else { data });
+    }
     if !bus.arc_failures.is_empty() { line("ARC FLASH FAILED".into(), size, color("#FFB300")); }
+}
+
+/// Disconnect switch: two contacts and a blade, in line when closed, angled and amber when open.
+fn draw_switch(painter: &egui::Painter, map: impl Fn(f64, f64) -> Pos2, x: f64, y: f64, closed: bool, z: f32) {
+    let ink = if closed { color("#E2E8F0") } else { color("#FFB300") };
+    painter.rect_filled(Rect::from_center_size(map(x, y), Vec2::new(14.0, 18.0) * z), 0.0, color("#0A0C10"));
+    painter.circle_filled(map(x, y - 7.0), (2.0 * z).max(1.0), color("#E2E8F0"));
+    painter.circle_filled(map(x, y + 7.0), (2.0 * z).max(1.0), color("#E2E8F0"));
+    let tip = if closed { map(x, y - 7.0) } else { map(x + 9.0, y - 5.0) };
+    painter.line_segment([map(x, y + 7.0), tip], Stroke::new((1.6 * z).clamp(0.8, 2.0), ink));
 }
 
 fn bus_hit_rect(bus: &sld::BusGlyph, origin: Pos2, z: f32) -> Rect {
@@ -643,6 +782,11 @@ fn bus_card_at(bus: &sld::BusGlyph, origin: Pos2, z: f32) -> Rect {
     let top = origin + Vec2::new((bus.x + 96.0) as f32, (bus.y - 16.0) as f32) * z;
     Rect::from_min_size(top, Vec2::new(210.0, bus.card_h as f32) * z)
 }
+
+/// Dark-theme TCC palette (the SVG export uses `tcc::SVG_COLORS` on a light background).
+const GUI_CURVE_COLORS: [&str; 6] = ["#E2E8F0", "#00FF66", "#FFB300", "#38BDF8", "#F472B6", "#A3E635"];
+const GUI_FAULT_MARKER: &str = "#94A3B8";
+const GUI_ARC_MARKER: &str = "#FB923C";
 
 fn draw_tcc(ui: &egui::Ui, rect: Rect, plot: &TccPlot) {
     let painter = ui.painter_at(rect);
@@ -679,17 +823,26 @@ fn draw_tcc(ui: &egui::Ui, rect: Rect, plot: &TccPlot) {
             continue;
         }
         let x = x_of(marker.amps);
-        painter.line_segment(
-            [Pos2::new(x, plot_rect.top()), Pos2::new(x, plot_rect.bottom())],
-            Stroke::new(1.0, color(marker.color)),
-        );
+        // The SVG marker colors are for a light background; use the dark-theme set here.
+        let (ink, dash) = match marker.kind {
+            tcc::MarkerKind::Fault => (color(GUI_FAULT_MARKER), 4.0),
+            tcc::MarkerKind::Arc => (color(GUI_ARC_MARKER), 4.0),
+            tcc::MarkerKind::ArcAssumed => (color(GUI_ARC_MARKER), 1.5),
+        };
+        painter.extend(egui::Shape::dashed_line(
+            &[Pos2::new(x, plot_rect.top()), Pos2::new(x, plot_rect.bottom())],
+            Stroke::new(1.2, ink),
+            dash,
+            3.0,
+        ));
     }
-    for curve in &plot.curves {
+    for (n, curve) in plot.curves.iter().enumerate() {
+        let ink = color(GUI_CURVE_COLORS[n % GUI_CURVE_COLORS.len()]);
         let mut points = Vec::new();
         for (amp, time) in &curve.points {
             if *amp < plot.i_min || *amp > plot.i_max || *time < plot.t_min || *time > plot.t_max {
                 if points.len() > 1 {
-                    painter.add(egui::Shape::line(points.clone(), Stroke::new(2.2, color(curve.color))));
+                    painter.add(egui::Shape::line(points.clone(), Stroke::new(2.2, ink)));
                 }
                 points.clear();
                 continue;
@@ -697,12 +850,13 @@ fn draw_tcc(ui: &egui::Ui, rect: Rect, plot: &TccPlot) {
             points.push(Pos2::new(x_of(*amp), y_of(*time)));
         }
         if points.len() > 1 {
-            painter.add(egui::Shape::line(points, Stroke::new(2.2, color(curve.color))));
+            painter.add(egui::Shape::line(points, Stroke::new(2.2, ink)));
         }
     }
     let mut y = plot_rect.top();
-    for curve in &plot.curves {
-        painter.line_segment([Pos2::new(plot_rect.right() + 16.0, y + 8.0), Pos2::new(plot_rect.right() + 36.0, y + 8.0)], Stroke::new(2.4, color(curve.color)));
+    for (n, curve) in plot.curves.iter().enumerate() {
+        let ink = color(GUI_CURVE_COLORS[n % GUI_CURVE_COLORS.len()]);
+        painter.line_segment([Pos2::new(plot_rect.right() + 16.0, y + 8.0), Pos2::new(plot_rect.right() + 36.0, y + 8.0)], Stroke::new(2.4, ink));
         painter.text(Pos2::new(plot_rect.right() + 42.0, y), Align2::LEFT_TOP, curve.name.to_uppercase(), FontId::monospace(11.0), color("#E2E8F0"));
         y += 20.0;
     }
@@ -752,10 +906,10 @@ fn color(hex: &str) -> Color32 {
     Color32::from_rgb((n >> 16) as u8, (n >> 8) as u8, n as u8)
 }
 
-fn write_status(path: &std::path::Path, text: &str) -> String {
+fn write_status(path: &std::path::Path, text: &str) -> Result<String, String> {
     match std::fs::write(path, text) {
-        Ok(()) => format!("Wrote {}", path.display()),
-        Err(err) => err.to_string(),
+        Ok(()) => Ok(format!("Wrote {}", path.display())),
+        Err(err) => Err(format!("could not write {}: {err}", path.display())),
     }
 }
 
