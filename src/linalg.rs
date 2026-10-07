@@ -2,10 +2,17 @@ use faer::linalg::solvers::Solve;
 use faer::sparse::linalg::solvers::Lu;
 use faer::sparse::{SparseColMat, Triplet};
 
+/// Largest accepted relative residual `max|Ax-b| / max|b|` after a solve.
+/// Partial-pivoting LU is backward stable, so a residual above this indicates a
+/// numerically singular factorization rather than ordinary roundoff.
+pub const MAX_RELATIVE_RESIDUAL: f64 = 1e-6;
+
 /// Owned factorization, reusable for any right-hand side of the same matrix.
 pub struct SparseFactor {
     n: usize,
     lu: Option<Lu<usize, f64>>,
+    /// Nonzero entries retained for the post-solve residual check.
+    entries: Vec<(usize, usize, f64)>,
 }
 
 impl SparseFactor {
@@ -13,7 +20,7 @@ impl SparseFactor {
         if triplets.iter().any(|&(r, c, v)| r >= n || c >= n || !v.is_finite()) {
             return Err("matrix or right-hand side contains invalid indices or non-finite values".into());
         }
-        if n == 0 { return Ok(Self { n, lu: None }); }
+        if n == 0 { return Ok(Self { n, lu: None, entries: Vec::new() }); }
         let trips: Vec<Triplet<usize, usize, f64>> = triplets.iter().copied()
             .filter(|(_, _, v)| *v != 0.0)
             .map(|(r, c, v)| Triplet::new(r, c, v)).collect();
@@ -22,7 +29,8 @@ impl SparseFactor {
             .map_err(|err| format!("could not build the network matrix: {err}"))?;
         let lu = mat.sp_lu()
             .map_err(|err| format!("the network matrix is singular: {err}"))?;
-        Ok(Self { n, lu: Some(lu) })
+        let entries = trips.iter().map(|t| (t.row, t.col, t.val)).collect();
+        Ok(Self { n, lu: Some(lu), entries })
     }
 
     pub fn solve(&self, b: &[f64]) -> Result<Vec<f64>, String> {
@@ -37,8 +45,24 @@ impl SparseFactor {
         let x = lu.solve(&rhs);
         let out: Vec<f64> = (0..self.n).map(|i| x[i]).collect();
         if out.iter().any(|v| !v.is_finite()) { return Err("non-finite linear solution".into()); }
+        // Cheap O(nnz) guard against a numerically singular factorization
+        // that still returns finite values.
+        let residual = relative_residual(self.n, &self.entries, &out, b);
+        if !(residual <= MAX_RELATIVE_RESIDUAL) {
+            return Err(format!("the network matrix is numerically singular (relative residual {residual:.1e})"));
+        }
         Ok(out)
     }
+}
+
+/// Relative infinity-norm residual `max|Ax-b| / max|b|`. Duplicate entries are
+/// summed. A zero right-hand side gives zero only for an exact zero residual.
+pub fn relative_residual(n: usize, entries: &[(usize, usize, f64)], x: &[f64], b: &[f64]) -> f64 {
+    let mut ax = vec![0.0; n];
+    for &(r, c, v) in entries { ax[r] += v * x[c]; }
+    let num = ax.iter().zip(b).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+    let den = b.iter().map(|v| v.abs()).fold(0.0, f64::max);
+    if den == 0.0 { if num == 0.0 { 0.0 } else { f64::INFINITY } } else { num / den }
 }
 
 /// Solve `A x = b` with a sparse LU factorization. Duplicate triplets are summed.
@@ -64,5 +88,21 @@ mod tests {
         assert!(SparseFactor::new(1, &[(1, 0, 1.0)]).is_err());
         assert!(SparseFactor::new(1, &[(0, 0, f64::INFINITY)]).is_err());
         assert!(SparseFactor::new(0, &[]).unwrap().solve(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn residual_check_accepts_good_solutions_and_flags_bad_ones() {
+        let entries = [(0, 0, 2.0), (0, 1, 1.0), (1, 0, 1.0), (1, 1, 3.0)];
+        let b = [3.0, 4.0];
+        assert!(relative_residual(2, &entries, &[1.0, 1.0], &b) < 1e-15);
+        assert!(relative_residual(2, &entries, &[1.0, 1.1], &b) > MAX_RELATIVE_RESIDUAL);
+        assert_eq!(relative_residual(2, &entries, &[0.0, 0.0], &[0.0, 0.0]), 0.0);
+        assert_eq!(relative_residual(2, &entries, &[1.0, 0.0], &[0.0, 0.0]), f64::INFINITY);
+        let x = SparseFactor::new(2, &entries).unwrap().solve(&b).unwrap();
+        assert!((x[0] - 1.0).abs() < 1e-14 && (x[1] - 1.0).abs() < 1e-14);
+        // Singular once rounded: the factorization or the residual guard must
+        // refuse it rather than return a silent answer.
+        let singular = [(0, 0, 1.0), (0, 1, 1.0), (1, 0, 1.0), (1, 1, 1.0 + 1e-17)];
+        assert!(SparseFactor::new(2, &singular).and_then(|f| f.solve(&[1.0, 2.0])).is_err());
     }
 }

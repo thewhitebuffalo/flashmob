@@ -39,6 +39,50 @@ pub struct Project {
     /// Inputs that were not on the source document. The text report prints every entry.
     #[serde(default)]
     pub assumptions: Vec<Assumption>,
+    /// Neutral grounding of sources and transformer wye windings. A source or
+    /// wye winding without an entry is solidly grounded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub neutral_grounding: Vec<NeutralGrounding>,
+}
+
+/// Neutral connection of one source or one transformer wye winding.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NeutralGrounding {
+    /// A source id or a transformer branch id.
+    pub element_id: String,
+    /// Transformer winding (`hv` or `lv`); omit for a source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winding: Option<Winding>,
+    pub method: GroundingMethod,
+    /// Neutral resistor/reactor in physical ohms; only for `impedance`.
+    #[serde(default)]
+    pub r_ohm: f64,
+    #[serde(default)]
+    pub x_ohm: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Winding {
+    Hv,
+    Lv,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroundingMethod {
+    /// Neutral bonded directly to ground (the default when no entry exists).
+    Solid,
+    /// Neutral grounded through `r_ohm + j x_ohm`; 3Zn enters the zero sequence.
+    Impedance,
+    /// No neutral connection; the winding or source has no zero-sequence path.
+    Ungrounded,
+}
+
+/// The rated winding voltage nearest a bus voltage on a logarithmic scale.
+pub fn nearest_winding_kv(bus_kv: f64, hv: f64, lv: f64) -> f64 {
+    if (bus_kv / hv).ln().abs() <= (bus_kv / lv).ln().abs() { hv } else { lv }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -117,7 +161,9 @@ pub enum BranchKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum XfmrConn {
-    /// From-bus delta, to-bus grounded wye. Positive-sequence from-side leads by 30°.
+    /// From-bus delta, to-bus grounded wye. The phase shift follows ANSI
+    /// C57.12.00 (HV positive sequence leads LV by 30°) for either winding
+    /// arrangement and either branch orientation.
     Dyn,
     /// From-bus grounded wye, to-bus delta.
     Ynd,
@@ -140,39 +186,102 @@ pub struct Load {
     pub basis: String,
 }
 
+/// JSON shape is unchanged from the plain derive; `defaulted` records which
+/// engineering inputs were omitted so the assumption can be reported.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "SourceWire", into = "SourceWire")]
 pub struct Source {
     pub id: String,
     pub name: String,
     pub bus: String,
     /// Whether this utility or generator is available in the current state.
-    #[serde(default = "default_true")]
     pub in_service: bool,
-    #[serde(default = "default_vpu")]
     pub v_pu: f64,
-    #[serde(default)]
     pub angle_deg: f64,
     pub mva_sc: f64,
     /// Optional symmetrical three-phase short-circuit current profile at this
     /// source's terminals. Ratios are relative to the initial `mva_sc` value.
     /// An empty profile retains a constant source strength.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub decrement_curve: Vec<DecrementPoint>,
     pub xr: f64,
-    #[serde(default = "default_one")]
+    /// Defaults to 1.0 when omitted (reported as an assumption).
     pub x0_over_x1: f64,
-    #[serde(default = "default_one")]
+    /// Defaults to 1.0 when omitted (reported as an assumption).
     pub r0_over_r1: f64,
-    #[serde(default)]
     pub is_slack: bool,
     /// Positive is generation. Ignored on the slack bus.
-    #[serde(default)]
     pub p_mw: f64,
-    #[serde(default)]
     pub qmin_mvar: Option<f64>,
-    #[serde(default)]
     pub qmax_mvar: Option<f64>,
+    /// Names of fields omitted from the input and filled with defaults. Not a
+    /// JSON field: a defaulted value that is still at its default is omitted
+    /// again when saved, so the assumption stays visible.
+    pub defaulted: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceWire {
+    id: String,
+    name: String,
+    bus: String,
+    #[serde(default = "default_true")]
+    in_service: bool,
+    #[serde(default = "default_vpu")]
+    v_pu: f64,
+    #[serde(default)]
+    angle_deg: f64,
+    mva_sc: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    decrement_curve: Vec<DecrementPoint>,
+    xr: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    x0_over_x1: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    r0_over_r1: Option<f64>,
+    #[serde(default)]
+    is_slack: bool,
+    #[serde(default)]
+    p_mw: f64,
+    #[serde(default)]
+    qmin_mvar: Option<f64>,
+    #[serde(default)]
+    qmax_mvar: Option<f64>,
+}
+
+/// Take an entered value, or record the field as defaulted.
+fn entered_or(value: Option<f64>, name: &str, default: f64, defaulted: &mut Vec<String>) -> f64 {
+    value.unwrap_or_else(|| { defaulted.push(name.to_string()); default })
+}
+
+/// Omit a value on output only while it is still an unedited default.
+fn unless_default(value: f64, name: &str, default: f64, defaulted: &[String]) -> Option<f64> {
+    if value == default && defaulted.iter().any(|d| d == name) { None } else { Some(value) }
+}
+
+impl From<SourceWire> for Source {
+    fn from(w: SourceWire) -> Self {
+        let mut defaulted = Vec::new();
+        let x0_over_x1 = entered_or(w.x0_over_x1, "x0_over_x1", default_one(), &mut defaulted);
+        let r0_over_r1 = entered_or(w.r0_over_r1, "r0_over_r1", default_one(), &mut defaulted);
+        Self {
+            id: w.id, name: w.name, bus: w.bus, in_service: w.in_service, v_pu: w.v_pu, angle_deg: w.angle_deg,
+            mva_sc: w.mva_sc, decrement_curve: w.decrement_curve, xr: w.xr, x0_over_x1, r0_over_r1,
+            is_slack: w.is_slack, p_mw: w.p_mw, qmin_mvar: w.qmin_mvar, qmax_mvar: w.qmax_mvar, defaulted,
+        }
+    }
+}
+
+impl From<Source> for SourceWire {
+    fn from(s: Source) -> Self {
+        Self {
+            x0_over_x1: unless_default(s.x0_over_x1, "x0_over_x1", default_one(), &s.defaulted),
+            r0_over_r1: unless_default(s.r0_over_r1, "r0_over_r1", default_one(), &s.defaulted),
+            id: s.id, name: s.name, bus: s.bus, in_service: s.in_service, v_pu: s.v_pu, angle_deg: s.angle_deg,
+            mva_sc: s.mva_sc, decrement_curve: s.decrement_curve, xr: s.xr,
+            is_slack: s.is_slack, p_mw: s.p_mw, qmin_mvar: s.qmin_mvar, qmax_mvar: s.qmax_mvar,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -274,22 +383,87 @@ pub struct OperatingCase {
     pub equipment_states: Vec<EquipmentState>,
 }
 
+/// JSON shape is unchanged from the plain derive; omitted ratings take the
+/// typical values below and are reported as assumptions.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "MotorWire", into = "MotorWire")]
 pub struct Motor {
     pub id: String,
     pub name: String,
     pub bus: String,
     pub hp: f64,
     pub kv: f64,
-    #[serde(default = "default_pf")]
+    /// Defaults to 0.85 when omitted.
     pub pf: f64,
-    #[serde(default = "default_eff")]
+    /// Defaults to 0.94 when omitted.
     pub efficiency: f64,
-    #[serde(default = "default_xd")]
+    /// Defaults to 0.17 pu when omitted.
     pub x_subtransient_pu: f64,
-    #[serde(default = "default_mxr")]
+    /// Defaults to 6 when omitted.
     pub xr: f64,
+    /// Names of fields omitted from the input and filled with defaults; see `Source::defaulted`.
+    pub defaulted: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MotorWire {
+    id: String,
+    name: String,
+    bus: String,
+    hp: f64,
+    kv: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pf: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    efficiency: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    x_subtransient_pu: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    xr: Option<f64>,
+}
+
+impl From<MotorWire> for Motor {
+    fn from(w: MotorWire) -> Self {
+        let mut defaulted = Vec::new();
+        let pf = entered_or(w.pf, "pf", default_pf(), &mut defaulted);
+        let efficiency = entered_or(w.efficiency, "efficiency", default_eff(), &mut defaulted);
+        let x_subtransient_pu = entered_or(w.x_subtransient_pu, "x_subtransient_pu", default_xd(), &mut defaulted);
+        let xr = entered_or(w.xr, "xr", default_mxr(), &mut defaulted);
+        Self { id: w.id, name: w.name, bus: w.bus, hp: w.hp, kv: w.kv, pf, efficiency, x_subtransient_pu, xr, defaulted }
+    }
+}
+
+impl From<Motor> for MotorWire {
+    fn from(m: Motor) -> Self {
+        Self {
+            pf: unless_default(m.pf, "pf", default_pf(), &m.defaulted),
+            efficiency: unless_default(m.efficiency, "efficiency", default_eff(), &m.defaulted),
+            x_subtransient_pu: unless_default(m.x_subtransient_pu, "x_subtransient_pu", default_xd(), &m.defaulted),
+            xr: unless_default(m.xr, "xr", default_mxr(), &m.defaulted),
+            id: m.id, name: m.name, bus: m.bus, hp: m.hp, kv: m.kv,
+        }
+    }
+}
+
+impl Source {
+    /// Typical value used for an omitted source field, for assumption reports.
+    pub fn default_value(field: &str) -> Option<f64> {
+        matches!(field, "x0_over_x1" | "r0_over_r1").then(default_one)
+    }
+}
+
+impl Motor {
+    /// Typical value used for an omitted motor field, for assumption reports.
+    pub fn default_value(field: &str) -> Option<f64> {
+        match field {
+            "pf" => Some(default_pf()),
+            "efficiency" => Some(default_eff()),
+            "x_subtransient_pu" => Some(default_xd()),
+            "xr" => Some(default_mxr()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -476,6 +650,7 @@ impl Default for Project {
             arc_duration_cap_s: default_cap(),
             prefault: Prefault::Flat,
             assumptions: Vec::new(),
+            neutral_grounding: Vec::new(),
         }
     }
 }
@@ -491,6 +666,7 @@ impl Project {
             switches: Vec::new(),
             switch_groups: Vec::new(),
             operating_cases: Vec::new(),
+            neutral_grounding: Vec::new(),
             buses: vec![
                 Bus { id: "util".into(), name: "Utility".into(), kv: 12.47, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None },
                 Bus { id: "mcc".into(), name: "MCC-1".into(), kv: 0.48, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None },
@@ -550,6 +726,7 @@ impl Project {
                 p_mw: 0.0,
                 qmin_mvar: None,
                 qmax_mvar: None,
+                defaulted: Vec::new(),
             }],
             motors: vec![Motor {
                 id: "m1".into(),
@@ -561,6 +738,7 @@ impl Project {
                 efficiency: 0.94,
                 x_subtransient_pu: 0.17,
                 xr: 6.0,
+                defaulted: Vec::new(),
             }],
             devices: vec![
                 Device {
@@ -645,6 +823,20 @@ impl Project {
     /// Branches without an explicit switch are always connected.
     pub fn branch_closed(&self, branch: &Branch) -> bool {
         self.switches.iter().find(|s| s.branch_id == branch.id).map_or(true, |s| s.closed)
+    }
+
+    /// Neutral grounding entered for a source (`winding: None`) or for one
+    /// transformer winding. None means solidly grounded.
+    pub fn grounding_of(&self, element_id: &str, winding: Option<Winding>) -> Option<&NeutralGrounding> {
+        self.neutral_grounding.iter().find(|g| g.element_id == element_id && g.winding == winding)
+    }
+
+    /// Whether a transformer's HV winding is on its `from` bus, judged from
+    /// the bus voltages as the network builder does.
+    pub fn transformer_hv_is_from(&self, branch: &Branch) -> Option<bool> {
+        let BranchKind::Transformer { hv_kv, lv_kv, .. } = branch.kind else { return None };
+        let from = self.bus(&branch.from)?.kv;
+        Some(nearest_winding_kv(from, hv_kv, lv_kv) == hv_kv)
     }
 
     /// Apply a named state to a project snapshot, retaining interlocks while
@@ -916,8 +1108,53 @@ impl Project {
                 }
             }
         }
+        self.validate_grounding(&mut errors);
         self.validate_physical(&mut errors);
         errors
+    }
+
+    fn validate_grounding(&self, errors: &mut Vec<String>) {
+        let mut entered = std::collections::HashSet::new();
+        for g in &self.neutral_grounding {
+            let label = match g.winding {
+                Some(Winding::Hv) => format!("neutral grounding {} hv", g.element_id),
+                Some(Winding::Lv) => format!("neutral grounding {} lv", g.element_id),
+                None => format!("neutral grounding {}", g.element_id),
+            };
+            if !entered.insert((g.element_id.as_str(), g.winding)) {
+                errors.push(format!("{label} is entered more than once"));
+            }
+            if !(g.r_ohm.is_finite() && g.r_ohm >= 0.0 && g.x_ohm.is_finite() && g.x_ohm >= 0.0) {
+                errors.push(format!("{label}: r_ohm and x_ohm must be finite and nonnegative"));
+            }
+            let has_impedance = g.r_ohm > 0.0 || g.x_ohm > 0.0;
+            match g.method {
+                GroundingMethod::Impedance if !has_impedance => errors.push(format!("{label}: impedance grounding needs a positive r_ohm or x_ohm")),
+                GroundingMethod::Solid | GroundingMethod::Ungrounded if has_impedance => errors.push(format!("{label}: r_ohm/x_ohm apply only to impedance grounding")),
+                _ => {}
+            }
+            if self.sources.iter().any(|s| s.id == g.element_id) {
+                if g.winding.is_some() { errors.push(format!("{label}: a source takes no winding")); }
+            } else if let Some(branch) = self.branches.iter().find(|b| b.id == g.element_id && matches!(b.kind, BranchKind::Transformer { .. })) {
+                let BranchKind::Transformer { connection, .. } = branch.kind else { unreachable!() };
+                match (g.winding, self.transformer_hv_is_from(branch)) {
+                    (None, _) => errors.push(format!("{label}: a transformer entry needs winding hv or lv")),
+                    (Some(winding), Some(hv_is_from)) => {
+                        let on_from = (winding == Winding::Hv) == hv_is_from;
+                        let wye = match connection {
+                            XfmrConn::Dyn => !on_from,
+                            XfmrConn::Ynd => on_from,
+                            XfmrConn::Ynyn => true,
+                            XfmrConn::Dd => false,
+                        };
+                        if !wye { errors.push(format!("{label}: that winding is delta and has no neutral")); }
+                    }
+                    (Some(_), None) => {} // unknown terminal bus is reported for the branch
+                }
+            } else {
+                errors.push(format!("{label} references unknown source or transformer '{}'", g.element_id));
+            }
+        }
     }
 
     fn group_state_errors(&self, label: &str, switches: &[Switch]) -> Vec<String> {
@@ -970,10 +1207,15 @@ impl Project {
             }
         }
         for s in &self.sources {
+            // An ungrounded or impedance-grounded neutral has no zero (or a
+            // nonzero) zero-sequence shunt even when the source Z0 is zero.
+            let zero_sequence_defined = matches!(self.grounding_of(&s.id, None).map(|g| g.method),
+                Some(GroundingMethod::Ungrounded | GroundingMethod::Impedance))
+                || s.r0_over_r1 > 0.0 || s.xr * s.x0_over_x1 > 0.0;
             check(positive(s.mva_sc) && positive(s.v_pu) && nonnegative(s.xr)
                 && s.angle_deg.is_finite() && s.p_mw.is_finite()
                 && nonnegative(s.r0_over_r1) && nonnegative(s.x0_over_x1)
-                && (s.r0_over_r1 > 0.0 || s.xr * s.x0_over_x1 > 0.0), &s.id, "source impedance or voltage");
+                && zero_sequence_defined, &s.id, "source impedance or voltage");
             check(s.qmin_mvar.map_or(true, f64::is_finite) && s.qmax_mvar.map_or(true, f64::is_finite)
                 && s.qmin_mvar.unwrap_or(f64::NEG_INFINITY) <= s.qmax_mvar.unwrap_or(f64::INFINITY), &s.id, "reactive limits");
         }
@@ -998,6 +1240,18 @@ impl Project {
                 CurveSpec::SettingsNotCollected { .. } => true,
             };
             check(ok, &d.id, "pickup or delay");
+            // Pickups of successive elements must increase: an instantaneous
+            // at or below the timed pickup, or a short-time below long-time,
+            // would make the slower element unreachable.
+            let ordered = match d.curve {
+                CurveSpec::Iec { pickup_a, inst_a, .. } | CurveSpec::Ieee { pickup_a, inst_a, .. } =>
+                    inst_a.map_or(true, |inst| inst > pickup_a),
+                CurveSpec::ThermalMagnetic { lt_pickup_a, st_pickup_a, inst_a, .. } =>
+                    [Some(lt_pickup_a), st_pickup_a, inst_a].into_iter().flatten()
+                        .collect::<Vec<_>>().windows(2).all(|pair| pair[0] < pair[1]),
+                _ => true,
+            };
+            check(ordered, &d.id, "pickup order (requires long-time < short-time < instantaneous, and instantaneous above the timed pickup)");
         }
         for e in &self.equipment {
             check([e.gap_mm, e.distance_mm, e.height_mm, e.width_mm, e.depth_mm].into_iter().all(positive)

@@ -59,6 +59,259 @@ fn transformer_ratio_loaded_loss_reversal_taps_and_mva_base() {
     let mut p = transformer(); p.buses[1].kv = 0.48;
     near(loadflow::solve(&p).unwrap().buses[1].v_pu, 11.0/12.47, 1e-7);
 }
+fn set_connection(p: &mut Project, branch: usize, conn: XfmrConn) {
+    if let BranchKind::Transformer { connection, .. } = &mut p.branches[branch].kind { *connection = conn; }
+}
+#[test]
+fn delta_wye_lv_lags_hv_by_thirty_degrees_in_either_orientation() {
+    // ANSI C57.12.00: HV leads LV by 30 degrees for both delta-wye and wye-delta.
+    for conn in [XfmrConn::Dyn, XfmrConn::Ynd] {
+        for reverse in [false, true] {
+            let mut p = transformer(); p.buses[0].kv = 12.47; p.buses[1].kv = 0.48;
+            set_connection(&mut p, 0, conn);
+            if reverse { let b = &mut p.branches[0]; std::mem::swap(&mut b.from, &mut b.to); }
+            let lf = loadflow::solve(&p).unwrap(); assert!(lf.converged, "{:?}", lf.message);
+            near(lf.buses[0].angle_deg, 0.0, 1e-9);
+            near(lf.buses[1].angle_deg, -30.0, 1e-7);
+            assert!(!network::build(&p).unwrap().warnings.iter().any(|w| w.contains("more than 10%")));
+        }
+    }
+    // The helper's 11 kV bus is 11.8% below the 12.47 kV winding.
+    let warnings = network::build(&transformer()).unwrap().warnings;
+    assert!(warnings.iter().any(|w| w.contains("bus util") && w.contains("more than 10%")), "{warnings:?}");
+}
+#[test]
+fn utility_dyn_and_parallel_ynd_gsu_do_not_circulate_at_no_load() {
+    for gsu_drawn_lv_to_hv in [false, true] {
+        let mut p = transformer(); p.buses[0].kv = 12.47; p.buses[1].kv = 0.48;
+        // Utility step-down: HV delta (from) to LV grounded wye (to).
+        let mut gsu = p.branches[0].clone();
+        gsu.id = "gsu".into(); gsu.name = "GSU".into();
+        p.branches.push(gsu);
+        if gsu_drawn_lv_to_hv {
+            // HV grounded wye, LV delta drawn from the LV bus: from-bus delta.
+            let b = &mut p.branches[1]; std::mem::swap(&mut b.from, &mut b.to);
+            set_connection(&mut p, 1, XfmrConn::Dyn);
+        } else {
+            // Same unit drawn from the HV bus: from-bus grounded wye.
+            set_connection(&mut p, 1, XfmrConn::Ynd);
+        }
+        let lf = loadflow::solve(&p).unwrap(); assert!(lf.converged, "{:?}", lf.message);
+        near(lf.buses[1].angle_deg, -30.0, 1e-7);
+        for branch in &lf.branches { near(branch.i_from_a, 0.0, 1e-6); }
+    }
+}
+fn grounded(element_id: &str, winding: Option<Winding>, method: GroundingMethod, r_ohm: f64) -> NeutralGrounding {
+    NeutralGrounding { element_id: element_id.into(), winding, method, r_ohm, x_ohm: 0.0 }
+}
+fn lv_ground_fault_a(p: &Project) -> (f64, Option<String>) {
+    let f = fault::solve(p, None).unwrap();
+    let lv = f.buses.iter().find(|b| b.id == "mcc").unwrap();
+    (lv.line_to_ground.as_ref().unwrap().symmetrical_ka * 1000.0, lv.note.clone())
+}
+#[test]
+fn high_resistance_grounded_480v_wye_limits_ground_fault_to_about_5a() {
+    // 277 V / 5 A = 55.4 ohm neutral resistor on a 480 V wye secondary.
+    let r = 0.48e3 / 3.0_f64.sqrt() / 5.0;
+    for (conn, reverse, on_hv) in [(XfmrConn::Dyn, false, false), (XfmrConn::Ynd, true, false), (XfmrConn::Ynyn, false, false), (XfmrConn::Ynyn, true, false), (XfmrConn::Ynyn, false, true), (XfmrConn::Ynyn, true, true)] {
+        let mut p = transformer(); p.buses[0].kv = 12.47; p.buses[1].kv = 0.48;
+        if let BranchKind::Transformer { xr, .. } = &mut p.branches[0].kind { *xr = 5.0; }
+        set_connection(&mut p, 0, conn);
+        if reverse { let b = &mut p.branches[0]; std::mem::swap(&mut b.from, &mut b.to); }
+        let (solid, _) = lv_ground_fault_a(&p);
+        assert!(solid > 10_000.0, "{solid}");
+        // A resistor on the HV neutral of a YNyn unit refers to the LV side by the turns ratio squared.
+        let (winding, ohms) = if on_hv { (Winding::Hv, r * (12.47_f64 / 0.48).powi(2)) } else { (Winding::Lv, r) };
+        p.neutral_grounding.push(grounded("t1", Some(winding), GroundingMethod::Impedance, ohms));
+        assert!(p.validate().is_empty(), "{:?}", p.validate());
+        let (hrg, _) = lv_ground_fault_a(&p);
+        assert!((hrg - 5.0).abs() < 0.02, "{conn:?} reverse {reverse}: {hrg} A");
+        // Three-phase duty is unchanged by the neutral.
+        let f = fault::solve(&p, None).unwrap();
+        near(f.buses[1].three_phase.as_ref().unwrap().symmetrical_ka, fault::solve(&{ let mut q = p.clone(); q.neutral_grounding.clear(); q }, None).unwrap().buses[1].three_phase.as_ref().unwrap().symmetrical_ka, 1e-12);
+    }
+}
+#[test]
+fn ungrounded_source_or_winding_gives_zero_ground_fault_with_note() {
+    let mut p = transformer(); p.buses[0].kv = 12.47; p.buses[1].kv = 0.48;
+    p.neutral_grounding.push(grounded("t1", Some(Winding::Lv), GroundingMethod::Ungrounded, 0.0));
+    let (ig, note) = lv_ground_fault_a(&p);
+    assert_eq!(ig, 0.0);
+    assert!(note.unwrap().contains("no zero-sequence path"));
+
+    // A 480 V generator with an ungrounded neutral and no zero-sequence data.
+    let mut p = transformer(); p.buses.truncate(1); p.branches.clear(); p.buses[0].kv = 0.48;
+    p.sources[0].r0_over_r1 = 0.0; p.sources[0].x0_over_x1 = 0.0;
+    assert!(!p.validate().is_empty(), "solid grounding still needs a nonzero Z0");
+    p.neutral_grounding.push(grounded("grid", None, GroundingMethod::Ungrounded, 0.0));
+    assert!(p.validate().is_empty(), "{:?}", p.validate());
+    let f = fault::solve(&p, None).unwrap();
+    assert_eq!(f.buses[0].line_to_ground.as_ref().unwrap().symmetrical_ka, 0.0);
+    assert!(f.buses[0].three_phase.as_ref().unwrap().symmetrical_ka > 0.0);
+    assert!(f.buses[0].note.as_ref().unwrap().contains("no zero-sequence path"));
+    // A source neutral resistor alone defines the zero-sequence shunt.
+    p.neutral_grounding[0] = grounded("grid", None, GroundingMethod::Impedance, 0.48e3 / 3.0_f64.sqrt() / 5.0);
+    assert!(p.validate().is_empty(), "{:?}", p.validate());
+    let f = fault::solve(&p, None).unwrap();
+    assert!((f.buses[0].line_to_ground.as_ref().unwrap().symmetrical_ka * 1000.0 - 5.0).abs() < 0.01);
+}
+#[test]
+fn neutral_grounding_entries_are_validated() {
+    let base = || { let mut p = transformer(); p.buses[0].kv = 12.47; p.buses[1].kv = 0.48; p };
+    let cases: [(NeutralGrounding, &str); 7] = [
+        (grounded("t1", Some(Winding::Hv), GroundingMethod::Ungrounded, 0.0), "delta"),
+        (grounded("t1", None, GroundingMethod::Solid, 0.0), "needs winding"),
+        (grounded("grid", Some(Winding::Lv), GroundingMethod::Solid, 0.0), "no winding"),
+        (grounded("nothing", None, GroundingMethod::Solid, 0.0), "unknown source or transformer"),
+        (grounded("t1", Some(Winding::Lv), GroundingMethod::Impedance, 0.0), "positive r_ohm"),
+        (grounded("t1", Some(Winding::Lv), GroundingMethod::Impedance, -1.0), "nonnegative"),
+        (grounded("t1", Some(Winding::Lv), GroundingMethod::Solid, 5.0), "only to impedance"),
+    ];
+    for (entry, expected) in cases {
+        let mut p = base(); p.neutral_grounding.push(entry);
+        assert!(p.validate().iter().any(|e| e.contains(expected)), "{expected}: {:?}", p.validate());
+    }
+    let mut p = base();
+    p.neutral_grounding.push(grounded("t1", Some(Winding::Lv), GroundingMethod::Solid, 0.0));
+    p.neutral_grounding.push(grounded("t1", Some(Winding::Lv), GroundingMethod::Ungrounded, 0.0));
+    assert!(p.validate().iter().any(|e| e.contains("more than once")));
+    let mut p = base(); p.neutral_grounding.push(grounded("t1", Some(Winding::Lv), GroundingMethod::Impedance, f64::NAN));
+    assert!(!p.validate().is_empty());
+}
+#[test]
+fn legacy_json_without_grounding_is_solid_and_unchanged() {
+    let sample = Project::sample();
+    let json = serde_json::to_value(&sample).unwrap();
+    assert!(json.get("neutral_grounding").is_none());
+    let parsed: Project = serde_json::from_value(json).unwrap();
+    assert!(parsed.neutral_grounding.is_empty());
+    let a = fault::solve(&sample, None).unwrap();
+    let mut explicit = sample.clone();
+    explicit.neutral_grounding.push(grounded("t1", Some(Winding::Lv), GroundingMethod::Solid, 0.0));
+    explicit.neutral_grounding.push(grounded("grid", None, GroundingMethod::Solid, 0.0));
+    let b = fault::solve(&explicit, None).unwrap();
+    for (x, y) in a.buses.iter().zip(&b.buses) {
+        near(x.line_to_ground.as_ref().unwrap().symmetrical_ka, y.line_to_ground.as_ref().unwrap().symmetrical_ka, 0.0);
+    }
+    let text = serde_json::to_string(&explicit).unwrap();
+    let back: Project = serde_json::from_str(&text).unwrap();
+    assert_eq!(back.neutral_grounding, explicit.neutral_grounding);
+}
+#[test]
+fn omitted_source_and_motor_ratings_are_reported_and_stay_omitted() {
+    let mut json = serde_json::to_value(Project::sample()).unwrap();
+    for field in ["x0_over_x1", "r0_over_r1"] { json["sources"][0].as_object_mut().unwrap().remove(field); }
+    for field in ["pf", "efficiency", "x_subtransient_pu", "xr"] { json["motors"][0].as_object_mut().unwrap().remove(field); }
+    let p: Project = serde_json::from_value(json).unwrap();
+    assert_eq!((p.sources[0].x0_over_x1, p.sources[0].r0_over_r1), (1.0, 1.0));
+    assert_eq!((p.motors[0].pf, p.motors[0].efficiency, p.motors[0].x_subtransient_pu, p.motors[0].xr), (0.85, 0.94, 0.17, 6.0));
+    let warnings = network::build(&p).unwrap().warnings;
+    for expected in ["source grid: x0_over_x1 not entered; 1 assumed", "source grid: r0_over_r1 not entered; 1 assumed",
+        "motor m1: pf not entered; 0.85 assumed", "motor m1: efficiency not entered; 0.94 assumed",
+        "motor m1: x_subtransient_pu not entered; 0.17 assumed", "motor m1: xr not entered; 6 assumed"] {
+        assert!(warnings.iter().any(|w| w == expected), "{expected}: {warnings:?}");
+    }
+    let study = study::run(&p, Studies::all()).unwrap();
+    assert!(study.warnings.iter().any(|w| w.contains("pf not entered")));
+    // Saving keeps the omission, so a reload still reports the assumption.
+    let saved = serde_json::to_value(&p).unwrap();
+    assert!(saved["sources"][0].get("x0_over_x1").is_none() && saved["motors"][0].get("pf").is_none());
+    // Entered values (including ones equal to the default) are not assumptions.
+    let sample = Project::sample();
+    assert!(sample.sources[0].defaulted.is_empty() && sample.motors[0].defaulted.is_empty());
+    let saved = serde_json::to_value(&sample).unwrap();
+    assert_eq!(saved["sources"][0]["r0_over_r1"], 1.0);
+    assert_eq!(saved["motors"][0]["xr"], 6.0);
+    assert!(!network::build(&sample).unwrap().warnings.iter().any(|w| w.contains("not entered")));
+    // An edited default is written out.
+    let mut edited = p.clone(); edited.motors[0].pf = 0.9;
+    assert_eq!(serde_json::to_value(&edited).unwrap()["motors"][0]["pf"], 0.9);
+    // exec builders apply the same rule; set_source clears the assumption.
+    let r = exec::exec_request(r#"{"commands":[{"op":"sample"},{"op":"add_source","id":"g2","bus":"util","mva_sc":20,"xr":8},
+        {"op":"add_motor","id":"m2","bus":"mcc","hp":50,"kv":0.46,"pf":0.9},{"op":"run","studies":["fault"]}]}"#);
+    assert!(r.ok, "{:?}", r.error);
+    assert!(r.warnings.iter().any(|w| w == "source g2: x0_over_x1 not entered; 1 assumed"));
+    assert!(r.warnings.iter().any(|w| w == "motor m2: efficiency not entered; 0.94 assumed"));
+    assert!(!r.warnings.iter().any(|w| w.starts_with("motor m2: pf")));
+    let r = exec::exec_request(&serde_json::json!({"project": r.project, "commands": [
+        {"op":"set_source","id":"g2","x0_over_x1":3.0,"r0_over_r1":1.0},{"op":"run","studies":["fault"]}]}).to_string());
+    assert!(r.ok, "{:?}", r.error);
+    assert!(!r.warnings.iter().any(|w| w.starts_with("source g2")), "{:?}", r.warnings);
+}
+#[test]
+fn partial_line_zero_sequence_entry_is_kept_and_warned() {
+    for (r0, x0, expected) in [(0.03, 0.0, "only R0 entered; X0=0"), (0.0, 0.03, "only X0 entered; R0=0")] {
+        let mut p = Project::sample();
+        if let BranchKind::Line { r0_ohm, x0_ohm, .. } = &mut p.branches[1].kind { *r0_ohm = r0; *x0_ohm = x0; }
+        let net = network::build(&p).unwrap();
+        assert!(net.warnings.iter().any(|w| w.contains("line feeder") && w.contains(expected)), "{:?}", net.warnings);
+        assert!(!net.warnings.iter().any(|w| w.contains("R0=3R1")));
+    }
+    let net = network::build(&Project::sample()).unwrap();
+    assert!(!net.warnings.iter().any(|w| w.contains("only")));
+}
+fn rejects(p: &Project, expected: &str) {
+    let errors = p.validate();
+    assert!(errors.iter().any(|e| e.contains(expected)), "expected '{expected}' in {errors:?}");
+}
+#[test]
+fn validation_rejects_reference_identity_and_interlock_errors() {
+    let mut p = Project::sample(); p.loads[0].id = "m1".into(); rejects(&p, "duplicate id 'm1' on motor and load");
+    let mut p = Project::sample(); p.equipment[0].id = "grid".into(); rejects(&p, "duplicate id 'grid'");
+    let mut p = Project::sample(); p.loads[0].bus = "nowhere".into(); rejects(&p, "load load-mcc references unknown bus 'nowhere'");
+    let mut p = Project::sample(); p.sources[0].bus = "nowhere".into(); rejects(&p, "source grid references unknown bus 'nowhere'");
+    let mut p = Project::sample(); p.motors[0].bus = "nowhere".into(); rejects(&p, "motor m1 references unknown bus 'nowhere'");
+    let switched = || {
+        let mut p = Project::sample();
+        p.switches.push(Switch { id: "sw".into(), name: "SW".into(), branch_id: "feeder".into(), kind: SwitchKind::Breaker, closed: true });
+        p
+    };
+    let mut p = switched(); p.switch_groups.push(SwitchGroup { id: "g".into(), switch_ids: vec!["sw".into(), "ghost".into()], max_closed: 1 });
+    rejects(&p, "references unknown switch 'ghost'");
+    let mut p = switched(); p.switch_groups.push(SwitchGroup { id: "g".into(), switch_ids: vec!["sw".into()], max_closed: 2 });
+    rejects(&p, "max_closed exceeds its switch count");
+    let mut p = switched(); p.switch_groups.push(SwitchGroup { id: "g".into(), switch_ids: Vec::new(), max_closed: 0 });
+    rejects(&p, "has no switches");
+    // brk-feeder is on bus pnl; the transformer t1 does not terminate there.
+    let mut p = Project::sample(); p.devices[1].protected_branch = Some("t1".into()); rejects(&p, "brk-feeder: invalid protected branch terminal");
+    let mut p = Project::sample(); p.devices[1].protected_branch = Some("ghost".into()); rejects(&p, "brk-feeder: invalid protected branch terminal");
+}
+#[test]
+fn validation_requires_increasing_device_pickups() {
+    let order = "pickup order";
+    let tm = |lt: f64, st: Option<f64>, inst: Option<f64>| CurveSpec::ThermalMagnetic {
+        lt_pickup_a: lt, lt_delay_s: 8.0, st_pickup_a: st, st_delay_s: st.map(|_| 0.3), inst_a: inst, inst_s: None,
+    };
+    for (curve, ok) in [
+        (tm(3200.0, Some(16000.0), Some(36000.0)), true),
+        (tm(3200.0, None, Some(36000.0)), true),
+        (tm(3200.0, Some(3000.0), None), false),
+        (tm(3200.0, Some(16000.0), Some(12000.0)), false),
+        (tm(3200.0, Some(16000.0), Some(16000.0)), false),
+        (tm(3200.0, None, Some(2000.0)), false),
+        (CurveSpec::Iec { kind: IecKind::Si, pickup_a: 600.0, tms: 0.1, inst_a: Some(6000.0), inst_s: None }, true),
+        (CurveSpec::Iec { kind: IecKind::Si, pickup_a: 600.0, tms: 0.1, inst_a: Some(600.0), inst_s: None }, false),
+        (CurveSpec::Ieee { kind: IeeeKind::VeryInverse, pickup_a: 600.0, td: 1.0, inst_a: Some(500.0), inst_s: None }, false),
+        (CurveSpec::Ieee { kind: IeeeKind::VeryInverse, pickup_a: 600.0, td: 1.0, inst_a: None, inst_s: None }, true),
+    ] {
+        let mut p = Project::sample(); p.devices[0].curve = curve.clone();
+        assert_eq!(p.validate().iter().any(|e| e.contains(order)), !ok, "{curve:?}: {:?}", p.validate());
+    }
+}
+#[test]
+fn unusual_but_accepted_entries_are_warned() {
+    let mut p = Project::sample();
+    p.loads[1].kw = -50.0;
+    p.sources[0].v_pu = 1.25;
+    if let BranchKind::Line { b_siemens, .. } = &mut p.branches[1].kind { *b_siemens = -1e-4; }
+    assert!(p.validate().is_empty(), "{:?}", p.validate());
+    let warnings = network::build(&p).unwrap().warnings;
+    for expected in ["load load-pnl: negative kW", "source grid: voltage setpoint 1.25 pu is outside", "line feeder: negative b_siemens"] {
+        assert!(warnings.iter().any(|w| w.contains(expected)), "{expected}: {warnings:?}");
+    }
+    let warnings = network::build(&Project::sample()).unwrap().warnings;
+    assert!(!warnings.iter().any(|w| w.contains("negative") || w.contains("setpoint")), "{warnings:?}");
+}
 fn pv_project() -> Project {
     let mut p = transformer();
     p.buses[0].kv = 13.8; p.buses[1].kv = 13.8;
