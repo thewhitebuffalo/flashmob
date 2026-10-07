@@ -1108,7 +1108,7 @@ fn coordination(project: &Project, fault: &FaultResult) -> Vec<CoordRow> {
         .iter()
         .map(|device| {
             let kv = project.bus(&device.bus).map(|b| b.kv).unwrap_or(1.0);
-            let (fault_bus, location) = coordination_fault_bus(project, device);
+            let (fault_bus, location) = coordination_fault_bus(project, device, fault);
             let bus_fault = fault.buses.iter().find(|b| b.id == fault_bus);
             let amps = bus_fault.and_then(|b| device_current(project, device, b, 1.0));
             let bolted = amps.map(|a| a / 1000.0);
@@ -1133,7 +1133,7 @@ fn coordination(project: &Project, fault: &FaultResult) -> Vec<CoordRow> {
 /// Bus faulted for a device's coordination row: the terminal of its protected
 /// branch on the source-free (protected) side. A device entered at its
 /// line-side bus would otherwise see only backfeed for a fault at its own bus.
-fn coordination_fault_bus(project: &Project, device: &crate::model::Device) -> (String, String) {
+fn coordination_fault_bus(project: &Project, device: &crate::model::Device, fault: &FaultResult) -> (String, String) {
     let branch = device.protected_branch.as_deref()
         .and_then(|id| project.branches.iter().find(|b| b.id == id))
         .filter(|b| (b.from == device.bus || b.to == device.bus) && project.branch_closed(b));
@@ -1148,6 +1148,18 @@ fn coordination_fault_bus(project: &Project, device: &crate::model::Device) -> (
     match (sourced(&device.bus), sourced(far)) {
         (true, false) => (far.clone(), format!("far terminal of protected branch '{}', away from the device bus, on the source-free side", branch.id)),
         (false, true) => (device.bus.clone(), format!("device bus, the source-free terminal of protected branch '{}'", branch.id)),
+        (true, true) => {
+            let current = |bus: &str| fault.buses.iter().find(|b| b.id == bus)
+                .and_then(|b| device_current(project, device, b, 1.0));
+            let (from, to) = (current(&branch.from), current(&branch.to));
+            let (chosen, other, other_amps) = if to > from {
+                (&branch.to, &branch.from, from)
+            } else {
+                (&branch.from, &branch.to, to)
+            };
+            let other_ka = other_amps.map(|a| format!("{:.6}", a / 1000.0)).unwrap_or_else(|| "unavailable".into());
+            (chosen.clone(), format!("protected side undetermined in a meshed/parallel network; reported the terminal fault giving the larger device current (other terminal {other}: {other_ka} kA)"))
+        }
         _ => (device.bus.clone(), format!("device bus; both terminals of protected branch '{}' have the same source connectivity, so the protected side is not determined", branch.id)),
     }
 }
