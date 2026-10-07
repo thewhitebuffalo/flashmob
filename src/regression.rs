@@ -277,7 +277,7 @@ fn validation_rejects_reference_identity_and_interlock_errors() {
     let mut p = Project::sample(); p.devices[1].protected_branch = Some("ghost".into()); rejects(&p, "brk-feeder: invalid protected branch terminal");
 }
 #[test]
-fn validation_requires_increasing_device_pickups() {
+fn validation_rejects_decreasing_device_pickups() {
     let order = "pickup order";
     let tm = |lt: f64, st: Option<f64>, inst: Option<f64>| CurveSpec::ThermalMagnetic {
         lt_pickup_a: lt, lt_delay_s: 8.0, st_pickup_a: st, st_delay_s: st.map(|_| 0.3), inst_a: inst, inst_s: None,
@@ -287,10 +287,10 @@ fn validation_requires_increasing_device_pickups() {
         (tm(3200.0, None, Some(36000.0)), true),
         (tm(3200.0, Some(3000.0), None), false),
         (tm(3200.0, Some(16000.0), Some(12000.0)), false),
-        (tm(3200.0, Some(16000.0), Some(16000.0)), false),
+        (tm(3200.0, Some(16000.0), Some(16000.0)), true),
         (tm(3200.0, None, Some(2000.0)), false),
         (CurveSpec::Iec { kind: IecKind::Si, pickup_a: 600.0, tms: 0.1, inst_a: Some(6000.0), inst_s: None }, true),
-        (CurveSpec::Iec { kind: IecKind::Si, pickup_a: 600.0, tms: 0.1, inst_a: Some(600.0), inst_s: None }, false),
+        (CurveSpec::Iec { kind: IecKind::Si, pickup_a: 600.0, tms: 0.1, inst_a: Some(600.0), inst_s: None }, true),
         (CurveSpec::Ieee { kind: IeeeKind::VeryInverse, pickup_a: 600.0, td: 1.0, inst_a: Some(500.0), inst_s: None }, false),
         (CurveSpec::Ieee { kind: IeeeKind::VeryInverse, pickup_a: 600.0, td: 1.0, inst_a: None, inst_s: None }, true),
     ] {
