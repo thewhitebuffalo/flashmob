@@ -77,20 +77,32 @@ pub fn plot(project: &Project, study: Option<&StudyOutput>, ref_kv: Option<f64>,
     let mut i_min = f64::MAX;
     let mut i_max: f64 = 100.0;
     let mut fastest = f64::MAX;
+    let mut point_notes = Vec::new();
     for (n, device) in devices.iter().enumerate() {
         let kv = project.bus(&device.bus).map(|b| b.kv).unwrap_or(ref_kv);
-        let points = sample_curve(&device.curve, kv, ref_kv);
-        if points.is_empty() { continue; }
-        for (amp, time) in &points {
-            i_min = i_min.min(*amp);
-            i_max = i_max.max(*amp);
-            fastest = fastest.min(*time);
+        for (suffix, points) in curve_bands(&device.curve, kv, ref_kv) {
+            if points.is_empty() { continue; }
+            for (amp, time) in &points {
+                i_min = i_min.min(*amp);
+                i_max = i_max.max(*amp);
+                fastest = fastest.min(*time);
+            }
+            curves.push(TccCurve {
+                name: format!("{}{suffix}", device.name),
+                color: SVG_COLORS[n % SVG_COLORS.len()],
+                points,
+            });
         }
-        curves.push(TccCurve {
-            name: device.name.clone(),
-            color: SVG_COLORS[n % SVG_COLORS.len()],
-            points,
-        });
+        if let CurveSpec::Points { points, max_points, beyond_last, band_interpretation } = &device.curve {
+            let last = max_points.as_deref().unwrap_or(points).last().map(|p| p[0]).unwrap_or(0.0) * kv / ref_kv;
+            point_notes.push(match beyond_last {
+                crate::model::PointTail::HoldLastTime => format!("{}: above {last:.0} A the last stored time is held (assumed).", device.name),
+                crate::model::PointTail::Unavailable => format!("{}: no operating time above {last:.0} A.", device.name),
+            });
+            if *band_interpretation == crate::model::BandInterpretation::Assumed {
+                point_notes.push(format!("{}: band interpretation assumed.", device.name));
+            }
+        }
     }
     if curves.is_empty() { return Err("no plottable curve: selected devices have no usable settings".into()); }
     i_min = (i_min * 0.7).max(1.0);
@@ -152,9 +164,23 @@ pub fn plot(project: &Project, study: Option<&StudyOutput>, ref_kv: Option<f64>,
         curves,
         markers,
         note: format!(
-            "Current is referred to {ref_kv:.3} kV. Time-current curves use IEC 60255, IEEE C37.112, definite time, or the simplified breaker model stored on each device."
+            "Current is referred to {ref_kv:.3} kV. Time-current curves use IEC 60255, IEEE C37.112, definite time, the simplified breaker model, or the entered time-current points stored on each device. Point curves with two bands are drawn as (min) and (max); operating and clearing times use the max band.{}",
+            point_notes.iter().map(|note| format!(" {note}")).collect::<String>()
         ),
     })
+}
+
+/// Curves to draw for one device, with a name suffix. A point curve draws its
+/// stored points (both bands when entered); other curves are sampled.
+fn curve_bands(curve: &CurveSpec, device_kv: f64, ref_kv: f64) -> Vec<(&'static str, Vec<(f64, f64)>)> {
+    let scale = device_kv / ref_kv;
+    let scaled = |points: &[[f64; 2]]| points.iter().map(|p| (p[0] * scale, p[1]))
+        .filter(|(amp, time)| amp.is_finite() && *amp > 0.0 && time.is_finite() && *time > 0.0).collect::<Vec<_>>();
+    match curve {
+        CurveSpec::Points { points, max_points: Some(max), .. } => vec![(" (min)", scaled(points)), (" (max)", scaled(max))],
+        CurveSpec::Points { points, max_points: None, .. } => vec![("", scaled(points))],
+        _ => vec![("", sample_curve(curve, device_kv, ref_kv))],
+    }
 }
 
 fn sample_curve(curve: &CurveSpec, device_kv: f64, ref_kv: f64) -> Vec<(f64, f64)> {
@@ -203,6 +229,7 @@ fn pickup_amps(curve: &CurveSpec) -> Option<f64> {
     match curve {
         CurveSpec::Iec { pickup_a, .. } | CurveSpec::Ieee { pickup_a, .. } | CurveSpec::Definite { pickup_a, .. } => Some(*pickup_a),
         CurveSpec::ThermalMagnetic { lt_pickup_a, .. } => Some(*lt_pickup_a),
+        CurveSpec::Points { points, .. } => points.first().map(|p| p[0]),
         CurveSpec::SettingsNotCollected { .. } => None,
     }
 }
@@ -211,7 +238,7 @@ fn inst_amps(curve: &CurveSpec) -> Option<f64> {
     match curve {
         CurveSpec::Iec { inst_a, .. } | CurveSpec::Ieee { inst_a, .. } => *inst_a,
         CurveSpec::ThermalMagnetic { inst_a, .. } => *inst_a,
-        CurveSpec::Definite { .. } | CurveSpec::SettingsNotCollected { .. } => None,
+        CurveSpec::Definite { .. } | CurveSpec::Points { .. } | CurveSpec::SettingsNotCollected { .. } => None,
     }
 }
 

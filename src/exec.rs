@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::connectivity::{self, Topology};
-use crate::model::{ArcEquipment, Branch, BranchKind, Bus, CurveSpec, DecrementPoint, Device, Electrode, EquipmentState, Load, Motor, OperatingCase, Project, Source, SourceState, Switch, SwitchGroup, SwitchKind, SwitchState, XfmrConn};
+use crate::model::{ArcEquipment, Branch, BranchKind, Bus, CurveSpec, DecrementPoint, Device, Electrode, EquipmentState, LibraryLink, Load, Motor, OperatingCase, Project, Source, SourceState, Switch, SwitchGroup, SwitchKind, SwitchState, XfmrConn};
 use crate::sld;
 use crate::study::{self, Studies, StudyOutput};
 use crate::tcc;
@@ -88,7 +88,7 @@ pub enum Command {
         #[serde(default)] x_subtransient_pu: Option<f64>,
         #[serde(default)] xr: Option<f64>,
     },
-    AddDevice { id: String, #[serde(default)] name: String, bus: String, curve: CurveSpec, #[serde(default)] basis: String, #[serde(default)] protected_branch: Option<String>, #[serde(default)] breaker_interrupting_s: Option<f64>, #[serde(default)] fuse_total_clearing: bool },
+    AddDevice { id: String, #[serde(default)] name: String, bus: String, curve: CurveSpec, #[serde(default)] basis: String, #[serde(default)] protected_branch: Option<String>, #[serde(default)] breaker_interrupting_s: Option<f64>, #[serde(default)] fuse_total_clearing: bool, #[serde(default)] library: Option<LibraryLink> },
     AddSwitch { id: String, #[serde(default)] name: String, branch_id: String, kind: SwitchKind, closed: bool },
     AddSwitchGroup { id: String, switch_ids: Vec<String>, max_closed: usize },
     AddOperatingCase {
@@ -132,6 +132,21 @@ pub enum Command {
         #[serde(default)] r0_over_r1: Option<f64>,
         #[serde(default)] is_slack: Option<bool>,
         #[serde(default)] in_service: Option<bool>,
+    },
+    /// Change fields of an existing protective device. Omitted fields are kept;
+    /// `clear` lists optional fields to remove (protected_branch,
+    /// breaker_interrupting_s, library).
+    SetDevice {
+        id: String,
+        #[serde(default)] name: Option<String>,
+        #[serde(default)] bus: Option<String>,
+        #[serde(default)] curve: Option<CurveSpec>,
+        #[serde(default)] basis: Option<String>,
+        #[serde(default)] protected_branch: Option<String>,
+        #[serde(default)] breaker_interrupting_s: Option<f64>,
+        #[serde(default)] fuse_total_clearing: Option<bool>,
+        #[serde(default)] library: Option<LibraryLink>,
+        #[serde(default)] clear: Vec<String>,
     },
     Run { #[serde(default)] studies: Vec<String> },
     Topology,
@@ -356,9 +371,36 @@ fn apply_one(project: &mut Project, command: &Command, out: &mut Outputs) -> Res
                 defaulted,
             });
         }
-        Command::AddDevice { id, name, bus, curve, basis, protected_branch, breaker_interrupting_s, fuse_total_clearing } => {
+        Command::AddDevice { id, name, bus, curve, basis, protected_branch, breaker_interrupting_s, fuse_total_clearing, library } => {
             fresh(id, project)?;
-            project.devices.push(Device { id: id.clone(), name: named(name, id), bus: bus.clone(), curve: curve.clone(), basis: basis.clone(), protected_branch: protected_branch.clone(), breaker_interrupting_s: *breaker_interrupting_s, fuse_total_clearing: *fuse_total_clearing });
+            project.devices.push(Device { id: id.clone(), name: named(name, id), bus: bus.clone(), curve: curve.clone(), basis: basis.clone(), protected_branch: protected_branch.clone(), breaker_interrupting_s: *breaker_interrupting_s, fuse_total_clearing: *fuse_total_clearing, library: library.clone() });
+        }
+        Command::SetDevice { id, name, bus, curve, basis, protected_branch, breaker_interrupting_s, fuse_total_clearing, library, clear } => {
+            for field in clear {
+                let settable = match field.as_str() {
+                    "protected_branch" => protected_branch.is_some(),
+                    "breaker_interrupting_s" => breaker_interrupting_s.is_some(),
+                    "library" => library.is_some(),
+                    other => return Err(format!("set_device cannot clear '{other}'; clearable fields are protected_branch, breaker_interrupting_s, library")),
+                };
+                if settable { return Err(format!("set_device both sets and clears '{field}'")); }
+            }
+            let device = project.devices.iter_mut().find(|d| d.id == *id).ok_or_else(|| format!("no device '{id}'"))?;
+            if let Some(v) = name { device.name = v.clone(); }
+            if let Some(v) = bus { device.bus = v.clone(); }
+            if let Some(v) = curve { device.curve = v.clone(); }
+            if let Some(v) = basis { device.basis = v.clone(); }
+            if let Some(v) = protected_branch { device.protected_branch = Some(v.clone()); }
+            if let Some(v) = breaker_interrupting_s { device.breaker_interrupting_s = Some(*v); }
+            if let Some(v) = fuse_total_clearing { device.fuse_total_clearing = *v; }
+            if let Some(v) = library { device.library = Some(v.clone()); }
+            for field in clear {
+                match field.as_str() {
+                    "protected_branch" => device.protected_branch = None,
+                    "breaker_interrupting_s" => device.breaker_interrupting_s = None,
+                    _ => device.library = None,
+                }
+            }
         }
         Command::AddSwitch { id, name, branch_id, kind, closed } => {
             fresh(id, project)?;
@@ -567,6 +609,7 @@ fn op_name(command: &Command) -> &'static str {
         Command::Remove { .. } => "remove",
         Command::SetBus { .. } => "set_bus",
         Command::SetSource { .. } => "set_source",
+        Command::SetDevice { .. } => "set_device",
         Command::Run { .. } => "run",
         Command::Topology => "topology",
         Command::Sld => "sld",
@@ -614,6 +657,8 @@ pub fn schema() -> serde_json::Value {
         "export_package_options": "output: directory, or an .xml path whose siblings are written beside it; other file-like paths (.json, .csv, .txt, .tab, .svg) are rejected. Existing files are refused unless \"overwrite\": true. The project must validate.",
         "topology": "Validated entered connections only: every bus lists branch terminal and neighbor plus attached source, load, motor, device, and arc equipment IDs. Global records give branch endpoints and switch link, source base in-service state, switch base closed state, group rules, named operating cases, and each device's entered protected branch terminal. Null placement means it was not entered. No study or protection inference is performed.",
         "source_decrement": "Optional add_source/set_source decrement_curve is an array of {time_s,current_ratio} for symmetrical three-phase RMS short-circuit current at source terminals relative to initial mva_sc. First point must be {time_s:0,current_ratio:1}; times increase strictly and ratios stay positive. Linear interpolation in time holds the first/last value outside entered points. An empty array clears the curve; omission retains the constant-current model. Arc energy uses at most 10 ms midpoint, quasi-steady network samples. For an isolating upstream breaker with an entered trip-only curve, protected terminal, and breaker_interrupting_s, relay trip elements integrate separately over full and reduced sampled arcing currents; breaker interruption is added after trip. Timers assume immediate reset below pickup and the result is marked assumed if a reset occurs. A fuse total-clearing curve does not establish dynamic clearing. Optional clearing_s overrides automatic clearing; fallback_duration_s applies only when clearing is unresolved. arc_duration_cap_s bounds the study, never supplies a field clearing setting.",
+        "point_curves": "A device curve {\"type\":\"points\"} stores [amperes, seconds] pairs in points (the faster / minimum band) and optional max_points (the slower / maximum or total-clearing band). Currents increase strictly and times never increase; max_points is never faster than points where they overlap. Time is interpolated in log(current)-log(time). Below the first point the device does not operate. beyond_last is required: hold_last_time keeps the last time above the last point and marks results assumed; unavailable gives no time there (clearing is unresolved). Trip, clearing, coordination, and arc-flash times use the max band when present; TCC draws both bands. band_interpretation \"assumed\" (default \"entered\") marks results that rely on an inferred band meaning as assumed. fuse_total_clearing and breaker_interrupting_s apply as for other curves.",
+        "device_library_link": "Optional device.library records which device-library entry a device came from: device_id (required), library, manufacturer, type, style, category, size, rating_a, voltage_v, modified, unsupported_elements. It is informational; studies use only curve and the other device fields. add_device accepts it; set_device changes it, and set_device clear [\"library\"] removes it.",
         "motor_backfeed": "A motor remains a possible fault contributor while connected to the arc, even after the selected utility/generator main opens. Automatic single-device arc clearing fails visibly if any motor is still reachable after that branch opens. An already-open motor feeder branch disconnects its motor. A breaker that trips during the arc is not yet treated as an opening event; its time and motor-current decay require staged modeling. Place the motor on a separate bus behind a finite-impedance feeder branch with a switch/device to represent the breaker. The built-in sample has no motor feeder breaker, so its MCC arc-flash result is unresolved. An explicit equipment clearing_s may override only when it represents total exposure from all paths.",
         "operating_cases": "Base switch.closed and source.in_service values define normal operation. Each named operating case overrides listed switch/source states. Its arc equipment starts with no inherited upstream_device, clearing_s, or fallback_duration_s; list case-specific values in equipment_states, or leave them absent for automatic protection selection or an explicit failure. At most one switch can control a branch. A switch group limits simultaneous closures using max_closed. `run` evaluates the base configuration and each named valid case; inspect per-case failures before using an arc-flash maximum.",
         "switch_model": "Opening a switch removes its entire referenced branch, including any transformer grounding shunt or line charging on that branch. For an independent breaker or ATS contact, use a separate short finite-impedance branch with separate bus nodes; put transformers and other equipment on their own branches. The closed field is required for every switch, especially normally open ties and ATS contacts.",

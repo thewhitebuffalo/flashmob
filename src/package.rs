@@ -1235,6 +1235,21 @@ fn device_fields(curve: &CurveSpec, fuse: bool) -> DeviceFields {
             inst: opt(inst_a),
             inst_s: opt(inst_s),
         },
+        CurveSpec::Points { points, max_points, .. } => DeviceFields {
+            kind: "Point Curve",
+            curve: match max_points {
+                Some(max) => format!("Points (min {} / max {}; points in project.json)", points.len(), max.len()),
+                None => format!("Points ({}; points in project.json)", points.len()),
+            },
+            pickup: max_points.as_deref().unwrap_or(points).first().map(|p| fmt(p[0])).unwrap_or_default(),
+            time_dial: String::new(),
+            delay_s: String::new(),
+            delay_basis: "",
+            st_pickup: String::new(),
+            st_delay: String::new(),
+            inst: String::new(),
+            inst_s: String::new(),
+        },
         CurveSpec::SettingsNotCollected { .. } => DeviceFields {
             kind: "Collected device",
             curve: "Settings not collected".into(),

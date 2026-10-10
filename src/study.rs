@@ -193,6 +193,10 @@ pub struct CoordRow {
     pub bolted_ka: Option<f64>,
     pub trip_at_bolted_s: Option<f64>,
     pub total_clearing_s: Option<f64>,
+    /// Point curves with two bands: operating time on the faster (min) band.
+    /// `trip_at_bolted_s` and `total_clearing_s` use the slower (max) band.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_band_trip_s: Option<f64>,
     /// Bus faulted to obtain `bolted_ka`: the protected-side terminal of the
     /// device's protected branch.
     #[serde(default)]
@@ -650,7 +654,7 @@ fn decrement_duration(project: &Project, loadflow: Option<&LoadflowResult>, equi
     let reset_note = " Relay progress was reset immediately when sampled current fell below pickup, and an element holding its progress would have operated earlier; verify the device reset setting.";
     // Total clearing beyond the study cap is capped exactly as in the
     // constant-current path; the incident energy is integrated to the cap.
-    let finish_trip = |trip_s: f64, reset_matters: bool| -> Result<Clearing, String> {
+    let finish_trip = |trip_s: f64, reset_matters: bool, point_note: Option<(bool, String)>| -> Result<Clearing, String> {
         let raw = trip_s + interrupting_s;
         let mut clear = finish_clearing(raw, project.arc_duration_cap_s,
             &format!("{} [{}] {current_case}-arcing-current relay trip at {trip_s:.3} s plus entered breaker interruption of {interrupting_s:.3} s (total {raw:.3} s)", device.name, device.id),
@@ -659,6 +663,7 @@ fn decrement_duration(project: &Project, loadflow: Option<&LoadflowResult>, equi
             clear.assumed = true;
             clear.note.push_str(reset_note);
         }
+        add_point_note(&mut clear, point_note);
         Ok(clear)
     };
     let mut sampled_amps = |time_s: f64| -> Result<f64, String> {
@@ -682,7 +687,7 @@ fn decrement_duration(project: &Project, loadflow: Option<&LoadflowResult>, equi
         let midpoint_s = interval_start_s + (end_s - interval_start_s) / 2.0;
         let amps = sampled_amps(midpoint_s)?;
         match advance_relay_over_ramp(&mut relay, prior_amps, amps, midpoint_s - prior_sample_s) {
-            Ok(Some(within_s)) => return finish_trip(prior_sample_s + within_s, relay.reset_affects_result()),
+            Ok(Some(within_s)) => return finish_trip(prior_sample_s + within_s, relay.reset_affects_result(), relay.point_note()),
             Ok(None) => {},
             Err(error) => return fallback(format!("upstream device {} [{}]: {error}", device.name, device.id)),
         }
@@ -694,7 +699,7 @@ fn decrement_duration(project: &Project, loadflow: Option<&LoadflowResult>, equi
             // from generator excitation, instead of interpolating across it.
             let amps = sampled_amps(end_s)?;
             match advance_relay_over_ramp(&mut relay, prior_amps, amps, end_s - prior_sample_s) {
-                Ok(Some(within_s)) => return finish_trip(prior_sample_s + within_s, relay.reset_affects_result()),
+                Ok(Some(within_s)) => return finish_trip(prior_sample_s + within_s, relay.reset_affects_result(), relay.point_note()),
                 Ok(None) => {},
                 Err(error) => return fallback(format!("upstream device {} [{}]: {error}", device.name, device.id)),
             }
@@ -709,7 +714,7 @@ fn decrement_duration(project: &Project, loadflow: Option<&LoadflowResult>, equi
     if project.arc_duration_cap_s - prior_sample_s > 1e-12 {
         let amps = sampled_amps(project.arc_duration_cap_s)?;
         match advance_relay_over_ramp(&mut relay, prior_amps, amps, project.arc_duration_cap_s - prior_sample_s) {
-            Ok(Some(within_s)) => return finish_trip(prior_sample_s + within_s, relay.reset_affects_result()),
+            Ok(Some(within_s)) => return finish_trip(prior_sample_s + within_s, relay.reset_affects_result(), relay.point_note()),
             Ok(None) => {},
             Err(error) => return fallback(format!("upstream device {} [{}]: {error}", device.name, device.id)),
         }
@@ -733,6 +738,7 @@ fn decrement_duration(project: &Project, loadflow: Option<&LoadflowResult>, equi
                 clear.assumed = true;
                 clear.note.push_str(reset_note);
             }
+            add_point_note(&mut clear, relay.point_note());
             Ok(clear)
         }
         Ok(false) => fallback(format!("upstream device {} [{}] did not trip within the {:.3} s study cap under the sampled {} arcing-current profile and is below every entered pickup at {prior_amps:.0} A at the cap; total clearing is unresolved",
@@ -1034,10 +1040,24 @@ fn duration(project: &Project, case: &ArcEquipment, fault: &crate::fault::BusFau
         return Err("opening the selected device does not isolate all utility/generator paths to the fault; a multi-device clearing study is required".into());
     }
     reject_connected_motors(project, device, &case.bus)?;
+    let point_note = curves::point_curve_note(&device.curve, amps);
     let Some(raw) = curves::clearing_time(device, amps) else {
-        return fallback(format!("Upstream device {} [{}] identified; total clearing unavailable at {amps:.0} A: enter operating settings and breaker interrupting time, or a fuse total-clearing curve; device may not operate at this current", device.name, device.id));
+        let detail = point_note.map(|(_, note)| format!(" {note}")).unwrap_or_default();
+        return fallback(format!("Upstream device {} [{}] identified; total clearing unavailable at {amps:.0} A: enter operating settings and breaker interrupting time, or a fuse total-clearing curve; device may not operate at this current.{detail}", device.name, device.id));
     };
-    Ok(finish_clearing(raw, cap, &format!("total clearing time of {} at {amps:.0} A through its protected terminal (network terminal current; loadflow prefault includes initial branch flow)", device.name), not_a_label))
+    let mut clear = finish_clearing(raw, cap, &format!("total clearing time of {} at {amps:.0} A through its protected terminal (network terminal current; loadflow prefault includes initial branch flow)", device.name), not_a_label);
+    add_point_note(&mut clear, point_note);
+    Ok(clear)
+}
+
+/// Report point-curve assumptions (held tail, assumed band interpretation)
+/// on a clearing result. Point curves always use their slower (max) band here.
+fn add_point_note(clear: &mut Clearing, point_note: Option<(bool, String)>) {
+    if let Some((assumed, note)) = point_note {
+        clear.assumed |= assumed;
+        clear.note.push(' ');
+        clear.note.push_str(&note);
+    }
 }
 
 fn device_current(project: &Project, device: &crate::model::Device, fault: &crate::fault::BusFault, fraction: f64) -> Option<f64> {
@@ -1114,6 +1134,11 @@ fn coordination(project: &Project, fault: &FaultResult) -> Vec<CoordRow> {
             let bolted = amps.map(|a| a / 1000.0);
             let trip = amps.and_then(|a| curves::trip_time_device(device, a));
             let total = amps.and_then(|a| curves::clearing_time(device, a));
+            let two_bands = matches!(&device.curve, crate::model::CurveSpec::Points { max_points: Some(_), .. });
+            let min_band = amps.filter(|_| two_bands).and_then(|a| curves::trip_time_fast_band(&device.curve, a));
+            let point_note = amps.and_then(|a| curves::point_curve_note(&device.curve, a))
+                .map(|(_, note)| format!(" {note}")).unwrap_or_default();
+            let band_note = if two_bands { " Point curve: times use the slower (max) band; min_band_trip_s is the faster band." } else { "" };
             CoordRow {
                 device_id: device.id.clone(),
                 name: device.name.clone(),
@@ -1123,8 +1148,9 @@ fn coordination(project: &Project, fault: &FaultResult) -> Vec<CoordRow> {
                 bolted_ka: bolted,
                 trip_at_bolted_s: trip,
                 total_clearing_s: total,
+                min_band_trip_s: min_band,
                 fault_bus_id: fault_bus.clone(),
-                note: format!("Current is the protected branch terminal contribution for a three-phase fault at bus '{fault_bus}' ({location}); operating and total-clearing times are separate. Unassigned terminals/times are unavailable."),
+                note: format!("Current is the protected branch terminal contribution for a three-phase fault at bus '{fault_bus}' ({location}); operating and total-clearing times are separate. Unassigned terminals/times are unavailable.{band_note}{point_note}"),
             }
         })
         .collect()

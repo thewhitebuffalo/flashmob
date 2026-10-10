@@ -485,6 +485,67 @@ pub struct Device {
     /// "collected" or "assumed". Empty means unspecified.
     #[serde(default)]
     pub basis: String,
+    /// Where the device data came from when it was applied from a device
+    /// library. Identification only: studies use `curve` and the fields above,
+    /// never the library file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library: Option<LibraryLink>,
+}
+
+/// Identity of the library entry a device was applied from. The curve itself
+/// is copied into the project (a snapshot), so a later library change does not
+/// silently change a study.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LibraryLink {
+    /// Device id within the library it came from.
+    pub device_id: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub library: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub manufacturer: String,
+    #[serde(default, rename = "type", skip_serializing_if = "String::is_empty")]
+    pub device_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub style: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub category: String,
+    /// Size or rating label chosen in the library.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub size: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rating_a: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voltage_v: Option<f64>,
+    /// Library modification stamp of the entry when it was applied.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub modified: String,
+    /// Library elements that were not applied because Flashmob cannot evaluate them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsupported_elements: Vec<String>,
+}
+
+/// What happens above the highest current of a point curve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PointTail {
+    /// Keep the last point's time. Results that use it are marked assumed.
+    HoldLastTime,
+    /// No operating time is available above the last point.
+    Unavailable,
+}
+
+/// How the bands of a point curve were identified.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BandInterpretation {
+    /// Entered from a source that states which band is which.
+    #[default]
+    Entered,
+    /// Which band is minimum and which is maximum / total clearing was
+    /// inferred (for example from a converted library). Results that use the
+    /// curve are marked assumed.
+    Assumed,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -524,6 +585,21 @@ pub enum CurveSpec {
         inst_a: Option<f64>,
         #[serde(default)]
         inst_s: Option<f64>,
+    },
+    /// Time-current points as [amperes, seconds], currents strictly increasing
+    /// and times non-increasing. Between points time is interpolated linearly
+    /// in log(current)–log(time). Below the first current the device does not
+    /// operate. With `max_points`, `points` is the faster (minimum) band and
+    /// `max_points` the slower (maximum or total-clearing) band; operating and
+    /// clearing times use the slower band.
+    Points {
+        points: Vec<[f64; 2]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_points: Option<Vec<[f64; 2]>>,
+        /// Behavior above the last point's current. Required so it is always explicit.
+        beyond_last: PointTail,
+        #[serde(default)]
+        band_interpretation: BandInterpretation,
     },
     /// The device was on the collection sheet. No pickup, delay, fuse size, or instantaneous is stored.
     SettingsNotCollected {
@@ -758,6 +834,7 @@ impl Project {
                         inst_s: Some(0.05),
                     },
                     basis: String::new(),
+                    library: None,
                 },
                 Device {
                     protected_branch: Some("feeder".into()),
@@ -775,6 +852,7 @@ impl Project {
                         inst_s: Some(0.03),
                     },
                     basis: String::new(),
+                    library: None,
                 },
             ],
             equipment: vec![
@@ -1237,9 +1315,15 @@ impl Project {
                 CurveSpec::Ieee { pickup_a, td, inst_a, inst_s, .. } => positive(pickup_a) && positive(td) && pair(inst_a, inst_s),
                 CurveSpec::Definite { pickup_a, time_s } => positive(pickup_a) && positive(time_s),
                 CurveSpec::ThermalMagnetic { lt_pickup_a, lt_delay_s, st_pickup_a, st_delay_s, inst_a, inst_s } => positive(lt_pickup_a) && positive(lt_delay_s) && pair(st_pickup_a, st_delay_s) && pair(inst_a, inst_s),
+                CurveSpec::Points { .. } => true,
                 CurveSpec::SettingsNotCollected { .. } => true,
             };
             check(ok, &d.id, "pickup or delay");
+            if let CurveSpec::Points { points, max_points, .. } = &d.curve {
+                if let Err(problem) = crate::curves::check_point_curve(points, max_points.as_deref()) {
+                    check(false, &d.id, &format!("point curve ({problem})"));
+                }
+            }
             // Pickups of successive elements must not decrease: an instantaneous
             // below the timed pickup, or a short-time below long-time, inverts
             // the curve. Equal pickups are real settings (e.g. instantaneous at

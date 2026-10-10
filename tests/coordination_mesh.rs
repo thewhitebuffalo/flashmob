@@ -11,7 +11,7 @@ fn meshed_coordination_reports_the_larger_terminal_device_current() {
     p.branches.extend([line("ac", "a", "c", 0.02, 0.04), line("cb", "c", "b", 0.02, 0.04)]);
     p.devices.push(Device { id: "d".into(), name: "d".into(), bus: "a".into(),
         protected_branch: Some("ab".into()), curve: CurveSpec::Definite { pickup_a: 100.0, time_s: 0.1 },
-        breaker_interrupting_s: Some(0.04), fuse_total_clearing: false, basis: "collected".into() });
+        breaker_interrupting_s: Some(0.04), fuse_total_clearing: false, basis: "collected".into(), library: None });
     assert!(p.validate().is_empty());
     let studies = Studies { loadflow: false, fault: true, arcflash: false, coordination: true };
     for reversed in [false, true] {
