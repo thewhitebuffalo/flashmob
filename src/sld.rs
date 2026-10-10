@@ -649,7 +649,7 @@ pub fn energy_color(cal: f64) -> &'static str {
 
 /// XML text/attribute escape that also drops control characters XML 1.0 forbids.
 fn esc(value: &str) -> String {
-    crate::skm::strip_controls(value)
+    crate::package::strip_controls(value)
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

@@ -1,4 +1,4 @@
-use flashmob::{model::Project, skm::{self, WriteOptions}};
+use flashmob::{model::Project, package::{self, WriteOptions}};
 use std::path::PathBuf;
 
 struct TempDir(PathBuf);
@@ -21,7 +21,7 @@ fn directory_target_preflight_leaves_every_file_unchanged() {
     let dir = TempDir::new("directory-target");
     std::fs::create_dir(dir.0.join("buses.csv")).unwrap();
     std::fs::write(dir.0.join("project.json"), "ORIGINAL").unwrap();
-    let error = skm::write_dir(&Project::sample(), &dir.0, WriteOptions { overwrite: true, protect: None }).unwrap_err();
+    let error = package::write_dir(&Project::sample(), &dir.0, WriteOptions { overwrite: true, protect: None }).unwrap_err();
     assert!(error.contains("buses.csv") && error.contains("not a regular file"), "{error}");
     assert_eq!(std::fs::read_to_string(dir.0.join("project.json")).unwrap(), "ORIGINAL");
     assert!(!dir.0.join("project.xml").exists());
@@ -36,7 +36,7 @@ fn hard_link_export_preserves_protected_input_content() {
     std::fs::create_dir(&output).unwrap();
     std::fs::write(&input, "ORIGINAL INPUT").unwrap();
     std::fs::hard_link(&input, output.join("project.json")).unwrap();
-    skm::write_dir(&Project::sample(), &output, WriteOptions { overwrite: true, protect: Some(&input) }).unwrap();
+    package::write_dir(&Project::sample(), &output, WriteOptions { overwrite: true, protect: Some(&input) }).unwrap();
     assert_eq!(std::fs::read_to_string(&input).unwrap(), "ORIGINAL INPUT");
     let exported: Project = serde_json::from_str(&std::fs::read_to_string(output.join("project.json")).unwrap()).unwrap();
     assert_eq!(exported.name, Project::sample().name);

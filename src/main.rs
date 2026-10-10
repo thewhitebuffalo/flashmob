@@ -96,10 +96,10 @@ enum Command {
         #[arg(long = "device")]
         device: Vec<String>,
     },
-    /// Write an engineering data package for mapping (PTW import unverified).
+    /// Write an engineering data package for mapping (third-party import unverified).
     /// The project must validate. Existing files are never replaced without --force,
     /// and the input project file is never replaced.
-    ExportSkm {
+    ExportPackage {
         path: PathBuf,
         /// Folder for the export, or an .xml path: project.xml is written there and the
         /// other files beside it. Other file-like paths (.json, .csv, ...) are rejected.
@@ -108,6 +108,32 @@ enum Command {
         /// Replace existing package files in the output.
         #[arg(long)]
         force: bool,
+    },
+    /// Convert a binary manufacturer device library into a Flashmob library JSON file.
+    /// Prints a JSON summary. Existing output is never replaced without --force.
+    ImportLibrary {
+        /// Binary manufacturer device library file.
+        input: PathBuf,
+        /// Library JSON to write.
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long)]
+        compact: bool,
+        #[arg(long)]
+        force: bool,
+        /// Term to remove from the output (repeatable, case-insensitive). Free text has it
+        /// replaced by [redacted]; a device whose identifying text contains it is withheld.
+        #[arg(long = "redact")]
+        redact: Vec<String>,
+    },
+    /// Search a Flashmob library JSON file. Prints matching devices as JSON.
+    Library {
+        path: PathBuf,
+        /// Terms that must all appear in manufacturer, category, type, style, catalog, or reference.
+        terms: Vec<String>,
+        /// Print at most this many devices.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
 }
 
@@ -186,7 +212,7 @@ fn main() -> ExitCode {
             },
             Err(err) => fail(&err),
         },
-        Command::ExportSkm { path, output, force } => match read_project(&path) {
+        Command::ExportPackage { path, output, force } => match read_project(&path) {
             Ok(project) => {
                 let errors = project.validate();
                 if !errors.is_empty() {
@@ -194,8 +220,8 @@ fn main() -> ExitCode {
                         .max_code(ExitCode::from(1));
                 }
                 let input = (path.as_os_str() != "-").then_some(path.as_path());
-                let options = flashmob::skm::WriteOptions { overwrite: force, protect: input };
-                match flashmob::skm::write_dir(&project, output.as_path(), options) {
+                let options = flashmob::package::WriteOptions { overwrite: force, protect: input };
+                match flashmob::package::write_dir(&project, output.as_path(), options) {
                     Ok(dir) => {
                         println!("{}", serde_json::json!({"ok": true, "directory": dir.display().to_string()}));
                         ExitCode::SUCCESS
@@ -205,7 +231,44 @@ fn main() -> ExitCode {
             }
             Err(err) => fail(&err),
         },
+        Command::ImportLibrary { input, output, compact, force, redact } => import_library(&input, &output, compact, force, &redact),
+        Command::Library { path, terms, limit } => {
+            let library = match std::fs::read_to_string(&path).map_err(|err| format!("could not read {}: {err}", path.display()))
+                .and_then(|text| flashmob::library::Library::from_json(&text)) {
+                Ok(library) => library,
+                Err(err) => return fail(&err),
+            };
+            let found = library.search(&terms);
+            emit(&serde_json::json!({"ok": true, "matches": found.len(), "devices": found.into_iter().take(limit).collect::<Vec<_>>()}), false)
+        }
     }
+}
+
+fn import_library(input: &std::path::Path, output: &std::path::Path, compact: bool, force: bool, redact: &[String]) -> ExitCode {
+    if output.exists() && !force {
+        return fail(&format!("{} exists; use --force to replace it", output.display()));
+    }
+    if std::fs::canonicalize(input).ok().is_some_and(|i| std::fs::canonicalize(output).ok() == Some(i)) {
+        return fail("the output would replace the input file");
+    }
+    let bytes = match std::fs::read(input) {
+        Ok(bytes) => bytes,
+        Err(err) => return fail(&format!("could not read {}: {err}", input.display())),
+    };
+    let mut library = match flashmob::library_import::convert(&bytes) {
+        Ok(library) => library,
+        Err(err) => return fail(&err),
+    };
+    flashmob::library_import::redact(&mut library, redact);
+    let text = if compact { serde_json::to_string(&library) } else { serde_json::to_string_pretty(&library) };
+    let text = match text {
+        Ok(text) => text,
+        Err(err) => return fail(&err.to_string()),
+    };
+    if let Err(err) = std::fs::write(output, format!("{text}\n")) {
+        return fail(&format!("could not write {}: {err}", output.display()));
+    }
+    emit(&serde_json::json!({"ok": true, "output": output.display().to_string(), "summary": library.summary}), false)
 }
 
 fn gui(project: Option<PathBuf>) -> ExitCode {

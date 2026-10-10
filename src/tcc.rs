@@ -352,7 +352,7 @@ fn time_label(time: f64) -> String {
 }
 
 fn esc(value: &str) -> String {
-    crate::skm::strip_controls(value)
+    crate::package::strip_controls(value)
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -361,7 +361,7 @@ fn esc(value: &str) -> String {
 
 /// A text CSV cell: control characters removed, formula prefixes neutralized, quoted when needed.
 fn csv_cell(value: &str) -> String {
-    let value = crate::skm::formula_guard(&crate::skm::strip_controls(value));
+    let value = crate::package::formula_guard(&crate::package::strip_controls(value));
     if value.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {

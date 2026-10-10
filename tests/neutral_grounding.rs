@@ -1,4 +1,4 @@
-use flashmob::{model::*, skm};
+use flashmob::{model::*, package};
 
 fn row<'a>(text: &'a str, column: &str) -> &'a str {
     let mut lines = text.lines();
@@ -23,7 +23,7 @@ fn export_resolves_ungrounded_lv_and_impedance_source_in_physical_ohms() {
             std::mem::swap(&mut b.from, &mut b.to);
             if let BranchKind::Transformer { connection, .. } = &mut b.kind { *connection = XfmrConn::Ynd; }
         }
-        let export = skm::export(&p);
+        let export = package::export(&p);
         let transformer = export.file("transformers.csv").unwrap();
         assert_eq!(row(transformer, "SecondaryConnection"), "Wye-Ungrounded");
         assert_eq!(row(transformer, "SecondaryGroundingMethod"), "Ungrounded");
@@ -55,13 +55,13 @@ fn export_resolves_ungrounded_lv_and_impedance_source_in_physical_ohms() {
     p.neutral_grounding[0].method = GroundingMethod::Impedance;
     p.neutral_grounding[0].r_ohm = 0.12;
     p.neutral_grounding[0].x_ohm = 0.03;
-    let export = skm::export(&p);
+    let export = package::export(&p);
     let transformer = export.file("transformers.csv").unwrap();
     assert_eq!(row(transformer, "SecondaryConnection"), "Wye-Impedance");
     assert_eq!(row(transformer, "SecondaryNeutralR_ohm"), "0.12");
     assert_eq!(row(transformer, "SecondaryNeutralX_ohm"), "0.03");
     p.neutral_grounding.clear();
-    let export = skm::export(&p);
+    let export = package::export(&p);
     assert_eq!(row(export.file("transformers.csv").unwrap(), "SecondaryGroundingMethod"), "Solid");
     assert_eq!(row(export.file("utilities.csv").unwrap(), "NeutralR_ohm"), "");
     assert_eq!(row(export.file("utilities.csv").unwrap(), "NeutralX_ohm"), "");

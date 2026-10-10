@@ -1,5 +1,5 @@
-//! Engineering data package for mapping. No PTW version has been round-tripped.
-//! XML is a Flashmob representation, not an SKM schema or verified import format.
+//! Engineering data package for mapping. No target tool version has been round-tripped.
+//! XML is a Flashmob representation, not a vendor schema or verified import format.
 //!
 //! Every exporter assumes a project that has passed `Project::validate()`;
 //! callers (CLI, exec, GUI) validate before exporting.
@@ -12,17 +12,17 @@ use serde::Serialize;
 use crate::model::{Branch, BranchKind, CurveSpec, Electrode, GroundingMethod, Project, Winding, XfmrConn};
 
 #[derive(Clone, Debug, Serialize)]
-pub struct SkmExport {
-    pub files: Vec<SkmFile>,
+pub struct PackageExport {
+    pub files: Vec<PackageFile>,
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct SkmFile {
+pub struct PackageFile {
     pub name: String,
     pub content: String,
 }
 
-impl SkmExport {
+impl PackageExport {
     pub fn xml(&self) -> &str {
         self.file("project.xml").unwrap_or("")
     }
@@ -32,28 +32,28 @@ impl SkmExport {
     }
 }
 
-pub fn export(project: &Project) -> SkmExport {
+pub fn export(project: &Project) -> PackageExport {
     let names = Names::new(project);
     let mut files = vec![
-        SkmFile { name: "project.json".into(), content: serde_json::to_string_pretty(project).expect("project serializes") },
-        SkmFile { name: "project.xml".into(), content: xml(project, &names) },
-        SkmFile { name: "buses.csv".into(), content: buses_csv(project, &names) },
-        SkmFile { name: "arc-equipment.csv".into(), content: arc_equipment_csv(project, &names) },
-        SkmFile { name: "cables.csv".into(), content: cables_csv(project, &names) },
-        SkmFile { name: "transformers.csv".into(), content: transformers_csv(project, &names) },
-        SkmFile { name: "utilities.csv".into(), content: utilities_csv(project, &names) },
-        SkmFile { name: "loads.csv".into(), content: loads_csv(project, &names) },
-        SkmFile { name: "motors.csv".into(), content: motors_csv(project, &names) },
-        SkmFile { name: "protective-devices.csv".into(), content: devices_csv(project, &names) },
-        SkmFile { name: "switches.csv".into(), content: switches_csv(project, &names) },
-        SkmFile { name: "connections.csv".into(), content: connections_csv(project, &names) },
-        SkmFile { name: "revit-panels.csv".into(), content: revit_panels_csv(project, &names) },
-        SkmFile { name: "revit-circuits.csv".into(), content: revit_circuits_csv(project, &names) },
-        SkmFile { name: "components.tab".into(), content: components_tab(project, &names) },
-        SkmFile { name: "IMPORT.txt".into(), content: import_notes(project) },
+        PackageFile { name: "project.json".into(), content: serde_json::to_string_pretty(project).expect("project serializes") },
+        PackageFile { name: "project.xml".into(), content: xml(project, &names) },
+        PackageFile { name: "buses.csv".into(), content: buses_csv(project, &names) },
+        PackageFile { name: "arc-equipment.csv".into(), content: arc_equipment_csv(project, &names) },
+        PackageFile { name: "cables.csv".into(), content: cables_csv(project, &names) },
+        PackageFile { name: "transformers.csv".into(), content: transformers_csv(project, &names) },
+        PackageFile { name: "utilities.csv".into(), content: utilities_csv(project, &names) },
+        PackageFile { name: "loads.csv".into(), content: loads_csv(project, &names) },
+        PackageFile { name: "motors.csv".into(), content: motors_csv(project, &names) },
+        PackageFile { name: "protective-devices.csv".into(), content: devices_csv(project, &names) },
+        PackageFile { name: "switches.csv".into(), content: switches_csv(project, &names) },
+        PackageFile { name: "connections.csv".into(), content: connections_csv(project, &names) },
+        PackageFile { name: "revit-panels.csv".into(), content: revit_panels_csv(project, &names) },
+        PackageFile { name: "revit-circuits.csv".into(), content: revit_circuits_csv(project, &names) },
+        PackageFile { name: "components.tab".into(), content: components_tab(project, &names) },
+        PackageFile { name: "IMPORT.txt".into(), content: import_notes(project) },
     ];
     files.retain(|f| !f.content.is_empty());
-    SkmExport { files }
+    PackageExport { files }
 }
 
 /// How `write_dir` treats files that already exist.
@@ -262,7 +262,7 @@ fn switch_kind(kind: crate::model::SwitchKind) -> &'static str {
     }
 }
 
-const SOURCE_KIND_NOTE: &str = "Flashmob does not store utility vs generator; classify in PTW. IsSlack is the load-flow reference role only.";
+const SOURCE_KIND_NOTE: &str = "Flashmob does not store utility vs generator; classify in the target tool. IsSlack is the load-flow reference role only.";
 
 fn xml(project: &Project, names: &Names) -> String {
     let mut body = String::new();
@@ -823,10 +823,10 @@ fn revit_panels_csv(project: &Project, names: &Names) -> String {
         "Wires",
         "Apparent Load",
         "Load Unit",
-        "SKM_EquipmentType",
-        "SKM_ElectrodeConfiguration",
-        "SKM_Gap_mm",
-        "SKM_WorkingDistance_mm",
+        "Study_EquipmentType",
+        "Study_ElectrodeConfiguration",
+        "Study_Gap_mm",
+        "Study_WorkingDistance_mm",
     ]);
     for bus in &project.buses {
         let (kw, kvar) = bus_load(project, &bus.id);
@@ -1025,10 +1025,10 @@ fn import_notes(project: &Project) -> String {
 Flashmob engineering data package for mapping
 Project: {name}
 
-This package has not been round-tripped through any Power*Tools version.
-It is not a verified PTW import. The XML is a Flashmob representation;
-no SKM XML schema or compatibility is claimed. An engineer must map and
-verify the data against the selected PTW version.
+This package has not been round-tripped through any target study tool.
+It is not a verified import. The XML is a Flashmob representation;
+no vendor XML schema or compatibility is claimed. An engineer must map and
+verify the data against the selected target tool version.
 
   project.json              complete Flashmob model, including all protection metadata
   project.xml               one file with every component and connection
@@ -1043,7 +1043,7 @@ verify the data against the selected PTW version.
   switches.csv              switches, their branch, kind, and normal state
   connections.csv           from bus, to bus, normal state, and controlling switch
   components.tab            summary, tab delimited
-  revit-panels.csv          Revit panel schedule columns plus SKM_ fields
+  revit-panels.csv          Revit panel schedule columns plus Study_ fields
   revit-circuits.csv        Revit circuit connections
 
 Units
@@ -1088,10 +1088,10 @@ Normal operating state
 Operating cases
   {cases}
   Switch groups (interlocks) and per-case equipment states are likewise only
-  in project.json. Map alternate cases to PTW scenarios manually.
+  in project.json. Map alternate cases to target-tool scenarios manually.
 
 Protective devices
-  A protective device is exported as data, not as an SKM library curve.
+  A protective device is exported as data, not as a vendor library curve.
   TimeDial is dimensionless (IEC TMS or IEEE TD). DelayS is seconds: the
   definite-time delay, or for a thermal-magnetic breaker the long-time trip
   time at 6x long-time pickup (DelayBasis says which). ShortTimePickupA and
@@ -1400,7 +1400,7 @@ fn fmt_scaled(value: f64, shift: i32) -> String {
 mod tests {
     use super::*;
 
-    fn file<'a>(exported: &'a SkmExport, name: &str) -> &'a str {
+    fn file<'a>(exported: &'a PackageExport, name: &str) -> &'a str {
         exported.file(name).unwrap_or_else(|| panic!("{name} missing"))
     }
 
@@ -1412,7 +1412,7 @@ mod tests {
     }
 
     #[test]
-    fn sample_export_has_skm_components() {
+    fn sample_export_has_package_components() {
         let exported = export(&Project::sample());
         let xml = exported.xml();
         assert!(xml.contains("<Component Type=\"Bus\""));
@@ -1424,7 +1424,7 @@ mod tests {
         assert!(buses.contains("MCC-1"));
         let revit = file(&exported, "revit-panels.csv");
         assert!(revit.contains("Panel Name"));
-        assert!(revit.contains("SKM_EquipmentType"));
+        assert!(revit.contains("Study_EquipmentType"));
         let xfmr = file(&exported, "transformers.csv");
         assert!(xfmr.contains("PercentZ"));
         assert!(xfmr.contains("NominalKVA"));
@@ -1623,7 +1623,7 @@ mod tests {
 
     #[test]
     fn write_dir_refuses_overwrite_and_never_replaces_the_input() {
-        let root = std::env::temp_dir().join(format!("flashmob-skm-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let root = std::env::temp_dir().join(format!("flashmob-package-{}-{:?}", std::process::id(), std::thread::current().id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let p = Project::sample();
