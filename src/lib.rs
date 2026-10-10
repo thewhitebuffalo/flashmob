@@ -7,6 +7,8 @@ pub mod connectivity;
 pub mod curves;
 pub mod exec;
 pub mod fault;
+pub mod library;
+pub mod library_import;
 pub mod loadflow;
 pub mod model;
 pub mod protection;

@@ -158,7 +158,22 @@ Current on a TCC is referred to the chosen voltage, so a device on another windi
 
 Buses are entered in physical units: kV, ohms, kVA, and percent impedance. The system base defaults to 100 MVA.
 
-This is a study tool for building and checking a model. It does not include a manufacturer device library, ANSI C37.010 NACD multipliers, three-winding transformers, or DC systems.
+This is a study tool for building and checking a model. It does not ship a manufacturer device library (one can be converted for reference; see [Device libraries](#device-libraries)), ANSI C37.010 NACD multipliers, three-winding transformers, or DC systems.
+
+## Device libraries
+
+`flashmob import-library` converts a binary manufacturer device library into Flashmob's library JSON (`format: "flashmob-device-library"`, `version: 1`). `flashmob library` searches the result.
+
+```bash
+flashmob import-library devices.lib -o device-library.json --compact
+flashmob library device-library.json bussmann lpj --limit 5
+```
+
+Each device keeps its manufacturer, type, style, catalog pattern, reference document, notes, and category; its voltage / ampere / interrupting ratings with test X/R; frames and their sensor ratings; and, per frame, the characteristic elements (pickup and delay setting lists, point curves, dial curve families, and so on). Values whose meaning is not established are kept as unlabeled numbers, arrays, or hex rather than guessed. Point-curve currents are amperes when `current_unit` is `"A"` and multiples of an unspecified base when it is `"multiple"`. The summary counts devices by category and elements by kind and lists records that were not converted.
+
+`--redact TERM` (repeatable, case-insensitive) removes a term from the output: free text has it replaced by `[redacted]`, and a device whose identifying text contains it is withheld and listed in `summary.withheld_device_ids`. Existing output is not replaced without `--force`.
+
+A library is reference data. Nothing in it is applied to a project; a project device still needs its own entered curve and settings.
 
 ## Engineering input and result conventions
 
