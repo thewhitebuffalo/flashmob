@@ -173,7 +173,7 @@ Each device keeps its manufacturer, type, style, catalog pattern, reference docu
 
 `--redact TERM` (repeatable, case-insensitive) removes a term from the output: free text has it replaced by `[redacted]`, and a device whose identifying text contains it is withheld and listed in `summary.withheld_device_ids`. Existing output is not replaced without `--force`.
 
-A library is reference data. Nothing in it is applied to a project automatically; a project device still needs its own entered curve and settings.
+A library is reference data. Nothing in it is applied until `flashmob apply-library` copies one point curve into a project device (see below). Studies still use only that device, not the library file.
 
 ### Point curves and library links
 
@@ -195,6 +195,26 @@ A device curve can be entered as time-current points (`"type": "points"`), for e
 - Total clearing adds `breaker_interrupting_s` to the governing band, as for other curves. When the governing band already includes total clearing (for example a breaker's total-clearing max band), set `curve_is_total_clearing: true` instead and leave `breaker_interrupting_s` out.
 
 A device may carry an optional `library` link recording where its data came from: `device_id` (required), and optionally `library`, `manufacturer`, `type`, `style`, `category`, `size`, `rating_a`, `voltage_v`, `modified`, and `unsupported_elements`. It is informational; studies use only the device's curve and fields. Projects without it load unchanged. `flashmob exec` accepts `library` on `add_device`, and `set_device` changes an existing device (`name`, `bus`, `curve`, `basis`, `protected_branch`, `breaker_interrupting_s`, `fuse_total_clearing`, `curve_is_total_clearing`, `library`; `"clear": ["library", "breaker_interrupting_s", "protected_branch"]` removes optional fields).
+
+### Applying a library device
+
+`flashmob apply-library` copies one library point curve onto a project device. The copy is a snapshot: the project stores the curve, and studies use that curve only, never the library file. The device's `library` link records the source. Band identity stays assumed. A check of five 100 A library curves against the published sheets found that a slower band is not, in general, total clearing: LPS-RK, AJT, and TRS pairs sit at a current ratio of 1.10/0.90, which is a tolerance band around one curve, while the published LPJ, LPS-RK, and FRS-R sheets each show one average-melt plot. `--fuse-total-clearing` is therefore off unless you set it after confirming that the governing band is total clearing.
+
+```bash
+flashmob apply-library device-library.json --device-id 12 --id fuse-1 --bus mcc --project project.json -o project.json
+```
+
+Without `--project` the command writes the device JSON only. `--name` overrides the name built from the manufacturer, style, catalog, and rating. `--rating-a` selects the trip unit when more than one is present (within 0.05% of the requested rating). `--function-name` selects the point curve when the trip unit has more than one (`point_curve` or `point_curve_bands` with a non-empty curve). `--current-base-a` sets the ampere scale of a curve stored as multiples. `--voltage-v` is recorded on the link. `--library-name` is the label stored on the link; omit it and the library path is stored. `--protected-branch` is copied onto the device. `--fuse-total-clearing` marks the governing band as total clearing and draws the device as a fuse; leave it off when the slower band has not been confirmed.
+
+`flashmob exec` does the same with `apply_library_device` (`library_path`, `device_id`, `id`, `bus`, and the same optional fields). An empty `library_name` stores `library_path`. A missing file, a library that does not load, or an id already used in the project is an error and does not change the project.
+
+- `current_unit` `"A"` means the stored currents are already amperes. `current_base_a` with an ampere curve is an error. `current_unit` `"multiple"` is scaled to amperes by `current_base_a` when given, otherwise by the selected trip unit's rating. The scale is noted on the link (`current scale 100 A`). Any other or missing current unit is an error. A non-finite or non-positive current or time is an error; points are not dropped or reordered to make a band valid.
+- No point curve, or more than two bands, is an error. The band count is reported; three or more are not guessed.
+- One band is stored as `points` with no `max_points`.
+- Two bands are ordered by time. The faster band is `points` and the slower is `max_points`. Faster means the smaller time at the geometric-mean current of the overlapping range, using the same log(current)–log(time) interpolation as an entered point curve. Ranges that do not overlap, or bands that cross, are an error. Unless `--fuse-total-clearing` is set, the link notes that the slower band is not marked total clearing.
+- `beyond_last` is `unavailable`. `band_interpretation` is `assumed`. `basis` is `assumed`.
+- `fuse_total_clearing` stays false unless requested. `curve_is_total_clearing` and `breaker_interrupting_s` are not set by the copy. Without the flag, clearing time stays unresolved rather than treating a tolerance band as total clearing.
+- Trip units that were not selected, and every other function on the selected trip unit, are named in `library.unsupported_elements`.
 
 ## Engineering input and result conventions
 

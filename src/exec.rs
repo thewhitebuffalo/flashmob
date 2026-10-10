@@ -89,6 +89,22 @@ pub enum Command {
         #[serde(default)] xr: Option<f64>,
     },
     AddDevice { id: String, #[serde(default)] name: String, bus: String, curve: CurveSpec, #[serde(default)] basis: String, #[serde(default)] protected_branch: Option<String>, #[serde(default)] breaker_interrupting_s: Option<f64>, #[serde(default)] fuse_total_clearing: bool, #[serde(default)] curve_is_total_clearing: bool, #[serde(default)] library: Option<LibraryLink> },
+    /// Copy one library point curve onto a new device. The curve is a snapshot.
+    ApplyLibraryDevice {
+        library_path: String,
+        device_id: u32,
+        id: String,
+        bus: String,
+        #[serde(default)] name: String,
+        #[serde(default)] rating_a: Option<f64>,
+        #[serde(default)] current_base_a: Option<f64>,
+        #[serde(default)] voltage_v: Option<f64>,
+        #[serde(default)] function_name: Option<String>,
+        #[serde(default)] protected_branch: Option<String>,
+        #[serde(default)] library_name: String,
+        /// Set only when the governing band is already total clearing.
+        #[serde(default)] fuse_total_clearing: bool,
+    },
     AddSwitch { id: String, #[serde(default)] name: String, branch_id: String, kind: SwitchKind, closed: bool },
     AddSwitchGroup { id: String, switch_ids: Vec<String>, max_closed: usize },
     AddOperatingCase {
@@ -376,6 +392,26 @@ fn apply_one(project: &mut Project, command: &Command, out: &mut Outputs) -> Res
             fresh(id, project)?;
             project.devices.push(Device { id: id.clone(), name: named(name, id), bus: bus.clone(), curve: curve.clone(), basis: basis.clone(), protected_branch: protected_branch.clone(), breaker_interrupting_s: *breaker_interrupting_s, fuse_total_clearing: *fuse_total_clearing, curve_is_total_clearing: *curve_is_total_clearing, library: library.clone() });
         }
+        Command::ApplyLibraryDevice { library_path, device_id, id, bus, name, rating_a, current_base_a, voltage_v, function_name, protected_branch, library_name, fuse_total_clearing } => {
+            fresh(id, project)?;
+            let text = std::fs::read_to_string(library_path).map_err(|err| format!("could not read {library_path}: {err}"))?;
+            let library = crate::library::Library::from_json(&text)?;
+            let library_name = if library_name.is_empty() { library_path.clone() } else { library_name.clone() };
+            let device = crate::library::apply_device(&library, &crate::library::ApplyDevice {
+                device_id: *device_id,
+                id: id.clone(),
+                name: name.clone(),
+                bus: bus.clone(),
+                protected_branch: protected_branch.clone(),
+                rating_a: *rating_a,
+                current_base_a: *current_base_a,
+                voltage_v: *voltage_v,
+                function_name: function_name.clone(),
+                library_name,
+                fuse_total_clearing: *fuse_total_clearing,
+            })?;
+            project.devices.push(device);
+        }
         Command::SetDevice { id, name, bus, curve, basis, protected_branch, breaker_interrupting_s, fuse_total_clearing, curve_is_total_clearing, library, clear } => {
             for field in clear {
                 let settable = match field.as_str() {
@@ -604,6 +640,7 @@ fn op_name(command: &Command) -> &'static str {
         Command::AddSource { .. } => "add_source",
         Command::AddMotor { .. } => "add_motor",
         Command::AddDevice { .. } => "add_device",
+        Command::ApplyLibraryDevice { .. } => "apply_library_device",
         Command::AddSwitch { .. } => "add_switch",
         Command::AddSwitchGroup { .. } => "add_switch_group",
         Command::AddOperatingCase { .. } => "add_operating_case",
@@ -637,7 +674,8 @@ pub fn schema() -> serde_json::Value {
             "exec": "flashmob exec request.json    # or stdin",
             "sld": "flashmob sld project.json -o diagram.svg",
             "tcc": "flashmob tcc project.json -o curves.svg --csv curves.csv --ref-kv 0.48",
-            "export_package": "flashmob export-package project.json -o package-export    # --force to replace existing files"
+            "export_package": "flashmob export-package project.json -o package-export    # --force to replace existing files",
+            "apply_library": "flashmob apply-library device-library.json --device-id 1 --id fuse-1 --bus mcc [--project project.json] [-o out.json]"
         },
         "exec_request": {
             "project": null,
@@ -650,7 +688,8 @@ pub fn schema() -> serde_json::Value {
                 {"op": "run", "studies": ["loadflow", "fault", "arcflash", "coordination"]},
                 {"op": "sld"},
                 {"op": "tcc", "ref_kv": 0.48, "devices": []},
-                {"op": "export_package", "output": "package-export"}
+                {"op": "export_package", "output": "package-export"},
+                {"op": "apply_library_device", "library_path": "device-library.json", "device_id": 1, "id": "fuse-1", "bus": "mcc"}
             ]
         },
         "exec_request_note": "The project field is optional; omit it or set it to null to start empty. The example commands build on the built-in sample.",
@@ -661,6 +700,7 @@ pub fn schema() -> serde_json::Value {
         "source_decrement": "Optional add_source/set_source decrement_curve is an array of {time_s,current_ratio} for symmetrical three-phase RMS short-circuit current at source terminals relative to initial mva_sc. First point must be {time_s:0,current_ratio:1}; times increase strictly and ratios stay positive. Linear interpolation in time holds the first/last value outside entered points. An empty array clears the curve; omission retains the constant-current model. Arc energy uses at most 10 ms midpoint, quasi-steady network samples. For an isolating upstream breaker with an entered trip-only curve, protected terminal, and breaker_interrupting_s, relay trip elements integrate separately over full and reduced sampled arcing currents; breaker interruption is added after trip. Timers assume immediate reset below pickup and the result is marked assumed if a reset occurs. A total-clearing curve (fuse_total_clearing or curve_is_total_clearing) does not establish dynamic clearing. Optional clearing_s overrides automatic clearing; fallback_duration_s applies only when clearing is unresolved. arc_duration_cap_s bounds the study, never supplies a field clearing setting.",
         "point_curves": "A device curve {\"type\":\"points\"} stores [amperes, seconds] pairs in points (the faster / minimum band) and optional max_points (the slower / maximum or total-clearing band). Currents increase strictly and times never increase; max_points is never faster than points where they overlap. Time is interpolated in log(current)-log(time). Below the first point the device does not operate. beyond_last is required: hold_last_time keeps the last time above the last point and marks results assumed; unavailable gives no time there (clearing is unresolved). Trip, clearing, coordination, and arc-flash times use the max band when present; TCC draws both bands. band_interpretation \"assumed\" (default \"entered\") marks results that rely on an inferred band meaning as assumed. Clearing adds breaker_interrupting_s to the governing band, unless curve_is_total_clearing (or fuse_total_clearing for a fuse) says that band already includes total clearing.",
         "total_clearing_flags": "Device clearing is the curve time plus breaker_interrupting_s, unless the curve already includes total clearing. curve_is_total_clearing: true says so for any device (for example a breaker whose point-curve max band is total clearing). fuse_total_clearing: true is kept unchanged for fuses: it implies curve_is_total_clearing and also marks the device as a fuse (SLD fuse symbol, package device type Fuse). Existing projects are not migrated; both flags are read as entered. Either flag together with breaker_interrupting_s is a validation error. add_device and set_device accept both.",
+        "apply_library_device": "Copies a library point curve onto a new project device. The curve is a snapshot (studies do not read the library file). Multiples are scaled to amperes. Two bands are ordered faster then slower and marked assumed. fuse_total_clearing stays false unless set: a slower library band is often a current-tolerance side, not total clearing. library_path is the library JSON; an empty library_name stores that path. A missing file or an invalid library does not change the project.",
         "device_library_link": "Optional device.library records which device-library entry a device came from: device_id (required), library, manufacturer, type, style, category, size, rating_a, voltage_v, modified, unsupported_elements. It is informational; studies use only curve and the other device fields. add_device accepts it; set_device changes it, and set_device clear [\"library\"] removes it.",
         "motor_backfeed": "A motor remains a possible fault contributor while connected to the arc, even after the selected utility/generator main opens. Automatic single-device arc clearing fails visibly if any motor is still reachable after that branch opens. An already-open motor feeder branch disconnects its motor. A breaker that trips during the arc is not yet treated as an opening event; its time and motor-current decay require staged modeling. Place the motor on a separate bus behind a finite-impedance feeder branch with a switch/device to represent the breaker. The built-in sample has no motor feeder breaker, so its MCC arc-flash result is unresolved. An explicit equipment clearing_s may override only when it represents total exposure from all paths.",
         "operating_cases": "Base switch.closed and source.in_service values define normal operation. Each named operating case overrides listed switch/source states. Its arc equipment starts with no inherited upstream_device, clearing_s, or fallback_duration_s; list case-specific values in equipment_states, or leave them absent for automatic protection selection or an explicit failure. At most one switch can control a branch. A switch group limits simultaneous closures using max_closed. `run` evaluates the base configuration and each named valid case; inspect per-case failures before using an arc-flash maximum.",

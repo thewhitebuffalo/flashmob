@@ -135,6 +135,47 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Copy one library point curve onto a project device (a snapshot).
+    /// Prints the device JSON, or the whole project when --project is set.
+    ApplyLibrary {
+        /// Flashmob device-library JSON.
+        library: PathBuf,
+        #[arg(long)]
+        device_id: u32,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        bus: String,
+        /// Empty builds a name from the manufacturer, style, catalog, and rating.
+        #[arg(long, default_value = "")]
+        name: String,
+        /// Trip-unit rating when the library device has more than one.
+        #[arg(long)]
+        rating_a: Option<f64>,
+        /// Ampere scale for a curve stored as multiples.
+        #[arg(long)]
+        current_base_a: Option<f64>,
+        /// Recorded on the library link. Does not select a trip unit.
+        #[arg(long)]
+        voltage_v: Option<f64>,
+        /// Point-curve name when the trip unit has more than one.
+        #[arg(long)]
+        function_name: Option<String>,
+        #[arg(long)]
+        protected_branch: Option<String>,
+        /// Label stored on the library link. Empty stores the library path.
+        #[arg(long, default_value = "")]
+        library_name: String,
+        /// The governing band already includes total clearing. Off unless set.
+        #[arg(long, default_value_t = false)]
+        fuse_total_clearing: bool,
+        /// Project to add the device to. Omit to print the device only.
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// Output JSON path. Omit, or -, for stdout.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -241,6 +282,67 @@ fn main() -> ExitCode {
             let found = library.search(&terms);
             emit(&serde_json::json!({"ok": true, "matches": found.len(), "devices": found.into_iter().take(limit).collect::<Vec<_>>()}), false)
         }
+        Command::ApplyLibrary { library, device_id, id, bus, name, rating_a, current_base_a, voltage_v, function_name, protected_branch, library_name, fuse_total_clearing, project, output } => {
+            let library_path = library.display().to_string();
+            let request = flashmob::library::ApplyDevice {
+                device_id,
+                id,
+                name,
+                bus,
+                protected_branch,
+                rating_a,
+                current_base_a,
+                voltage_v,
+                function_name,
+                library_name: if library_name.is_empty() { library_path.clone() } else { library_name },
+                fuse_total_clearing,
+            };
+            match project {
+                Some(project) => apply_library_project(&project, &library_path, &request, output.as_deref()),
+                None => apply_library_device(&library, &request, output.as_deref()),
+            }
+        }
+    }
+}
+
+fn apply_library_device(library_path: &std::path::Path, request: &flashmob::library::ApplyDevice, output: Option<&std::path::Path>) -> ExitCode {
+    let device = match std::fs::read_to_string(library_path).map_err(|err| format!("could not read {}: {err}", library_path.display()))
+        .and_then(|text| flashmob::library::Library::from_json(&text))
+        .and_then(|library| flashmob::library::apply_device(&library, request)) {
+        Ok(device) => device,
+        Err(err) => return fail(&err),
+    };
+    match serde_json::to_value(&device) {
+        Ok(value) => write_json(output, &value, false),
+        Err(err) => fail(&err.to_string()),
+    }
+}
+
+fn apply_library_project(project_path: &std::path::Path, library_path: &str, request: &flashmob::library::ApplyDevice, output: Option<&std::path::Path>) -> ExitCode {
+    let project = match read_project(&project_path.to_path_buf()) {
+        Ok(project) => project,
+        Err(err) => return fail(&err),
+    };
+    let response = flashmob::exec::apply(project, &[flashmob::exec::Command::ApplyLibraryDevice {
+        library_path: library_path.to_string(),
+        device_id: request.device_id,
+        id: request.id.clone(),
+        bus: request.bus.clone(),
+        name: request.name.clone(),
+        rating_a: request.rating_a,
+        current_base_a: request.current_base_a,
+        voltage_v: request.voltage_v,
+        function_name: request.function_name.clone(),
+        protected_branch: request.protected_branch.clone(),
+        library_name: request.library_name.clone(),
+        fuse_total_clearing: request.fuse_total_clearing,
+    }]);
+    if !response.ok {
+        return fail(response.error.as_deref().unwrap_or("could not apply the library device"));
+    }
+    match serde_json::to_value(&response.project) {
+        Ok(value) => write_json(output, &value, false),
+        Err(err) => fail(&err.to_string()),
     }
 }
 

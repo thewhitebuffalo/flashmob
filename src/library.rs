@@ -2,9 +2,9 @@
 //!
 //! A library is reference data, separate from a study project. It lists
 //! devices (manufacturer, type, style, ratings) and the time-current
-//! characteristic data that came with them. Nothing here is applied to a
-//! project automatically: a project `Device` still needs its own entered
-//! curve and settings. `flashmob import-library` builds a library from a
+//! characteristic data that came with them. `apply_device` copies one point
+//! curve into a project `Device` (a snapshot). Studies use that curve, not
+//! the library file. `flashmob import-library` builds a library from a
 //! binary manufacturer device library file (see `library_import`).
 //!
 //! Field meanings that could not be established from the source are kept
@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 
 pub const FORMAT: &str = "flashmob-device-library";
 pub const VERSION: u32 = 1;
+
+pub use crate::library_apply::{apply_device, ApplyDevice};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
