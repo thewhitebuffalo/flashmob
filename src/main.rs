@@ -96,10 +96,10 @@ enum Command {
         #[arg(long = "device")]
         device: Vec<String>,
     },
-    /// Write an engineering data package for mapping (PTW import unverified).
+    /// Write an engineering data package for mapping (third-party import unverified).
     /// The project must validate. Existing files are never replaced without --force,
     /// and the input project file is never replaced.
-    ExportSkm {
+    ExportPackage {
         path: PathBuf,
         /// Folder for the export, or an .xml path: project.xml is written there and the
         /// other files beside it. Other file-like paths (.json, .csv, ...) are rejected.
@@ -186,7 +186,7 @@ fn main() -> ExitCode {
             },
             Err(err) => fail(&err),
         },
-        Command::ExportSkm { path, output, force } => match read_project(&path) {
+        Command::ExportPackage { path, output, force } => match read_project(&path) {
             Ok(project) => {
                 let errors = project.validate();
                 if !errors.is_empty() {
@@ -194,8 +194,8 @@ fn main() -> ExitCode {
                         .max_code(ExitCode::from(1));
                 }
                 let input = (path.as_os_str() != "-").then_some(path.as_path());
-                let options = flashmob::skm::WriteOptions { overwrite: force, protect: input };
-                match flashmob::skm::write_dir(&project, output.as_path(), options) {
+                let options = flashmob::package::WriteOptions { overwrite: force, protect: input };
+                match flashmob::package::write_dir(&project, output.as_path(), options) {
                     Ok(dir) => {
                         println!("{}", serde_json::json!({"ok": true, "directory": dir.display().to_string()}));
                         ExitCode::SUCCESS

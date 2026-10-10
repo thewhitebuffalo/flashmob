@@ -530,8 +530,8 @@ fn invalid_inputs_are_rejected_not_silently_dropped() {
 }
 #[test]
 fn model_mutation_clears_every_artifact_and_partial_runs_are_completed() {
-    let r = exec::exec_request(r#"{"commands":[{"op":"sample"},{"op":"run"},{"op":"sld"},{"op":"tcc"},{"op":"export_skm"},{"op":"set_source","id":"grid","mva_sc":25}] }"#);
-    assert!(r.ok, "{:?}", r.error); assert!(r.results.is_none() && r.sld_svg.is_none() && r.tcc_svg.is_none() && r.tcc_csv.is_none() && r.skm.is_none());
+    let r = exec::exec_request(r#"{"commands":[{"op":"sample"},{"op":"run"},{"op":"sld"},{"op":"tcc"},{"op":"export_package"},{"op":"set_source","id":"grid","mva_sc":25}] }"#);
+    assert!(r.ok, "{:?}", r.error); assert!(r.results.is_none() && r.sld_svg.is_none() && r.tcc_svg.is_none() && r.tcc_csv.is_none() && r.package.is_none());
     let r = exec::exec_request(r#"{"commands":[{"op":"sample"},{"op":"run"},{"op":"set_source","id":"grid","mva_sc":25},{"op":"sld"}]}"#);
     assert!(r.ok, "{:?}", r.error);
     // Utility-bus fault includes the sample motor behind the transformer.
@@ -613,15 +613,15 @@ fn arc_failures_remain_visible_and_manual_time_can_complete_a_case() {
 }
 
 #[test]
-fn tcc_decades_and_skm_package_have_explicit_status_and_identity() {
+fn tcc_decades_and_export_package_have_explicit_status_and_identity() {
     assert!(tcc::decades(f64::MAX, f64::INFINITY).is_empty());
     assert!(tcc::decades(0.0, 100.0).is_empty());
     assert_eq!(tcc::decades(1.0, 1000.0), vec![1.0,10.0,100.0,1000.0]);
-    let package = crate::skm::export(&Project::sample());
+    let package = crate::package::export(&Project::sample());
     let notes = &package.files.iter().find(|f| f.name == "IMPORT.txt").unwrap().content;
     assert!(notes.contains("engineering data package for mapping"));
-    assert!(notes.contains("not a verified PTW import"));
-    assert!(!package.xml().contains("SKMDataExchange"));
+    assert!(notes.contains("not a verified import"));
+    assert!(package.xml().contains("<FlashmobEngineeringData "));
     assert!(package.files.iter().any(|f| f.name == "project.json"));
 }
 

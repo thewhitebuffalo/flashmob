@@ -193,8 +193,8 @@ impl eframe::App for App {
                 if ui.button("Export TCC").clicked() {
                     self.export_tcc();
                 }
-                if ui.button("Export SKM").clicked() {
-                    self.export_skm();
+                if ui.button("Export Package").clicked() {
+                    self.export_package();
                 }
             });
             ui.horizontal(|ui| {
@@ -616,17 +616,17 @@ impl App {
         }
     }
 
-    fn export_skm(&mut self) {
+    fn export_package(&mut self) {
         let errors = self.project.validate();
         if !errors.is_empty() {
-            self.error = Some(format!("SKM export refused, project is invalid: {}", errors.join("; ")));
+            self.error = Some(format!("Package export refused, project is invalid: {}", errors.join("; ")));
             return;
         }
         if let Some(path) = rfd::FileDialog::new().pick_folder() {
             // Never replace existing files silently; ask for an empty folder instead.
-            match flashmob::skm::write_dir(&self.project, &path, flashmob::skm::WriteOptions::default()) {
-                Ok(dir) => self.status = format!("SKM export written to {}", dir.display()),
-                Err(err) => self.error = Some(format!("SKM export failed: {err}")),
+            match flashmob::package::write_dir(&self.project, &path, flashmob::package::WriteOptions::default()) {
+                Ok(dir) => self.status = format!("Package export written to {}", dir.display()),
+                Err(err) => self.error = Some(format!("Package export failed: {err}")),
             }
         }
     }

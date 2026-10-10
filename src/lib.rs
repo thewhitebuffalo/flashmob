@@ -10,7 +10,7 @@ pub mod fault;
 pub mod loadflow;
 pub mod model;
 pub mod protection;
-pub mod skm;
+pub mod package;
 pub mod sld;
 pub mod study;
 pub mod tcc;

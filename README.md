@@ -24,14 +24,14 @@ flashmob sld plant.json -o diagram.svg
 flashmob tcc plant.json -o curves.svg --csv curves.csv --ref-kv 0.48
 ```
 
-Export an engineering data package for mapping to SKM Power*Tools. No PTW version has been round-tripped, so this is not a verified PTW import. The XML is a Flashmob representation, not an SKM schema. `project.json` preserves the complete model; `IMPORT.txt` describes the mapping files.
+Export an engineering data package for mapping to a third-party study tool. No target tool version has been round-tripped, so this is not a verified import. The XML is a Flashmob representation, not a vendor schema. `project.json` preserves the complete model; `IMPORT.txt` describes the mapping files.
 
 ```bash
 cargo run --release -- sample -o plant.json
-cargo run --release -- export-skm plant.json -o skm-export
+cargo run --release -- export-package plant.json -o package-export
 ```
 
-Map and verify the package against the selected PTW version before using it. Voltages are in volts. Cable R and X are total ohms. Transformer percent impedance is on the transformer kVA base. Transformer Primary is always the HV winding (bus and connection), whatever the branch drawing direction. Source and winding `GroundingMethod` is Solid, Impedance, or Ungrounded (N/A for delta); `NeutralR_ohm` and `NeutralX_ohm` are physical ohms, blank unless impedance-grounded. Transformer fields have Primary/Secondary prefixes. Wye connection text distinguishes Wye-Ground, Wye-Ungrounded, and Wye-Impedance. Numbers use the shortest text that round-trips (`2.5e-7` for very small values). Component names are unique across the package. Branch `NormalState` (Open/Closed, with the controlling switch) and source `ServiceStatus` record the normal operating state; operating cases and switch groups stay only in `project.json`.
+Map and verify the package against the selected target tool version before using it. Voltages are in volts. Cable R and X are total ohms. Transformer percent impedance is on the transformer kVA base. Transformer Primary is always the HV winding (bus and connection), whatever the branch drawing direction. Source and winding `GroundingMethod` is Solid, Impedance, or Ungrounded (N/A for delta); `NeutralR_ohm` and `NeutralX_ohm` are physical ohms, blank unless impedance-grounded. Transformer fields have Primary/Secondary prefixes. Wye connection text distinguishes Wye-Ground, Wye-Ungrounded, and Wye-Impedance. Numbers use the shortest text that round-trips (`2.5e-7` for very small values). Component names are unique across the package. Branch `NormalState` (Open/Closed, with the controlling switch) and source `ServiceStatus` record the normal operating state; operating cases and switch groups stay only in `project.json`.
 
 The project must validate before export; otherwise nothing is written and the CLI exits 1. `-o` is a directory, or an `.xml` path where `project.xml` is written with the other files beside it; other file-like paths (`.json`, `.csv`, ...) are rejected. Existing files are never replaced unless `--force` is given (exec: `"overwrite": true`), and the input project file is never replaced. All existing targets must be regular files; preflight rejects other targets before changing any file. The complete package is written to a fresh staging directory before files are renamed into place, preserving the content of any hard-linked input. A rename failure can leave earlier files replaced; the staging directory is removed and the error reported.
 
@@ -49,7 +49,7 @@ flashmob exec <<'EOF'
 EOF
 ```
 
-The response contains `project`, `results`, `sld_svg`, `tcc_svg`, and `tcc_csv`, plus `topology` when requested. Intermediate states may be incomplete, but the final project is validated: `validation_errors` lists any errors, and then `ok` is false and the CLI exits 1. Model edits clear results and every derived view; `run`, `topology`, `sld`, `tcc`, and `export_skm` do not. `sld` and `tcc` reuse the last full study, even one whose load flow failed. `flashmob schema` includes a sample project and the command list.
+The response contains `project`, `results`, `sld_svg`, `tcc_svg`, and `tcc_csv`, plus `topology` when requested. Intermediate states may be incomplete, but the final project is validated: `validation_errors` lists any errors, and then `ok` is false and the CLI exits 1. Model edits clear results and every derived view; `run`, `topology`, `sld`, `tcc`, and `export_package` do not. `sld` and `tcc` reuse the last full study, even one whose load flow failed. `flashmob schema` includes a sample project and the command list.
 
 The built-in sample has a motor directly on the MCC bus and no modeled motor feeder breaker. Its MCC arc-flash result therefore reports an explicit unresolved motor backfeed path instead of treating the main breaker opening as total arc clearing. The downstream panel's feeder breaker still separates its arc from that motor.
 
