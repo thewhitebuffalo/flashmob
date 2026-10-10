@@ -638,6 +638,9 @@ fn decrement_duration(project: &Project, loadflow: Option<&LoadflowResult>, equi
     if device.fuse_total_clearing {
         return fallback(format!("upstream device {} [{}] has a fuse total-clearing curve; its melt and arcing history cannot be inferred from a time-varying relay model", device.name, device.id));
     }
+    if device.curve_is_total_clearing {
+        return fallback(format!("upstream device {} [{}] has a total-clearing curve (curve_is_total_clearing); the time-varying relay model integrates trip-element operating time, not total clearing, so enter a trip-only curve and breaker_interrupting_s", device.name, device.id));
+    }
     let Some(interrupting_s) = device.breaker_interrupting_s else {
         return fallback(format!("upstream device {} [{}] lacks breaker interruption time", device.name, device.id));
     };

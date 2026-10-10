@@ -403,7 +403,7 @@ fn ats_transfer_calculates_each_active_breaker_without_manual_duration() {
             id: id.into(), name: id.into(), bus: "load_bus".into(),
             curve: CurveSpec::Definite { pickup_a: 1.0, time_s: 0.05 },
             protected_branch: Some(branch.into()), breaker_interrupting_s: Some(0.04),
-            fuse_total_clearing: false, basis: "collected".into(), library: None,
+            fuse_total_clearing: false, curve_is_total_clearing: false, basis: "collected".into(), library: None,
         });
     }
     let output = run_arc(&project);

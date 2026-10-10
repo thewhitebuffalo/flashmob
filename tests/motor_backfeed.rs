@@ -77,7 +77,7 @@ fn motor_feeder_breaker_only_removes_backfeed_when_its_contact_is_open() {
         bus: "mcc".into(), protected_branch: Some("motor-feeder".into()),
         curve: CurveSpec::Definite { pickup_a: 1.0, time_s: 0.05 },
         breaker_interrupting_s: Some(0.04), fuse_total_clearing: false,
-        basis: "collected".into(), library: None,
+        basis: "collected".into(), curve_is_total_clearing: false, library: None,
     });
 
     let closed = run_arc(&project);

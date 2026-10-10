@@ -38,6 +38,8 @@ fn run(p: &Project) -> StudyOutput {
     study::run(p, Studies { loadflow: true, fault: true, arcflash: true, coordination: true }).unwrap()
 }
 
+fn run_full(p: &Project) -> StudyOutput { run(p) }
+
 fn arc(out: &StudyOutput) -> &ArcRow {
     out.arc_flash.as_ref().unwrap().iter().find(|row| row.equipment_id == "af-mcc").unwrap()
 }
@@ -242,4 +244,102 @@ fn projects_without_library_links_still_load_and_omit_the_field() {
     let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
     value["devices"][0]["library"] = serde_json::json!({"device_id": 7, "unknown": 1});
     assert!(exec::load_project(&value.to_string()).is_err());
+}
+
+/// A breaker whose max band is its total-clearing band.
+fn total_clearing_breaker() -> Project {
+    let mut p = Project::sample();
+    p.motors.clear();
+    p.equipment.truncate(1);
+    p.devices[0].curve = two_band(PointTail::Unavailable);
+    p.devices[0].breaker_interrupting_s = None;
+    p.devices[0].curve_is_total_clearing = true;
+    assert!(p.validate().is_empty(), "{:?}", p.validate());
+    p
+}
+
+#[test]
+fn curve_is_total_clearing_adds_no_breaker_time_and_keeps_breaker_identity() {
+    let p = total_clearing_breaker();
+    let out = run(&p);
+    let row = arc(&out);
+    close(row.time_s, curves::trip_time(&p.devices[0].curve, row.arcing_ka * 1000.0).unwrap());
+    let coord = out.coordination.as_ref().unwrap().iter().find(|r| r.device_id == "brk-main").unwrap();
+    close(coord.total_clearing_s.unwrap(), coord.trip_at_bolted_s.unwrap());
+    let protection = out.protection.iter().find(|r| r.device_id.as_deref() == Some("brk-main")).unwrap();
+    assert_eq!(protection.clearing_data, "entered");
+    // Still drawn and exported as a breaker, not a fuse.
+    let diagram = sld::diagram(&p, &out);
+    let t1 = diagram.branches.iter().find(|b| b.id == "t1").unwrap();
+    assert_eq!(t1.protector, "breaker");
+
+    // Same clearing as the fuse flag on the same curve; only the fuse identity differs.
+    let mut fuse = p.clone();
+    fuse.devices[0].curve_is_total_clearing = false;
+    fuse.devices[0].fuse_total_clearing = true;
+    let fuse_out = run(&fuse);
+    close(arc(&fuse_out).time_s, row.time_s);
+    assert_eq!(sld::diagram(&fuse, &fuse_out).branches.iter().find(|b| b.id == "t1").unwrap().protector, "fuse");
+}
+
+#[test]
+fn curve_is_total_clearing_conflicts_with_breaker_time_and_decrement() {
+    let mut p = total_clearing_breaker();
+    p.devices[0].breaker_interrupting_s = Some(0.05);
+    assert!(p.validate().iter().any(|e| e == "brk-main: invalid clearing-time definition"), "{:?}", p.validate());
+
+    let mut p = total_clearing_breaker();
+    p.sources[0].decrement_curve = vec![
+        DecrementPoint { time_s: 0.0, current_ratio: 1.0 },
+        DecrementPoint { time_s: 0.5, current_ratio: 0.8 },
+    ];
+    let out = study::run(&p, Studies { loadflow: false, fault: false, arcflash: true, coordination: false }).unwrap();
+    let failure = out.arc_flash_failures.iter().find(|f| f.equipment_id == "af-mcc").unwrap();
+    assert!(failure.error.contains("total-clearing curve (curve_is_total_clearing)"), "{}", failure.error);
+}
+
+#[test]
+fn fuse_total_clearing_projects_load_and_save_unchanged() {
+    let mut p = Project::sample();
+    p.devices[1].fuse_total_clearing = true;
+    p.devices[1].breaker_interrupting_s = None;
+    let text = serde_json::to_string_pretty(&p).unwrap();
+    assert!(!text.contains("curve_is_total_clearing"));
+    let loaded = exec::load_project(&text).unwrap();
+    assert!(loaded.devices[1].fuse_total_clearing && !loaded.devices[1].curve_is_total_clearing);
+    assert!(loaded.devices[1].curve_includes_clearing());
+    assert_eq!(serde_json::to_string_pretty(&loaded).unwrap(), text);
+    // Identical results to the general flag's clearing path for the same device.
+    let out = run_full(&loaded);
+    let fuse_row = out.coordination.as_ref().unwrap().iter().find(|r| r.device_id == loaded.devices[1].id).unwrap();
+    close(fuse_row.total_clearing_s.unwrap(), fuse_row.trip_at_bolted_s.unwrap());
+}
+
+#[test]
+fn exec_and_package_carry_curve_is_total_clearing() {
+    let dir = std::env::temp_dir().join(format!("flashmob-total-clearing-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let response = exec::exec_request(&serde_json::json!({"commands": [
+        {"op": "sample"},
+        {"op": "set_device", "id": "brk-main", "curve": {"type": "points", "points": MIN, "max_points": MAX, "beyond_last": "unavailable"},
+         "curve_is_total_clearing": true, "clear": ["breaker_interrupting_s"]},
+        {"op": "add_device", "id": "extra", "bus": "pnl", "curve": {"type": "definite", "pickup_a": 100.0, "time_s": 0.2},
+         "curve_is_total_clearing": true},
+        {"op": "run"},
+        {"op": "export_package", "output": dir}
+    ]}).to_string());
+    assert!(response.ok, "{:?} {:?}", response.error, response.validation_errors);
+    assert!(response.project.devices[0].curve_is_total_clearing && !response.project.devices[0].fuse_total_clearing);
+    assert!(response.project.devices.iter().find(|d| d.id == "extra").unwrap().curve_is_total_clearing);
+    let csv = std::fs::read_to_string(dir.join("protective-devices.csv")).unwrap();
+    assert!(csv.lines().next().unwrap().ends_with("FuseTotalClearingCurve,CurveIsTotalClearing"), "{csv}");
+    std::fs::remove_dir_all(&dir).unwrap();
+    let main_line = csv.lines().find(|l| l.contains("Point Curve")).unwrap();
+    assert!(main_line.ends_with("false,true"), "{main_line}");
+
+    let unset = exec::exec_request(&serde_json::json!({"project": response.project, "commands": [
+        {"op": "set_device", "id": "brk-main", "curve_is_total_clearing": false, "breaker_interrupting_s": 0.08}
+    ]}).to_string());
+    assert!(unset.ok, "{:?} {:?}", unset.error, unset.validation_errors);
+    assert!(!unset.project.devices[0].curve_is_total_clearing);
 }

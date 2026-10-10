@@ -479,9 +479,17 @@ pub struct Device {
     /// Relay/element operation must be followed by an entered breaker interruption time.
     #[serde(default)]
     pub breaker_interrupting_s: Option<f64>,
-    /// True only when the entered curve is a fuse total-clearing curve.
+    /// True only when the device is a fuse and the entered curve is its
+    /// total-clearing curve. Implies `curve_is_total_clearing`; it also marks
+    /// the device as a fuse (SLD symbol, package export device type).
     #[serde(default)]
     pub fuse_total_clearing: bool,
+    /// True when the curve's governing band (the max band of a point curve)
+    /// already includes total clearing, so no breaker interrupting time is
+    /// added. Use for breakers or other devices whose curve is a
+    /// total-clearing band; fuses may keep using `fuse_total_clearing`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub curve_is_total_clearing: bool,
     /// "collected" or "assumed". Empty means unspecified.
     #[serde(default)]
     pub basis: String,
@@ -490,6 +498,15 @@ pub struct Device {
     /// never the library file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub library: Option<LibraryLink>,
+}
+
+impl Device {
+    /// The curve already includes total clearing: either a fuse total-clearing
+    /// curve (`fuse_total_clearing`) or a general total-clearing curve
+    /// (`curve_is_total_clearing`). No breaker interrupting time is added.
+    pub fn curve_includes_clearing(&self) -> bool {
+        self.fuse_total_clearing || self.curve_is_total_clearing
+    }
 }
 
 /// Identity of the library entry a device was applied from. The curve itself
@@ -822,6 +839,7 @@ impl Project {
                     // Explicit illustrative sample input; deserialization never supplies a time.
                     breaker_interrupting_s: Some(0.08),
                     fuse_total_clearing: false,
+                    curve_is_total_clearing: false,
                     id: "brk-main".into(),
                     name: "MCC main".into(),
                     bus: "mcc".into(),
@@ -841,6 +859,7 @@ impl Project {
                     // Explicit illustrative sample input; deserialization never supplies a time.
                     breaker_interrupting_s: Some(0.08),
                     fuse_total_clearing: false,
+                    curve_is_total_clearing: false,
                     id: "brk-feeder".into(),
                     name: "Panel feeder".into(),
                     bus: "pnl".into(),
@@ -1305,7 +1324,7 @@ impl Project {
             check(self.bus(&m.bus).map_or(false, |b| (m.kv / b.kv - 1.0).abs() <= 0.10), &m.id, "motor voltage (must be within 10% of bus voltage)");
         }
         for d in &self.devices {
-            check(d.breaker_interrupting_s.map_or(true, positive) && !(d.fuse_total_clearing && d.breaker_interrupting_s.is_some()), &d.id, "clearing-time definition");
+            check(d.breaker_interrupting_s.map_or(true, positive) && !(d.curve_includes_clearing() && d.breaker_interrupting_s.is_some()), &d.id, "clearing-time definition");
             if let Some(id) = &d.protected_branch {
                 check(self.branches.iter().any(|b| b.id == *id && (b.from == d.bus || b.to == d.bus)), &d.id, "protected branch terminal");
             }

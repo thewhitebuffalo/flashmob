@@ -445,6 +445,7 @@ mod tests {
             },
             breaker_interrupting_s: None,
             fuse_total_clearing: false,
+            curve_is_total_clearing: false,
             basis: String::new(), library: None,
         });
         let view = topology(&project).unwrap();

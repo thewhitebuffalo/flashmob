@@ -189,11 +189,12 @@ pub fn trip_time_device(device: &Device, amps: f64) -> Option<f64> {
     trip_time(&device.curve, amps)
 }
 
-/// Total clearing requires either an explicit fuse total-clearing curve or breaker time.
+/// Total clearing requires either a curve that already includes total clearing
+/// (`fuse_total_clearing` or `curve_is_total_clearing`) or breaker time.
 pub fn clearing_time(device: &Device, amps: f64) -> Option<f64> {
     let operating = trip_time_device(device, amps).filter(|t| t.is_finite() && *t > 0.0)?;
-    if device.fuse_total_clearing && device.breaker_interrupting_s.is_some() { return None; }
-    if device.fuse_total_clearing { Some(operating) }
+    if device.curve_includes_clearing() && device.breaker_interrupting_s.is_some() { return None; }
+    if device.curve_includes_clearing() { Some(operating) }
     else { device.breaker_interrupting_s.filter(|t| t.is_finite() && *t > 0.0).map(|t| operating + t).filter(|t| t.is_finite()) }
 }
 
@@ -751,12 +752,19 @@ mod point_curve_tests {
         let mut device = Device {
             id: "d".into(), name: "d".into(), bus: "b".into(), curve: curve(true, PointTail::Unavailable),
             basis: String::new(), protected_branch: None, breaker_interrupting_s: Some(0.05),
-            fuse_total_clearing: false, library: None,
+            fuse_total_clearing: false, curve_is_total_clearing: false, library: None,
         };
         close(clearing_time(&device, 1000.0).unwrap(), 2.05);
         device.fuse_total_clearing = true;
         device.breaker_interrupting_s = None;
         close(clearing_time(&device, 1000.0).unwrap(), 2.0);
+        // The general flag gives the same total clearing without the fuse identity.
+        device.fuse_total_clearing = false;
+        device.curve_is_total_clearing = true;
+        close(clearing_time(&device, 1000.0).unwrap(), 2.0);
+        // Either flag with a breaker time is contradictory: no clearing time.
+        device.breaker_interrupting_s = Some(0.05);
+        assert_eq!(clearing_time(&device, 1000.0), None);
     }
 
     #[test]
