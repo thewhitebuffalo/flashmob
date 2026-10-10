@@ -452,6 +452,7 @@ fn xml(project: &Project, names: &Names) -> String {
                 ("ProtectedBranch", "", device.protected_branch.as_deref().map(|b| names.of(b)).unwrap_or_default()),
                 ("BreakerInterruptingTime", "s", device.breaker_interrupting_s.map(fmt).unwrap_or_default()),
                 ("FuseTotalClearingCurve", "", device.fuse_total_clearing.to_string()),
+                ("CurveIsTotalClearing", "", device.curve_includes_clearing().to_string()),
             ]),
         ));
     }
@@ -718,6 +719,7 @@ fn devices_csv(project: &Project, names: &Names) -> String {
         "ProtectedBranch",
         "BreakerInterruptingTimeS",
         "FuseTotalClearingCurve",
+        "CurveIsTotalClearing",
     ]);
     for device in &project.devices {
         let f = device_fields(&device.curve, device.fuse_total_clearing);
@@ -737,6 +739,7 @@ fn devices_csv(project: &Project, names: &Names) -> String {
             &device.protected_branch.as_deref().map(|b| names.of(b)).unwrap_or_default(),
             &device.breaker_interrupting_s.map(fmt).unwrap_or_default(),
             &device.fuse_total_clearing.to_string(),
+            &device.curve_includes_clearing().to_string(),
         ]));
     }
     s
@@ -1096,7 +1099,10 @@ Protective devices
   definite-time delay, or for a thermal-magnetic breaker the long-time trip
   time at 6x long-time pickup (DelayBasis says which). ShortTimePickupA and
   ShortTimeDelayS describe the short-time element. Fuse curves are marked
-  FuseTotalClearingCurve = true.
+  FuseTotalClearingCurve = true. CurveIsTotalClearing = true when the curve
+  already includes total clearing (every fuse total-clearing curve, and any
+  other device entered with curve_is_total_clearing); BreakerInterruptingTime
+  is then empty.
 
 Arc-flash equipment
   buses.csv carries the first equipment record entered on the bus, or a
@@ -1234,6 +1240,21 @@ fn device_fields(curve: &CurveSpec, fuse: bool) -> DeviceFields {
             st_delay: opt(st_delay_s),
             inst: opt(inst_a),
             inst_s: opt(inst_s),
+        },
+        CurveSpec::Points { points, max_points, .. } => DeviceFields {
+            kind: "Point Curve",
+            curve: match max_points {
+                Some(max) => format!("Points (min {} / max {}; points in project.json)", points.len(), max.len()),
+                None => format!("Points ({}; points in project.json)", points.len()),
+            },
+            pickup: max_points.as_deref().unwrap_or(points).first().map(|p| fmt(p[0])).unwrap_or_default(),
+            time_dial: String::new(),
+            delay_s: String::new(),
+            delay_basis: "",
+            st_pickup: String::new(),
+            st_delay: String::new(),
+            inst: String::new(),
+            inst_s: String::new(),
         },
         CurveSpec::SettingsNotCollected { .. } => DeviceFields {
             kind: "Collected device",

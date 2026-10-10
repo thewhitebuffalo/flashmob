@@ -1,4 +1,118 @@
-use crate::model::{CurveSpec, Device, IecKind, IeeeKind};
+use crate::model::{BandInterpretation, CurveSpec, Device, IecKind, IeeeKind, PointTail};
+
+/// Where a current falls on one band of a point curve.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PointTime {
+    /// Below the first point's current: the band does not operate.
+    Below,
+    /// At or between stored points, interpolated in log–log.
+    Within(f64),
+    /// Above the last point's current.
+    Beyond { last_a: f64, last_s: f64 },
+}
+
+/// Time on one band of [amperes, seconds] points. Between neighbors the time is
+/// interpolated linearly in log(current)–log(time).
+pub fn point_time(points: &[[f64; 2]], amps: f64) -> PointTime {
+    let (Some(first), Some(last)) = (points.first(), points.last()) else { return PointTime::Below };
+    if !amps.is_finite() || amps < first[0] { return PointTime::Below; }
+    if amps > last[0] { return PointTime::Beyond { last_a: last[0], last_s: last[1] }; }
+    for pair in points.windows(2) {
+        let ([i0, t0], [i1, t1]) = (pair[0], pair[1]);
+        if amps <= i1 {
+            if amps == i0 { return PointTime::Within(t0); }
+            if amps == i1 { return PointTime::Within(t1); }
+            let fraction = (amps.ln() - i0.ln()) / (i1.ln() - i0.ln());
+            return PointTime::Within((t0.ln() + fraction * (t1.ln() - t0.ln())).exp());
+        }
+    }
+    PointTime::Within(last[1])
+}
+
+fn band_time(points: &[[f64; 2]], tail: PointTail, amps: f64) -> Option<f64> {
+    match point_time(points, amps) {
+        PointTime::Below => None,
+        PointTime::Within(t) => Some(t),
+        PointTime::Beyond { last_s, .. } => (tail == PointTail::HoldLastTime).then_some(last_s),
+    }
+}
+
+/// The band that governs operating and clearing time: the slower band when two are entered.
+fn governing_band<'a>(points: &'a [[f64; 2]], max_points: &'a Option<Vec<[f64; 2]>>) -> &'a [[f64; 2]] {
+    max_points.as_deref().unwrap_or(points)
+}
+
+fn check_band(points: &[[f64; 2]], name: &str) -> Result<(), String> {
+    if points.len() < 2 { return Err(format!("{name} needs at least two points")); }
+    if points.iter().flatten().any(|v| !v.is_finite() || *v <= 0.0) {
+        return Err(format!("{name} currents and times must be positive and finite"));
+    }
+    for pair in points.windows(2) {
+        if pair[1][0] <= pair[0][0] { return Err(format!("{name} currents must increase strictly")); }
+        if pair[1][1] > pair[0][1] { return Err(format!("{name} times must not increase with current")); }
+    }
+    Ok(())
+}
+
+/// Shape checks for a point curve: each band ordered, and where the bands
+/// overlap in current the maximum band is never faster than the minimum band.
+pub fn check_point_curve(points: &[[f64; 2]], max_points: Option<&[[f64; 2]]>) -> Result<(), String> {
+    check_band(points, "points")?;
+    let Some(max) = max_points else { return Ok(()) };
+    check_band(max, "max_points")?;
+    let slower_or_equal = |slow: f64, fast: f64| slow >= fast * (1.0 - 1e-9);
+    for &[amps, fast] in points {
+        if let PointTime::Within(slow) = point_time(max, amps) {
+            if !slower_or_equal(slow, fast) { return Err(format!("max_points is faster than points at {amps} A")); }
+        }
+    }
+    for &[amps, slow] in max {
+        if let PointTime::Within(fast) = point_time(points, amps) {
+            if !slower_or_equal(slow, fast) { return Err(format!("max_points is faster than points at {amps} A")); }
+        }
+    }
+    Ok(())
+}
+
+/// Operating time on the faster (minimum) band of a point curve. For other
+/// curves this is `trip_time`.
+pub fn trip_time_fast_band(curve: &CurveSpec, amps: f64) -> Option<f64> {
+    match curve {
+        CurveSpec::Points { points, beyond_last, .. } => {
+            if !amps.is_finite() || amps <= 0.0 { return None; }
+            band_time(points, *beyond_last, amps)
+        }
+        _ => trip_time(curve, amps),
+    }
+}
+
+/// Assumptions behind a point-curve time at this current: a held last time
+/// above the curve, an unavailable time above the curve, or an assumed band
+/// interpretation. Returns (result is assumed, note). None for other curves or
+/// when nothing needs reporting.
+pub fn point_curve_note(curve: &CurveSpec, amps: f64) -> Option<(bool, String)> {
+    let CurveSpec::Points { points, max_points, beyond_last, band_interpretation } = curve else { return None };
+    let mut assumed = false;
+    let mut notes = Vec::new();
+    if let PointTime::Beyond { last_a, last_s } = point_time(governing_band(points, max_points), amps) {
+        match beyond_last {
+            PointTail::HoldLastTime => {
+                assumed = true;
+                notes.push(format!("{amps:.0} A is above the point curve's last point ({last_a:.0} A); its last time {last_s} s is held (assumed)."));
+            }
+            PointTail::Unavailable => notes.push(format!("{amps:.0} A is above the point curve's last point ({last_a:.0} A); no operating time is available there.")),
+        }
+    }
+    if *band_interpretation == BandInterpretation::Assumed {
+        assumed = true;
+        notes.push(if max_points.is_some() {
+            "The point curve's band interpretation is assumed: the slower band is taken as the maximum / total-clearing band.".to_string()
+        } else {
+            "The point curve's interpretation (what its single band represents) is assumed.".to_string()
+        });
+    }
+    (!notes.is_empty()).then(|| (assumed, notes.join(" ")))
+}
 
 /// Relay/element operating time, not breaker total clearing. None means unavailable or no operation.
 pub fn trip_time(curve: &CurveSpec, amps: f64) -> Option<f64> {
@@ -65,6 +179,8 @@ pub fn trip_time(curve: &CurveSpec, amps: f64) -> Option<f64> {
             }
             times.into_iter().filter(|t| t.is_finite() && *t > 0.0).reduce(f64::min)
         }
+        CurveSpec::Points { points, max_points, beyond_last, .. } =>
+            band_time(governing_band(points, max_points), *beyond_last, amps),
         CurveSpec::SettingsNotCollected { .. } => None,
     }
 }
@@ -73,11 +189,12 @@ pub fn trip_time_device(device: &Device, amps: f64) -> Option<f64> {
     trip_time(&device.curve, amps)
 }
 
-/// Total clearing requires either an explicit fuse total-clearing curve or breaker time.
+/// Total clearing requires either a curve that already includes total clearing
+/// (`fuse_total_clearing` or `curve_is_total_clearing`) or breaker time.
 pub fn clearing_time(device: &Device, amps: f64) -> Option<f64> {
     let operating = trip_time_device(device, amps).filter(|t| t.is_finite() && *t > 0.0)?;
-    if device.fuse_total_clearing && device.breaker_interrupting_s.is_some() { return None; }
-    if device.fuse_total_clearing { Some(operating) }
+    if device.curve_includes_clearing() && device.breaker_interrupting_s.is_some() { return None; }
+    if device.curve_includes_clearing() { Some(operating) }
     else { device.breaker_interrupting_s.filter(|t| t.is_finite() && *t > 0.0).map(|t| operating + t).filter(|t| t.is_finite()) }
 }
 
@@ -99,6 +216,8 @@ pub struct DynamicRelay {
     operated: bool,
     reset_occurred: bool,
     reset_affects_result: bool,
+    /// Highest sampled current above a point curve's last point (held tail).
+    beyond_last_a: Option<f64>,
 }
 
 impl DynamicRelay {
@@ -142,12 +261,14 @@ impl DynamicRelay {
                 optional_stage(*st_pickup_a, *st_delay_s, "short-time")?;
                 optional_stage(*inst_a, *inst_s, "instantaneous")?;
             }
+            CurveSpec::Points { points, max_points, .. } => check_point_curve(points, max_points.as_deref())?,
             CurveSpec::SettingsNotCollected { .. } => {
                 return Err("trip settings not collected".into());
             }
         }
         Ok(Self { curve: curve.clone(), progress: [0.0; 3], held_progress: [0.0; 3],
-            element_reset: [false; 3], operated: false, reset_occurred: false, reset_affects_result: false })
+            element_reset: [false; 3], operated: false, reset_occurred: false, reset_affects_result: false,
+            beyond_last_a: None })
     }
 
     /// Whether a timed element with accumulated operation reset below pickup.
@@ -160,6 +281,12 @@ impl DynamicRelay {
     /// relay has not yet operated). The true reset characteristic lies between
     /// these bounds, so only this case makes the operating time depend on it.
     pub fn reset_affects_result(&self) -> bool { self.reset_affects_result }
+
+    /// Point-curve assumptions met so far (held tail at the highest sampled
+    /// current above the curve, or an assumed band interpretation).
+    pub fn point_note(&self) -> Option<(bool, String)> {
+        point_curve_note(&self.curve, self.beyond_last_a.unwrap_or(0.0))
+    }
 
     /// Whether any element is timing (at or above its pickup) at this current.
     pub fn timing_at(&self, amps: f64) -> Result<bool, String> {
@@ -183,6 +310,7 @@ impl DynamicRelay {
                 if let Some(pickup) = inst_a { pickups.push(*pickup); }
                 pickups
             }
+            CurveSpec::Points { points, max_points, .. } => vec![governing_band(points, max_points)[0][0]],
             CurveSpec::SettingsNotCollected { .. } => unreachable!("rejected by new"),
         };
         pickups.retain(|pickup| pickup.is_finite());
@@ -199,6 +327,11 @@ impl DynamicRelay {
             return Err("sampled current must be finite and nonnegative, and slice duration must be positive and finite".into());
         }
         let times = self.element_times(amps)?;
+        if let CurveSpec::Points { points, max_points, .. } = &self.curve {
+            if matches!(point_time(governing_band(points, max_points), amps), PointTime::Beyond { .. }) {
+                self.beyond_last_a = Some(self.beyond_last_a.map_or(amps, |prior| prior.max(amps)));
+            }
+        }
         let mut earliest: Option<f64> = None;
         let mut earliest_held: Option<f64> = None;
         for (n, time) in times.into_iter().enumerate() {
@@ -273,6 +406,18 @@ impl DynamicRelay {
                 let immediate = active_stage_delay(amps, *inst_a, *inst_s, "instantaneous")?;
                 [long, short, immediate]
             }
+            CurveSpec::Points { points, max_points, beyond_last, .. } => {
+                let time = match point_time(governing_band(points, max_points), amps) {
+                    PointTime::Below => None,
+                    PointTime::Within(t) => Some(t),
+                    PointTime::Beyond { last_a, last_s } => match beyond_last {
+                        PointTail::HoldLastTime => Some(last_s),
+                        PointTail::Unavailable => return Err(format!(
+                            "{amps:.0} A is above the point curve's last point ({last_a:.0} A) and its operating time there is unavailable")),
+                    },
+                };
+                [time, None, None]
+            }
             CurveSpec::SettingsNotCollected { .. } => unreachable!("rejected by new"),
         })
     }
@@ -333,6 +478,14 @@ pub fn curve_label(curve: &CurveSpec) -> String {
         }
         CurveSpec::Definite { pickup_a, time_s } => format!("Definite {:.0} A  {time_s} s", pickup_a),
         CurveSpec::ThermalMagnetic { lt_pickup_a, .. } => format!("Breaker LT {:.0} A", lt_pickup_a),
+        CurveSpec::Points { points, max_points, band_interpretation, .. } => {
+            let bands = match max_points {
+                Some(max) => format!("min {} / max {} points", points.len(), max.len()),
+                None => format!("{} points", points.len()),
+            };
+            let assumed = if *band_interpretation == BandInterpretation::Assumed { ", bands assumed" } else { "" };
+            format!("Point curve  {bands}  from {:.0} A{assumed}", governing_band(points, max_points)[0][0])
+        }
         CurveSpec::SettingsNotCollected { .. } => "Collected device, trip settings not entered".into(),
     }
 }
@@ -511,5 +664,151 @@ mod tests {
         };
         let relay = DynamicRelay::new(&curve).unwrap();
         assert_eq!(relay.pickup_thresholds(), vec![100.0, 300.0]);
+    }
+}
+
+#[cfg(test)]
+mod point_curve_tests {
+    use super::*;
+
+    const MIN: [[f64; 2]; 3] = [[100.0, 100.0], [1000.0, 1.0], [10000.0, 0.01]];
+    const MAX: [[f64; 2]; 3] = [[120.0, 200.0], [1000.0, 2.0], [10000.0, 0.05]];
+
+    fn curve(max: bool, tail: PointTail) -> CurveSpec {
+        CurveSpec::Points {
+            points: MIN.to_vec(),
+            max_points: max.then(|| MAX.to_vec()),
+            beyond_last: tail,
+            band_interpretation: BandInterpretation::Entered,
+        }
+    }
+
+    fn close(got: f64, expected: f64) {
+        assert!((got - expected).abs() <= 1e-12 * expected.abs().max(1.0), "got {got}, expected {expected}");
+    }
+
+    #[test]
+    fn exact_points_return_stored_times() {
+        for [amps, time] in MIN {
+            assert_eq!(point_time(&MIN, amps), PointTime::Within(time));
+        }
+    }
+
+    #[test]
+    fn interpolation_is_linear_in_log_log() {
+        // Geometric midpoint of a decade on a two-decade-per-decade slope.
+        close(trip_time(&curve(false, PointTail::Unavailable), 316.227_766_016_837_9).unwrap(), 10.0);
+        // A quarter of the way across a decade in log current.
+        let amps = 1000.0 * 10f64.powf(0.25);
+        close(trip_time(&curve(false, PointTail::Unavailable), amps).unwrap(), 10f64.powf(-0.5));
+        // An uneven pair: 1000 A at 2 s to 10000 A at 0.05 s.
+        let expected = (2f64.ln() + 0.5 * (0.05f64.ln() - 2f64.ln())).exp();
+        close(trip_time_fast_band(&curve(true, PointTail::Unavailable), 3162.277_660_168_379).unwrap(), 0.1);
+        close(trip_time(&curve(true, PointTail::Unavailable), 3162.277_660_168_379).unwrap(), expected);
+    }
+
+    #[test]
+    fn below_first_point_does_not_operate() {
+        let c = curve(true, PointTail::HoldLastTime);
+        assert_eq!(trip_time(&c, 119.9), None);
+        assert_eq!(trip_time_fast_band(&c, 99.9), None);
+        // Between the two bands' first currents only the fast band operates.
+        assert!(trip_time_fast_band(&c, 110.0).is_some());
+        assert_eq!(trip_time(&c, 110.0), None);
+        assert_eq!(trip_time(&c, 0.0), None);
+        assert_eq!(trip_time(&c, f64::NAN), None);
+    }
+
+    #[test]
+    fn beyond_last_point_holds_or_is_unavailable_and_is_reported() {
+        let hold = curve(true, PointTail::HoldLastTime);
+        assert_eq!(trip_time(&hold, 50_000.0), Some(0.05));
+        assert_eq!(trip_time_fast_band(&hold, 50_000.0), Some(0.01));
+        let (assumed, note) = point_curve_note(&hold, 50_000.0).unwrap();
+        assert!(assumed);
+        assert!(note.contains("above the point curve's last point (10000 A)") && note.contains("held"), "{note}");
+
+        let none = curve(true, PointTail::Unavailable);
+        assert_eq!(trip_time(&none, 50_000.0), None);
+        let (assumed, note) = point_curve_note(&none, 50_000.0).unwrap();
+        assert!(!assumed);
+        assert!(note.contains("no operating time"), "{note}");
+
+        // Inside the curve nothing is reported for an entered interpretation.
+        assert_eq!(point_curve_note(&hold, 5000.0), None);
+    }
+
+    #[test]
+    fn assumed_band_interpretation_is_always_reported() {
+        let CurveSpec::Points { points, max_points, beyond_last, .. } = curve(true, PointTail::Unavailable) else { unreachable!() };
+        let c = CurveSpec::Points { points, max_points, beyond_last, band_interpretation: BandInterpretation::Assumed };
+        let (assumed, note) = point_curve_note(&c, 5000.0).unwrap();
+        assert!(assumed && note.contains("band interpretation is assumed"), "{note}");
+        assert!(curve_label(&c).contains("bands assumed"));
+    }
+
+    #[test]
+    fn clearing_uses_max_band_plus_breaker_time_or_total_clearing_flag() {
+        let mut device = Device {
+            id: "d".into(), name: "d".into(), bus: "b".into(), curve: curve(true, PointTail::Unavailable),
+            basis: String::new(), protected_branch: None, breaker_interrupting_s: Some(0.05),
+            fuse_total_clearing: false, curve_is_total_clearing: false, library: None,
+        };
+        close(clearing_time(&device, 1000.0).unwrap(), 2.05);
+        device.fuse_total_clearing = true;
+        device.breaker_interrupting_s = None;
+        close(clearing_time(&device, 1000.0).unwrap(), 2.0);
+        // The general flag gives the same total clearing without the fuse identity.
+        device.fuse_total_clearing = false;
+        device.curve_is_total_clearing = true;
+        close(clearing_time(&device, 1000.0).unwrap(), 2.0);
+        // Either flag with a breaker time is contradictory: no clearing time.
+        device.breaker_interrupting_s = Some(0.05);
+        assert_eq!(clearing_time(&device, 1000.0), None);
+    }
+
+    #[test]
+    fn shape_checks_reject_bad_curves() {
+        assert!(check_point_curve(&MIN, Some(&MAX)).is_ok());
+        assert!(check_point_curve(&MIN[..1], None).unwrap_err().contains("at least two"));
+        assert!(check_point_curve(&[[100.0, 1.0], [100.0, 0.5]], None).unwrap_err().contains("increase strictly"));
+        assert!(check_point_curve(&[[100.0, 1.0], [200.0, 2.0]], None).unwrap_err().contains("must not increase"));
+        assert!(check_point_curve(&[[100.0, 1.0], [200.0, f64::NAN]], None).unwrap_err().contains("positive and finite"));
+        assert!(check_point_curve(&[[0.0, 1.0], [200.0, 0.5]], None).is_err());
+        // The max band may not be faster than the min band where they overlap.
+        assert!(check_point_curve(&MAX, Some(&MIN)).unwrap_err().contains("faster"));
+        let crossing = [[100.0, 200.0], [1000.0, 2.0], [10000.0, 0.005]];
+        assert!(check_point_curve(&MIN, Some(&crossing)).unwrap_err().contains("faster than points at 10000 A"));
+    }
+
+    #[test]
+    fn dynamic_relay_integrates_the_max_band_and_reports_tails() {
+        let mut relay = DynamicRelay::new(&curve(true, PointTail::HoldLastTime)).unwrap();
+        // Constant 1000 A on the max band operates at 2 s.
+        assert_eq!(relay.advance(1000.0, 1.0).unwrap(), None);
+        close(relay.advance(1000.0, 1.5).unwrap().unwrap(), 1.0);
+        assert_eq!(relay.point_note(), None);
+
+        let mut relay = DynamicRelay::new(&curve(true, PointTail::HoldLastTime)).unwrap();
+        close(relay.advance(20_000.0, 1.0).unwrap().unwrap(), 0.05);
+        let (assumed, note) = relay.point_note().unwrap();
+        assert!(assumed && note.contains("20000 A"), "{note}");
+
+        let mut relay = DynamicRelay::new(&curve(true, PointTail::Unavailable)).unwrap();
+        assert!(relay.advance(20_000.0, 1.0).unwrap_err().contains("unavailable"));
+
+        assert!(DynamicRelay::new(&CurveSpec::Points { points: vec![[1.0, 1.0]], max_points: None,
+            beyond_last: PointTail::Unavailable, band_interpretation: BandInterpretation::Entered }).is_err());
+    }
+
+    #[test]
+    fn serde_requires_explicit_tail_and_defaults_interpretation() {
+        let c: CurveSpec = serde_json::from_str(r#"{"type":"points","points":[[100,1],[200,0.5]],"beyond_last":"hold_last_time"}"#).unwrap();
+        assert!(matches!(&c, CurveSpec::Points { points, max_points: None, beyond_last: PointTail::HoldLastTime,
+            band_interpretation: BandInterpretation::Entered } if points == &vec![[100.0, 1.0], [200.0, 0.5]]));
+        assert!(serde_json::from_str::<CurveSpec>(r#"{"type":"points","points":[[100,1],[200,0.5]]}"#).is_err());
+        assert!(serde_json::from_str::<CurveSpec>(r#"{"type":"points","points":[[100,1],[200,0.5]],"beyond_last":"hold_last_time","scale":2}"#).is_err());
+        let text = serde_json::to_string(&c).unwrap();
+        assert!(!text.contains("max_points"), "{text}");
     }
 }
