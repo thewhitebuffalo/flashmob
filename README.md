@@ -173,7 +173,28 @@ Each device keeps its manufacturer, type, style, catalog pattern, reference docu
 
 `--redact TERM` (repeatable, case-insensitive) removes a term from the output: free text has it replaced by `[redacted]`, and a device whose identifying text contains it is withheld and listed in `summary.withheld_device_ids`. Existing output is not replaced without `--force`.
 
-A library is reference data. Nothing in it is applied to a project; a project device still needs its own entered curve and settings.
+A library is reference data. Nothing in it is applied to a project automatically; a project device still needs its own entered curve and settings.
+
+### Point curves and library links
+
+A device curve can be entered as time-current points (`"type": "points"`), for example a fuse or breaker band read from manufacturer data:
+
+```json
+{"type": "points",
+ "points":     [[3000, 500], [10000, 0.5], [60000, 0.02]],
+ "max_points": [[3500, 1000], [10000, 1.0], [60000, 0.04]],
+ "beyond_last": "hold_last_time",
+ "band_interpretation": "entered"}
+```
+
+- Each pair is `[amperes, seconds]`. Currents increase strictly and times never increase. `points` is the faster (minimum, e.g. minimum melt) band; optional `max_points` is the slower (maximum or total-clearing) band and must not be faster than `points` where they overlap.
+- Time between points is interpolated linearly in log(current)–log(time). Below the first point the device does not operate.
+- `beyond_last` is required. `hold_last_time` keeps the last point's time at higher currents and marks the result assumed with a note; `unavailable` gives no time there, so clearing that depends on it is unresolved and reported.
+- Operating time, total clearing, coordination, and arc flash (constant current and source decrement) use the slower `max_points` band when present. Coordination rows add `min_band_trip_s` for the faster band. The TCC draws both bands as `name (min)` and `name (max)`.
+- `band_interpretation: "assumed"` (default `"entered"`) records that the band meaning was inferred rather than stated by the data, for example which library band is total clearing. Results that use such a curve are marked assumed.
+- `breaker_interrupting_s` and `fuse_total_clearing` apply as for other curves: points are operating times unless `fuse_total_clearing` says the curve is total clearing.
+
+A device may carry an optional `library` link recording where its data came from: `device_id` (required), and optionally `library`, `manufacturer`, `type`, `style`, `category`, `size`, `rating_a`, `voltage_v`, `modified`, and `unsupported_elements`. It is informational; studies use only the device's curve and fields. Projects without it load unchanged. `flashmob exec` accepts `library` on `add_device`, and `set_device` changes an existing device (`name`, `bus`, `curve`, `basis`, `protected_branch`, `breaker_interrupting_s`, `fuse_total_clearing`, `library`; `"clear": ["library", "breaker_interrupting_s", "protected_branch"]` removes optional fields).
 
 ## Engineering input and result conventions
 
