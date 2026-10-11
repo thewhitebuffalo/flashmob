@@ -1106,9 +1106,10 @@ Protective devices
 
 Arc-flash equipment
   buses.csv carries the first equipment record entered on the bus, or a
-  typical assumed enclosure when none is entered (EquipmentBasis says which,
-  ArcEquipmentCount gives the number of records). arc-equipment.csv lists all
-  records.
+  representative assumed class when none is entered (EquipmentBasis says which;
+  the arc-flash study instead evaluates each applicable IEEE 1584 class and
+  keeps the maximum energy and the maximum boundary). arc-equipment.csv lists
+  all records.
 
 Revit panels
   Distribution System is derived from the LV connection of the transformer
@@ -1159,7 +1160,7 @@ fn bus_equipment(project: &Project, bus: &str) -> BusEquipment {
             height: fmt(height),
             width: fmt(width),
             depth: fmt(depth),
-            basis: "typical (assumed)",
+            basis: "representative class (assumed; study uses each applicable IEEE 1584 class)",
             count,
         }
     }

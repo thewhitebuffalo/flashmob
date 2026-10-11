@@ -340,7 +340,7 @@ mod tests {
     #[test]
     fn utility_fault_matches_short_circuit_mva() {
         let project = Project {
-            buses: vec![Bus { id: "a".into(), name: "A".into(), kv: 13.8, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None }],
+            buses: vec![Bus { id: "a".into(), name: "A".into(), kv: 13.8, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None }],
             sources: vec![Source {
                 id: "s".into(),
                 name: "grid".into(),
@@ -372,8 +372,8 @@ mod tests {
         let project = Project {
             s_base_mva: 100.0,
             buses: vec![
-                Bus { id: "hv".into(), name: "HV".into(), kv: 12.47, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None },
-                Bus { id: "lv".into(), name: "LV".into(), kv: 0.48, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None },
+                Bus { id: "hv".into(), name: "HV".into(), kv: 12.47, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None },
+                Bus { id: "lv".into(), name: "LV".into(), kv: 0.48, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None },
             ],
             branches: vec![Branch {
                 id: "t".into(),

@@ -33,6 +33,10 @@ pub struct IeeeInput {
     pub electrode: Electrode,
     pub time_s: f64,
     pub time_min_s: f64,
+    /// Replaces the calculated full arcing current. The variation factor is not applied again.
+    pub arc_ka_override: Option<f64>,
+    /// Replaces the calculated reduced arcing current. The variation factor is not applied again.
+    pub arc_min_ka_override: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -61,6 +65,10 @@ pub struct IeeeOutput {
     /// The bolted current lies outside the IEEE 1584-2018 model range, so the
     /// result extrapolates the equations and must be reported as assumed.
     pub bolted_out_of_range: bool,
+    /// Gap, working distance, or enclosure width is outside the tested model.
+    /// The number is still returned and must be reported as assumed. The
+    /// enclosure-size clamp above 1244.6 mm is a warning and does not set this.
+    pub model_range_exceeded: bool,
 }
 
 /// A constant bolted-current interval in a time-varying fault profile.
@@ -77,6 +85,8 @@ pub struct ProfileEnergy {
     pub warnings: Vec<String>,
     /// At least one segment's bolted current is outside the model range.
     pub bolted_out_of_range: bool,
+    /// Template gap, working distance, or width-to-gap ratio is outside the model.
+    pub model_range_exceeded: bool,
 }
 
 const LV_BOLTED_RANGE_KA: std::ops::RangeInclusive<f64> = 0.5..=106.0;
@@ -171,7 +181,8 @@ pub fn integrate_profile(
         warnings.insert(0, format!("current profile: {}", bolted_range_warning(low, high, template.voc_kv)));
     }
     Ok(ProfileEnergy { energy_cal_cm2: energy_j / J_PER_CAL, boundary_mm, warnings,
-        bolted_out_of_range: out_of_range.is_some() })
+        bolted_out_of_range: out_of_range.is_some(),
+        model_range_exceeded: model_range_exceeded(template) })
 }
 
 pub fn calculate(input: &IeeeInput) -> Result<IeeeOutput, String> {
@@ -192,18 +203,22 @@ pub fn calculate(input: &IeeeInput) -> Result<IeeeOutput, String> {
     if bolted_out_of_range {
         warnings.push(bolted_range_warning(input.ibf_ka, input.ibf_ka, input.voc_kv));
     }
+    let model_range_exceeded = model_range_exceeded(input);
     if input.voc_kv <= 0.6 {
         if !(6.35..=76.2).contains(&input.gap_mm) {
-            warnings.push(format!("gap {:.1} mm is outside the 6.35–76.2 mm low-voltage model range", input.gap_mm));
+            warnings.push(format!("gap {:.1} mm is outside the 6.35–76.2 mm low-voltage model range; the IEEE 1584-2018 equations are extrapolated and the result is assumed", input.gap_mm));
         }
     } else if !(19.05..=254.0).contains(&input.gap_mm) {
-        warnings.push(format!("gap {:.1} mm is outside the 19.05–254 mm medium-voltage model range", input.gap_mm));
+        warnings.push(format!("gap {:.1} mm is outside the 19.05–254 mm medium-voltage model range; the IEEE 1584-2018 equations are extrapolated and the result is assumed", input.gap_mm));
     }
     if input.distance_mm < 305.0 {
-        warnings.push("working distance is below 305 mm".into());
+        warnings.push("working distance is below 305 mm; the IEEE 1584-2018 equations are extrapolated and the result is assumed".into());
     }
     if input.electrode.is_box() && input.width_mm < 4.0 * input.gap_mm {
-        warnings.push("enclosure width is less than four times the gap".into());
+        warnings.push("enclosure width is less than four times the gap; the IEEE 1584-2018 equations are extrapolated and the result is assumed".into());
+    }
+    if input.arc_ka_override.is_some() || input.arc_min_ka_override.is_some() {
+        warnings.push("Manufacturer effective arc current replaces the calculated arcing current. The variation factor is not applied to that current.".into());
     }
     if input.electrode.is_box() {
         for (name, value) in [("height", input.height_mm), ("width", input.width_mm)] {
@@ -245,7 +260,19 @@ pub fn calculate(input: &IeeeInput) -> Result<IeeeOutput, String> {
         afb_in: boundary / 25.4,
         warnings,
         bolted_out_of_range,
+        model_range_exceeded,
     })
+}
+
+fn model_range_exceeded(input: &IeeeInput) -> bool {
+    let gap_outside = if input.voc_kv <= 0.6 {
+        !(6.35..=76.2).contains(&input.gap_mm)
+    } else {
+        !(19.05..=254.0).contains(&input.gap_mm)
+    };
+    let distance_outside = input.distance_mm < 305.0;
+    let width_outside = input.electrode.is_box() && input.width_mm < 4.0 * input.gap_mm;
+    gap_outside || distance_outside || width_outside
 }
 
 struct Case {
@@ -268,6 +295,12 @@ struct Enclosure {
 
 fn evaluate(input: &IeeeInput, time_s: f64, reduced: bool, cf: f64, var_cf: f64) -> Result<Case, String> {
     let t_ms = time_s * 1000.0;
+    if let Some(i_arc) = if reduced { input.arc_min_ka_override } else { input.arc_ka_override } {
+        if !(i_arc.is_finite() && i_arc > 0.0) {
+            return Err("manufacturer effective arc current must be positive".into());
+        }
+        return energy_at_arc_current(input, i_arc, t_ms, cf);
+    }
     if input.voc_kv <= 0.6 {
         let i600 = i_arc_intermediate(input.electrode, 0.6, input.ibf_ka, input.gap_mm)?;
         let i_full = i_arc_final_lv(input.voc_kv, i600, input.ibf_ka)?;
@@ -305,6 +338,28 @@ fn evaluate(input: &IeeeInput, time_s: f64, reduced: bool, cf: f64, var_cf: f64)
             afb_mm: interpolate(input.voc_kv, b_levels[0], b_levels[1], b_levels[2]),
         })
     }
+}
+
+/// Incident energy at a stated arc current. Used when a manufacturer effective
+/// current replaces the calculated arcing current. The variation factor is not applied.
+fn energy_at_arc_current(input: &IeeeInput, i_arc: f64, t_ms: f64, cf: f64) -> Result<Case, String> {
+    if input.voc_kv <= 0.6 {
+        let energy = intermediate_energy(input.electrode, input.voc_kv, i_arc, input.ibf_ka, input.gap_mm, input.distance_mm, cf, t_ms, Some(i_arc))?;
+        let afb = afb_from_energy(input.electrode, input.voc_kv, energy, input.distance_mm)?;
+        return Ok(Case { i_arc, energy_j: energy, afb_mm: afb });
+    }
+    let levels = [0.6, 2.7, 14.3];
+    let mut e_levels = [0.0; 3];
+    let mut b_levels = [0.0; 3];
+    for n in 0..3 {
+        e_levels[n] = intermediate_energy(input.electrode, levels[n], i_arc, input.ibf_ka, input.gap_mm, input.distance_mm, cf, t_ms, None)?;
+        b_levels[n] = afb_from_energy(input.electrode, levels[n], e_levels[n], input.distance_mm)?;
+    }
+    Ok(Case {
+        i_arc,
+        energy_j: interpolate(input.voc_kv, e_levels[0], e_levels[1], e_levels[2]),
+        afb_mm: interpolate(input.voc_kv, b_levels[0], b_levels[1], b_levels[2]),
+    })
 }
 
 fn i_arc_intermediate(ec: Electrode, voc_kv: f64, ibf: f64, gap: f64) -> Result<f64, String> {
@@ -537,6 +592,8 @@ mod tests {
             electrode: Electrode::VCB,
             time_s: 0.197,
             time_min_s: 0.223,
+            arc_ka_override: None,
+            arc_min_ka_override: None,
         })
         .unwrap();
         close(full.i_arc_ka, 12.979, 0.0015);
@@ -562,6 +619,8 @@ mod tests {
             electrode: Electrode::VCB,
             time_s: 0.0613,
             time_min_s: 0.319,
+            arc_ka_override: None,
+            arc_min_ka_override: None,
         })
         .unwrap();
         close(out.i_arc_ka, 28.793, 0.002);
@@ -589,7 +648,8 @@ mod boundary_regression {
     fn both_boundaries_match_annex_d2_energy_distance_relation() {
         let out = calculate(&IeeeInput { voc_kv: 0.48, ibf_ka: 45.0, gap_mm: 32.0,
             distance_mm: 609.6, height_mm: 610.0, width_mm: 610.0, depth_mm: 254.0,
-            electrode: Electrode::VCB, time_s: 0.0613, time_min_s: 0.319 }).unwrap();
+            electrode: Electrode::VCB, time_s: 0.0613, time_min_s: 0.319,
+            arc_ka_override: None, arc_min_ka_override: None }).unwrap();
         // D.2 energies in J/cm2, with VCB distance exponent -1.598 and 1.2 cal/cm2 boundary.
         let full = 609.6 * (11.585_f64 / (1.2*4.184)).powf(1.0/1.598);
         let reduced = 609.6 * (53.156_f64 / (1.2*4.184)).powf(1.0/1.598);
@@ -615,6 +675,8 @@ mod profile_regression {
             electrode: Electrode::VCB,
             time_s: 0.3,
             time_min_s: 0.3,
+            arc_ka_override: None,
+            arc_min_ka_override: None,
         }
     }
 
@@ -718,6 +780,21 @@ mod profile_regression {
         let at_limit = calculate(&IeeeInput { height_mm: 1244.6, width_mm: 1244.6, ..input(4.16, 15.0) }).unwrap();
         assert!(!at_limit.warnings.iter().any(|w| w.contains("clamped")));
         assert!(!calculate(&input(0.48, 45.0)).unwrap().warnings.iter().any(|w| w.contains("clamped")));
+        assert!(!calculate(&input(0.48, 45.0)).unwrap().model_range_exceeded);
+        let mut narrow_gap = input(0.48, 45.0);
+        narrow_gap.gap_mm = 3.0;
+        let gap = calculate(&narrow_gap).unwrap();
+        assert!(gap.model_range_exceeded && gap.warnings.iter().any(|w| w.contains("gap") && w.contains("assumed")));
+        let mut close_work = input(0.48, 45.0);
+        close_work.distance_mm = 200.0;
+        assert!(calculate(&close_work).unwrap().model_range_exceeded);
+        let mut narrow_box = input(0.48, 45.0);
+        narrow_box.width_mm = 40.0;
+        assert!(calculate(&narrow_box).unwrap().model_range_exceeded);
+        let mut tall = input(4.16, 15.0);
+        tall.height_mm = 2000.0;
+        let clamped_only = calculate(&tall).unwrap();
+        assert!(!clamped_only.model_range_exceeded && clamped_only.warnings.iter().any(|w| w.contains("clamped")));
     }
 
     #[test]

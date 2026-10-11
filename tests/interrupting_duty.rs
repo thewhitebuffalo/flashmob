@@ -29,6 +29,7 @@ fn one_bus(source_xr: f64, bracing_ka: Option<f64>, bracing_test_xr: Option<f64>
         bracing_ka,
         main_rating_a: None,
         bracing_test_xr,
+        equipment_class: None,
     });
     project.sources.push(Source {
         id: "src".into(),
@@ -60,6 +61,7 @@ fn one_bus(source_xr: f64, bracing_ka: Option<f64>, bracing_test_xr: Option<f64>
         basis: String::new(),
         library: None,
         interrupting: Some(interrupting),
+        current_limiting: None,
     });
     project
 }
@@ -201,7 +203,7 @@ fn protected_branch_uses_the_terminal_current() {
     let mut project = one_bus(8.0, None, None, rating(100.0, 8.0, 480.0));
     project.buses.push(Bus {
         id: "load".into(), name: "Load".into(), kv: 0.48, shunt_kvar: 0.0,
-        bracing_ka: None, main_rating_a: None, bracing_test_xr: None,
+        bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None,
     });
     project.branches.push(Branch {
         id: "feeder".into(), name: "Feeder".into(), from: "bus".into(), to: "load".into(),

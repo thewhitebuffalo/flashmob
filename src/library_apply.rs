@@ -767,6 +767,7 @@ fn finish(request: &ApplyDevice, device: &LibraryDevice, unit: &TripUnit, curve:
             unsupported_elements,
         }),
         interrupting,
+        current_limiting: None,
     }
 }
 

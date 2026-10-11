@@ -11,15 +11,6 @@ fn run_arc(project: &Project) -> StudyOutput {
     }).expect("valid motor-backfeed study")
 }
 
-fn arc_failure<'a>(output: &'a StudyOutput, equipment_id: &str) -> &'a str {
-    assert!(output.arc_flash.as_ref().unwrap().iter().all(|row| row.equipment_id != equipment_id),
-        "{equipment_id} must not have a completed arc-flash row");
-    &output.arc_flash_failures.iter()
-        .find(|failure| failure.equipment_id == equipment_id)
-        .expect("missing explicit arc-flash failure")
-        .error
-}
-
 fn mcc_bolted_ka(output: &StudyOutput) -> f64 {
     output.fault.as_ref().unwrap().buses.iter()
         .find(|bus| bus.id == "mcc").unwrap()
@@ -27,13 +18,16 @@ fn mcc_bolted_ka(output: &StudyOutput) -> f64 {
 }
 
 #[test]
-fn sample_main_cannot_clear_motor_backfeed_but_panel_feeder_can() {
+fn sample_main_stages_motor_contribution_and_panel_feeder_stays_single_device() {
     let output = run_arc(&Project::sample());
-    let error = arc_failure(&output, "af-mcc");
-    assert!(error.to_lowercase().contains("motor") && error.contains("m1"), "{error}");
+    let mcc = output.arc_flash.as_ref().unwrap().iter().find(|row| row.equipment_id == "af-mcc")
+        .expect("the MCC arc continues until the utility breaker and the motor contribution both end");
+    assert!(mcc.assumed, "{}", mcc.duration_note);
+    assert!(mcc.duration_note.contains("m1") && mcc.duration_note.contains("initial arcing current"), "{}", mcc.duration_note);
+    assert!(output.arc_flash_failures.iter().all(|failure| failure.equipment_id != "af-mcc"));
 
-    assert!(output.arc_flash.as_ref().unwrap().iter().any(|row| row.equipment_id == "af-pnl"),
-        "opening the panel feeder isolates its fault from the utility and MCC motor");
+    let panel = output.arc_flash.as_ref().unwrap().iter().find(|row| row.equipment_id == "af-pnl").unwrap();
+    assert!(!panel.assumed, "{}", panel.duration_note);
     assert!(output.arc_flash_failures.iter().all(|failure| failure.equipment_id != "af-pnl"));
 }
 
@@ -45,8 +39,11 @@ fn source_decrement_does_not_erase_connected_motor_backfeed() {
         DecrementPoint { time_s: 0.2, current_ratio: 0.5 },
     ];
     let output = run_arc(&project);
-    let error = arc_failure(&output, "af-mcc");
-    assert!(error.contains("motor(s) m1 connected"), "{error}");
+    let row = output.arc_flash.as_ref().unwrap().iter().find(|row| row.equipment_id == "af-mcc")
+        .expect("motor contribution is calculated; decrement is not integrated across clearing events");
+    assert!(row.assumed && !row.decrement_applied);
+    assert!(row.duration_note.contains("was not integrated"), "{}", row.duration_note);
+    assert!(row.duration_note.contains("m1"), "{}", row.duration_note);
 }
 
 #[test]
@@ -57,7 +54,7 @@ fn motor_feeder_breaker_only_removes_backfeed_when_its_contact_is_open() {
     project.devices[0].breaker_interrupting_s = Some(0.04);
     project.buses.push(Bus {
         id: "motor-bus".into(), name: "Motor feeder load end".into(), kv: 0.48,
-        shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None,
+        shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None,
     });
     project.branches.push(Branch {
         id: "motor-feeder".into(), name: "Motor feeder".into(),
@@ -77,12 +74,26 @@ fn motor_feeder_breaker_only_removes_backfeed_when_its_contact_is_open() {
         bus: "mcc".into(), protected_branch: Some("motor-feeder".into()),
         curve: CurveSpec::Definite { pickup_a: 1.0, time_s: 0.05 },
         breaker_interrupting_s: Some(0.04), fuse_total_clearing: false,
-        basis: "collected".into(), curve_is_total_clearing: false, library: None, interrupting: None,
+        basis: "collected".into(), curve_is_total_clearing: false, library: None, interrupting: None, current_limiting: None,
     });
 
     let closed = run_arc(&project);
-    let error = arc_failure(&closed, "af-mcc");
-    assert!(error.to_lowercase().contains("motor") && error.contains("m1"), "{error}");
+    let closed_row = closed.arc_flash.as_ref().unwrap().iter().find(|row| row.equipment_id == "af-mcc").unwrap();
+    assert!(closed_row.assumed, "{}", closed_row.duration_note);
+    assert!((closed_row.time_s - 0.09).abs() < 1e-12, "{}", closed_row.time_s);
+    assert!((closed_row.time_min_s - 0.09).abs() < 1e-12, "{}", closed_row.time_min_s);
+    assert!(closed_row.duration_note.contains("initial arcing current"), "{}", closed_row.duration_note);
+    let closed_expected = calculate(&IeeeInput {
+        voc_kv: 0.48, ibf_ka: closed_row.bolted_ka, gap_mm: project.equipment[0].gap_mm,
+        distance_mm: project.equipment[0].distance_mm, height_mm: project.equipment[0].height_mm,
+        width_mm: project.equipment[0].width_mm, depth_mm: project.equipment[0].depth_mm,
+        electrode: project.equipment[0].electrode, time_s: 0.09, time_min_s: 0.09,
+        arc_ka_override: None, arc_min_ka_override: None,
+    }).unwrap();
+    for (got, want) in [(closed_row.energy_cal_cm2, closed_expected.energy_cal_cm2),
+        (closed_row.governing_cal_cm2, closed_expected.governing_cal_cm2), (closed_row.afb_mm, closed_expected.afb_mm)] {
+        assert!((got - want).abs() < 1e-9 * want, "got {got}, expected {want}");
+    }
 
     project.switches[0].closed = false;
     let open = run_arc(&project);
@@ -107,6 +118,7 @@ fn motor_feeder_breaker_only_removes_backfeed_when_its_contact_is_open() {
         distance_mm: equipment.distance_mm, height_mm: equipment.height_mm,
         width_mm: equipment.width_mm, depth_mm: equipment.depth_mm,
         electrode: equipment.electrode, time_s: 0.09, time_min_s: 0.09,
+        arc_ka_override: None, arc_min_ka_override: None,
     }).unwrap();
     for (got, want) in [(row.energy_cal_cm2, expected.energy_cal_cm2),
         (row.energy_min_cal_cm2, expected.energy_min_cal_cm2),

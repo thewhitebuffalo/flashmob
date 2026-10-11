@@ -327,7 +327,7 @@ fn disconnected_curved_source_does_not_change_static_island_clearing() {
 
 fn bus(id: &str) -> Bus {
     Bus { id: id.into(), name: id.into(), kv: 0.48, shunt_kvar: 0.0,
-        bracing_ka: None, main_rating_a: None, bracing_test_xr: None }
+        bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None }
 }
 
 fn line(id: &str, from: &str, to: &str) -> Branch {
@@ -405,7 +405,7 @@ fn ats_transfer_calculates_each_active_breaker_without_manual_duration() {
             id: id.into(), name: id.into(), bus: "load_bus".into(),
             curve: CurveSpec::Definite { pickup_a: 1.0, time_s: 0.05 },
             protected_branch: Some(branch.into()), breaker_interrupting_s: Some(0.04),
-            fuse_total_clearing: false, curve_is_total_clearing: false, basis: "collected".into(), library: None, interrupting: None,
+            fuse_total_clearing: false, curve_is_total_clearing: false, basis: "collected".into(), library: None, interrupting: None, current_limiting: None,
         });
     }
     let output = run_arc(&project);
@@ -455,6 +455,7 @@ fn hand_integrated(project: &Project, duration_s: f64) -> (f64, f64) {
             distance_mm: equipment.distance_mm, height_mm: equipment.height_mm,
             width_mm: equipment.width_mm, depth_mm: equipment.depth_mm,
             electrode: equipment.electrode, time_s: seconds, time_min_s: seconds,
+            arc_ka_override: None, arc_min_ka_override: None,
         }).unwrap();
         full += slice.energy_cal_cm2;
         reduced += slice.energy_min_cal_cm2;
@@ -489,7 +490,7 @@ fn low_voltage_two_step_decrement_matches_hand_summed_slice_energies() {
 fn medium_voltage_two_step_decrement_matches_hand_summed_slice_energies() {
     let mut project = manual_source_project();
     project.buses = vec![Bus { id: "swgr".into(), name: "4.16 kV switchgear".into(), kv: 4.16,
-        shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None }];
+        shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None }];
     project.branches.clear();
     project.sources[0].bus = "swgr".into();
     project.sources[0].mva_sc = 150.0;

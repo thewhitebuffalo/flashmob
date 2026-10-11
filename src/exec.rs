@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::connectivity::{self, Topology};
-use crate::model::{ArcEquipment, Branch, BranchKind, Bus, CurveSpec, DecrementPoint, Device, Electrode, EquipmentState, InterruptingRating, LibraryLink, Load, Motor, OperatingCase, Project, Source, SourceState, Switch, SwitchGroup, SwitchKind, SwitchState, XfmrConn};
+use crate::model::{ArcEquipment, Branch, BranchKind, Bus, CurrentLimiting, CurveSpec, DecrementPoint, Device, Electrode, EquipmentClass, EquipmentState, InterruptingRating, LibraryLink, Load, Motor, OperatingCase, Project, Source, SourceState, Switch, SwitchGroup, SwitchKind, SwitchState, XfmrConn};
 use crate::sld;
 use crate::study::{self, Studies, StudyOutput};
 use crate::tcc;
@@ -26,12 +26,15 @@ pub enum Command {
         #[serde(default)] shunt_kvar: f64,
         #[serde(default)] bracing_ka: Option<f64>,
         #[serde(default)] main_rating_a: Option<f64>,
+        #[serde(default)] equipment_class: Option<EquipmentClass>,
     },
     AddAssumption { id: String, statement: String },
     SetOptions {
         #[serde(default)] name: Option<String>,
         #[serde(default)] s_base_mva: Option<f64>,
         #[serde(default)] arc_duration_cap_s: Option<f64>,
+        #[serde(default)] escape_possible: Option<bool>,
+        #[serde(default)] motor_contribution_s: Option<f64>,
         #[serde(default)] prefault: Option<crate::model::Prefault>,
     },
     AddLine {
@@ -88,7 +91,7 @@ pub enum Command {
         #[serde(default)] x_subtransient_pu: Option<f64>,
         #[serde(default)] xr: Option<f64>,
     },
-    AddDevice { id: String, #[serde(default)] name: String, bus: String, curve: CurveSpec, #[serde(default)] basis: String, #[serde(default)] protected_branch: Option<String>, #[serde(default)] breaker_interrupting_s: Option<f64>, #[serde(default)] fuse_total_clearing: bool, #[serde(default)] curve_is_total_clearing: bool, #[serde(default)] library: Option<LibraryLink> },
+    AddDevice { id: String, #[serde(default)] name: String, bus: String, curve: CurveSpec, #[serde(default)] basis: String, #[serde(default)] protected_branch: Option<String>, #[serde(default)] breaker_interrupting_s: Option<f64>, #[serde(default)] fuse_total_clearing: bool, #[serde(default)] curve_is_total_clearing: bool, #[serde(default)] library: Option<LibraryLink>, #[serde(default)] current_limiting: Option<CurrentLimiting> },
     /// Copy a library point curve, dial curve, or trip setting onto a new device. The result is a snapshot.
     ApplyLibraryDevice {
         library_path: String,
@@ -156,6 +159,7 @@ pub enum Command {
         #[serde(default)] bracing_ka: Option<f64>,
         #[serde(default)] main_rating_a: Option<f64>,
         #[serde(default)] bracing_test_xr: Option<f64>,
+        #[serde(default)] equipment_class: Option<EquipmentClass>,
     },
     SetSource {
         id: String,
@@ -170,7 +174,7 @@ pub enum Command {
     },
     /// Change fields of an existing protective device. Omitted fields are kept;
     /// `clear` lists optional fields to remove (protected_branch,
-    /// breaker_interrupting_s, library, interrupting).
+    /// breaker_interrupting_s, library, interrupting, current_limiting).
     SetDevice {
         id: String,
         #[serde(default)] name: Option<String>,
@@ -183,6 +187,7 @@ pub enum Command {
         #[serde(default)] curve_is_total_clearing: Option<bool>,
         #[serde(default)] library: Option<LibraryLink>,
         #[serde(default)] interrupting: Option<InterruptingRating>,
+        #[serde(default)] current_limiting: Option<CurrentLimiting>,
         #[serde(default)] clear: Vec<String>,
     },
     Run { #[serde(default)] studies: Vec<String> },
@@ -296,7 +301,7 @@ fn apply_one(project: &mut Project, command: &Command, out: &mut Outputs) -> Res
     match command {
         Command::Sample => *project = Project::sample(),
         Command::Replace { project: next } => *project = next.clone(),
-        Command::AddBus { id, name, kv, shunt_kvar, bracing_ka, main_rating_a } => {
+        Command::AddBus { id, name, kv, shunt_kvar, bracing_ka, main_rating_a, equipment_class } => {
             fresh(id, project)?;
             project.buses.push(Bus {
                 id: id.clone(),
@@ -305,14 +310,14 @@ fn apply_one(project: &mut Project, command: &Command, out: &mut Outputs) -> Res
                 shunt_kvar: *shunt_kvar,
                 bracing_ka: *bracing_ka,
                 main_rating_a: *main_rating_a,
-                bracing_test_xr: None,
+                bracing_test_xr: None, equipment_class: *equipment_class,
             });
         }
         Command::AddAssumption { id, statement } => {
             fresh(id, project)?;
             project.assumptions.push(crate::model::Assumption { id: id.clone(), statement: statement.clone() });
         }
-        Command::SetOptions { name, s_base_mva, arc_duration_cap_s, prefault } => {
+        Command::SetOptions { name, s_base_mva, arc_duration_cap_s, escape_possible, motor_contribution_s, prefault } => {
             if let Some(name) = name {
                 project.name = name.clone();
             }
@@ -321,6 +326,12 @@ fn apply_one(project: &mut Project, command: &Command, out: &mut Outputs) -> Res
             }
             if let Some(cap) = arc_duration_cap_s {
                 project.arc_duration_cap_s = *cap;
+            }
+            if let Some(escape) = escape_possible {
+                project.escape_possible = *escape;
+            }
+            if let Some(window) = motor_contribution_s {
+                project.motor_contribution_s = *window;
             }
             if let Some(prefault) = prefault {
                 project.prefault = *prefault;
@@ -409,9 +420,9 @@ fn apply_one(project: &mut Project, command: &Command, out: &mut Outputs) -> Res
                 defaulted,
             });
         }
-        Command::AddDevice { id, name, bus, curve, basis, protected_branch, breaker_interrupting_s, fuse_total_clearing, curve_is_total_clearing, library } => {
+        Command::AddDevice { id, name, bus, curve, basis, protected_branch, breaker_interrupting_s, fuse_total_clearing, curve_is_total_clearing, library, current_limiting } => {
             fresh(id, project)?;
-            project.devices.push(Device { id: id.clone(), name: named(name, id), bus: bus.clone(), curve: curve.clone(), basis: basis.clone(), protected_branch: protected_branch.clone(), breaker_interrupting_s: *breaker_interrupting_s, fuse_total_clearing: *fuse_total_clearing, curve_is_total_clearing: *curve_is_total_clearing, library: library.clone(), interrupting: None });
+            project.devices.push(Device { id: id.clone(), name: named(name, id), bus: bus.clone(), curve: curve.clone(), basis: basis.clone(), protected_branch: protected_branch.clone(), breaker_interrupting_s: *breaker_interrupting_s, fuse_total_clearing: *fuse_total_clearing, curve_is_total_clearing: *curve_is_total_clearing, library: library.clone(), interrupting: None, current_limiting: current_limiting.clone() });
         }
         Command::ApplyLibraryDevice { library_path, device_id, id, bus, name, rating_a, current_base_a, voltage_v, function_name, protected_branch, library_name, fuse_total_clearing, dial, ct_ratio, tap_a, sensor_a, lt_pickup_function, lt_pickup_label, lt_delay_function, lt_delay_label, lt_delay_multiple, st_pickup_function, st_pickup_label, st_delay_function, st_delay_label, inst_function, inst_label, inst_s, pickup_base } => {
             fresh(id, project)?;
@@ -455,14 +466,15 @@ fn apply_one(project: &mut Project, command: &Command, out: &mut Outputs) -> Res
             })?;
             project.devices.push(device);
         }
-        Command::SetDevice { id, name, bus, curve, basis, protected_branch, breaker_interrupting_s, fuse_total_clearing, curve_is_total_clearing, library, interrupting, clear } => {
+        Command::SetDevice { id, name, bus, curve, basis, protected_branch, breaker_interrupting_s, fuse_total_clearing, curve_is_total_clearing, library, interrupting, current_limiting, clear } => {
             for field in clear {
                 let settable = match field.as_str() {
                     "protected_branch" => protected_branch.is_some(),
                     "breaker_interrupting_s" => breaker_interrupting_s.is_some(),
                     "library" => library.is_some(),
                     "interrupting" => interrupting.is_some(),
-                    other => return Err(format!("set_device cannot clear '{other}'; clearable fields are protected_branch, breaker_interrupting_s, library, interrupting")),
+                    "current_limiting" => current_limiting.is_some(),
+                    other => return Err(format!("set_device cannot clear '{other}'; clearable fields are protected_branch, breaker_interrupting_s, library, interrupting, current_limiting")),
                 };
                 if settable { return Err(format!("set_device both sets and clears '{field}'")); }
             }
@@ -477,12 +489,14 @@ fn apply_one(project: &mut Project, command: &Command, out: &mut Outputs) -> Res
             if let Some(v) = curve_is_total_clearing { device.curve_is_total_clearing = *v; }
             if let Some(v) = library { device.library = Some(v.clone()); }
             if let Some(v) = interrupting { device.interrupting = Some(v.clone()); }
+            if let Some(v) = current_limiting { device.current_limiting = Some(v.clone()); }
             for field in clear {
                 match field.as_str() {
                     "protected_branch" => device.protected_branch = None,
                     "breaker_interrupting_s" => device.breaker_interrupting_s = None,
                     "library" => device.library = None,
                     "interrupting" => device.interrupting = None,
+                    "current_limiting" => device.current_limiting = None,
                     _ => {}
                 }
             }
@@ -521,7 +535,7 @@ fn apply_one(project: &mut Project, command: &Command, out: &mut Outputs) -> Res
             });
         }
         Command::Remove { id } => remove(project, id)?,
-        Command::SetBus { id, name, kv, shunt_kvar, bracing_ka, main_rating_a, bracing_test_xr } => {
+        Command::SetBus { id, name, kv, shunt_kvar, bracing_ka, main_rating_a, bracing_test_xr, equipment_class } => {
             let bus = project.buses.iter_mut().find(|b| b.id == *id).ok_or_else(|| format!("no bus '{id}'"))?;
             if let Some(name) = name { bus.name = name.clone(); }
             if let Some(kv) = kv { bus.kv = *kv; }
@@ -529,6 +543,7 @@ fn apply_one(project: &mut Project, command: &Command, out: &mut Outputs) -> Res
             if let Some(ka) = bracing_ka { bus.bracing_ka = Some(*ka); }
             if let Some(amps) = main_rating_a { bus.main_rating_a = Some(*amps); }
             if let Some(xr) = bracing_test_xr { bus.bracing_test_xr = Some(*xr); }
+            if let Some(class) = equipment_class { bus.equipment_class = Some(*class); }
         }
         Command::SetSource { id, mva_sc, decrement_curve, xr, v_pu, x0_over_x1, r0_over_r1, is_slack, in_service } => {
             let source = project.sources.iter_mut().find(|s| s.id == *id).ok_or_else(|| format!("no source '{id}'"))?;
@@ -745,13 +760,13 @@ pub fn schema() -> serde_json::Value {
         "exec_semantics": "Commands run in order; intermediate states may be incomplete. The final project is validated: any validation error is listed in validation_errors and makes ok false (the CLI exits 1). Model edits clear results and every derived view; run, topology, sld, tcc, and export_package do not. sld and tcc reuse the last full study, including one whose load flow failed, instead of rerunning.",
         "export_package_options": "output: directory, or an .xml path whose siblings are written beside it; other file-like paths (.json, .csv, .txt, .tab, .svg) are rejected. Existing files are refused unless \"overwrite\": true. The project must validate.",
         "topology": "Validated entered connections only: every bus lists branch terminal and neighbor plus attached source, load, motor, device, and arc equipment IDs. Global records give branch endpoints and switch link, source base in-service state, switch base closed state, group rules, named operating cases, and each device's entered protected branch terminal. Null placement means it was not entered. No study or protection inference is performed.",
-        "source_decrement": "Optional add_source/set_source decrement_curve is an array of {time_s,current_ratio} for symmetrical three-phase RMS short-circuit current at source terminals relative to initial mva_sc. First point must be {time_s:0,current_ratio:1}; times increase strictly and ratios stay positive. Linear interpolation in time holds the first/last value outside entered points. An empty array clears the curve; omission retains the constant-current model. Arc energy uses at most 10 ms midpoint, quasi-steady network samples. For an isolating upstream breaker with an entered trip-only curve, protected terminal, and breaker_interrupting_s, relay trip elements integrate separately over full and reduced sampled arcing currents; breaker interruption is added after trip. Timers assume immediate reset below pickup and the result is marked assumed if a reset occurs. A total-clearing curve (fuse_total_clearing or curve_is_total_clearing) does not establish dynamic clearing. Optional clearing_s overrides automatic clearing. fallback_duration_s is stored and is not used as an arc duration; unresolved clearing is an arc-flash failure that names the missing data. arc_duration_cap_s bounds the study, never supplies a field clearing setting.",
-        "point_curves": "A device curve {\"type\":\"points\"} stores [amperes, seconds] pairs in points (the faster / minimum band) and optional max_points (the slower / maximum or total-clearing band). Currents increase strictly and times never increase; max_points is never faster than points where they overlap. Time is interpolated in log(current)-log(time). Below the first point the device does not operate. beyond_last is required: hold_last_time keeps the last time above the last point and marks results assumed; unavailable gives no time there (clearing is unresolved). Trip, clearing, coordination, and arc-flash times use the max band when present; TCC draws both bands. band_interpretation \"assumed\" (default \"entered\") marks results that rely on an inferred band meaning as assumed. Clearing adds breaker_interrupting_s to the governing band, unless curve_is_total_clearing (or fuse_total_clearing for a fuse) says that band already includes total clearing. A library fuse (library category containing \"fuse\") with a point curve, and with neither total-clearing flag nor breaker_interrupting_s, estimates clearing by IEEE 1584-2002 section 4.6 step 5. One band is the average melting time: multiply by 1.15 at or under 0.03 s and by 1.10 above 0.03 s. Two bands use the slower band as the high tolerance and do not apply that factor again. Current above a last point of 0.01 s uses 0.01 s. The estimate is assumed and is not the published total-clearing curve. A point curve without that fuse category still needs breaker_interrupting_s or a total-clearing flag. Current below the first point does not operate.",
-        "total_clearing_flags": "Device clearing is the curve time plus breaker_interrupting_s, unless the curve already includes total clearing. curve_is_total_clearing: true says so for any device (for example a breaker whose point-curve max band is total clearing). fuse_total_clearing: true is kept unchanged for fuses: it implies curve_is_total_clearing and also marks the device as a fuse (SLD fuse symbol, package device type Fuse). Existing projects are not migrated; both flags are read as entered. Either flag together with breaker_interrupting_s is a validation error. add_device and set_device accept both. A library fuse melting curve can also estimate clearing by the IEEE 1584-2002 section 4.6 step 5 adjustment described under point_curves. That adjustment does not set fuse_total_clearing.",
-        "apply_library_device": "Copies a library point curve onto a new project device. The curve is a snapshot (studies do not read the library file). Multiples are scaled to amperes. Two bands are ordered faster then slower and marked assumed. fuse_total_clearing stays false unless set: a slower library band is often a current-tolerance side, not total clearing. For a fuse category, arc flash may still estimate clearing from that melting curve by IEEE 1584-2002 section 4.6 step 5. The estimate is assumed and is not the published total-clearing curve. A time_dial_curve_family is scaled by dial, tap_a (secondary amperes), and ct_ratio to one primary-ampere band. Trip settings named by function and label (lt_pickup, lt_delay, optional st_pickup, st_delay, and inst) build a thermal-magnetic curve from sensor_a; lt_delay_multiple says the current multiple of the long-time delay. library_path is the library JSON; an empty library_name stores that path. One agreeing symmetrical interrupting rating is copied onto the device; several different duties are left unset and named. An empty library_path uses the device library built into the program. A missing file or an invalid library does not change the project.",
-        "device_library_link": "Optional device.library records which device-library entry a device came from: device_id (required), library, manufacturer, type, style, category, size, rating_a, voltage_v, modified, unsupported_elements. Studies use the curve and the device fields. The category is also read to recognize a library fuse for the IEEE 1584-2002 section 4.6 step 5 melting-time adjustment. add_device accepts it; set_device changes it, and set_device clear [\"library\"] removes it.",
+        "source_decrement": "Optional add_source/set_source decrement_curve is an array of {time_s,current_ratio} for symmetrical three-phase RMS short-circuit current at source terminals relative to initial mva_sc. First point must be {time_s:0,current_ratio:1}; times increase strictly and ratios stay positive. Linear interpolation in time holds the first/last value outside entered points. An empty array clears the curve; omission retains the constant-current model. Arc energy uses at most 10 ms midpoint, quasi-steady network samples. For an isolating upstream breaker with an entered trip-only curve, protected terminal, and breaker_interrupting_s, relay trip elements integrate separately over full and reduced sampled arcing currents; breaker interruption is added after trip. Timers assume immediate reset below pickup and the result is marked assumed if a reset occurs. A total-clearing curve (fuse_total_clearing or curve_is_total_clearing) does not establish dynamic clearing. Optional clearing_s overrides automatic clearing. fallback_duration_s is stored and is not used as an arc duration; unresolved clearing is an arc-flash failure that names the missing data. arc_duration_cap_s bounds the study when escape_possible is true (IEEE 1584-2018 Clause 6.9.1, a person can move away) and that capped result is assumed. When escape_possible is false the cap is not applied. A multi-source or motor-fed arc does not integrate source decrement across clearing events. The cap never supplies a field clearing setting.",
+        "point_curves": "A device curve {\"type\":\"points\"} stores [amperes, seconds] pairs in points (the faster / minimum band) and optional max_points (the slower / maximum or total-clearing band). Currents increase strictly and times never increase; max_points is never faster than points where they overlap. Time is interpolated in log(current)-log(time). Below the first point the device does not operate. beyond_last is required: hold_last_time keeps the last time above the last point and marks results assumed; unavailable gives no time there (clearing is unresolved). Trip, clearing, coordination, and arc-flash times use the max band when present; TCC draws both bands. band_interpretation \"assumed\" (default \"entered\") marks results that rely on an inferred band meaning as assumed. Clearing adds breaker_interrupting_s to the governing band, unless curve_is_total_clearing (or fuse_total_clearing for a fuse) says that band already includes total clearing. A library fuse (library category containing \"fuse\") with a point curve, and with neither total-clearing flag nor breaker_interrupting_s, estimates clearing by IEEE 1584-2018 Clause 6.9.2. Add 10% of the melting time plus 0.004 s. If that total is under 0.01 s, use 0.01 s. The same adjustment applies to one average-melt band and to the slower band of a tolerance pair. A published total-clearing curve is not adjusted. Current above a last point of 0.01 s uses 0.01 s and does not reduce the arc current unless manufacturer let-through is entered on current_limiting. The estimate is assumed and is not an arc-flash label. A point curve without that fuse category still needs breaker_interrupting_s or a total-clearing flag. Current below the first point does not operate.",
+        "total_clearing_flags": "Device clearing is the curve time plus breaker_interrupting_s, unless the curve already includes total clearing. curve_is_total_clearing: true says so for any device (for example a breaker whose point-curve max band is total clearing). fuse_total_clearing: true is kept unchanged for fuses: it implies curve_is_total_clearing and also marks the device as a fuse (SLD fuse symbol, package device type Fuse). Existing projects are not migrated; both flags are read as entered. Either flag together with breaker_interrupting_s is a validation error. add_device and set_device accept both. A library fuse melting curve can also estimate clearing by the IEEE 1584-2018 Clause 6.9.2 adjustment described under point_curves. That adjustment does not set fuse_total_clearing.",
+        "apply_library_device": "Copies a library point curve onto a new project device. The curve is a snapshot (studies do not read the library file). Multiples are scaled to amperes. Two bands are ordered faster then slower and marked assumed. fuse_total_clearing stays false unless set: a slower library band is often a current-tolerance side, not total clearing. For a fuse category, arc flash may still estimate clearing from that melting curve by IEEE 1584-2018 Clause 6.9.2 (10% of the melting time plus 0.004 s, and 0.01 s when that total is shorter). The estimate is assumed and is not the published total-clearing curve. A time_dial_curve_family is scaled by dial, tap_a (secondary amperes), and ct_ratio to one primary-ampere band. Trip settings named by function and label (lt_pickup, lt_delay, optional st_pickup, st_delay, and inst) build a thermal-magnetic curve from sensor_a; lt_delay_multiple says the current multiple of the long-time delay. library_path is the library JSON; an empty library_name stores that path. One agreeing symmetrical interrupting rating is copied onto the device; several different duties are left unset and named. An empty library_path uses the device library built into the program. A missing file or an invalid library does not change the project.",
+        "device_library_link": "Optional device.library records which device-library entry a device came from: device_id (required), library, manufacturer, type, style, category, size, rating_a, voltage_v, modified, unsupported_elements. Studies use the curve and the device fields. The category is also read to recognize a library fuse for the IEEE 1584-2018 Clause 6.9.2 melting-time adjustment. add_device accepts it; set_device changes it, and set_device clear [\"library\"] removes it.",
         "interrupting_duty": "After a fault study is solved, including when that fault result is kept only for arc flash and then omitted from the output, each braced bus and each device with an interrupting rating is checked. The half-cycle factor is sqrt(1 + 2*exp(-2*pi/(X/R))); no resistance (infinite X/R) uses sqrt(3), and X/R of 0 uses 1. A bus with bracing_ka uses the three-phase or line-to-ground fault with the greater half-cycle rms. A device with protected_branch uses the bolted three-phase current through that branch at each terminal and keeps the larger one. Line-to-ground current through the branch is not stored, so it is not compared. Without protected_branch the greater of the device bus three-phase and line-to-ground faults is used. System X/R is the faulted bus Thevenin X/R, not a separate-network calculation. With a test X/R, adjusted symmetrical kA is rated symmetrical kA times factor(test X/R) / factor(system X/R), and the duty is within_rating when half-cycle rms is within the rated half-cycle rms. Bracing without a test X/R is not an asymmetrical pass: symmetrical current above the bracing is exceeds_rating, otherwise not_adjusted. exceeds_rating and not_adjusted each add one warning; within_rating does not. If interrupting voltage_v is positive and the device bus nominal kV differs by more than 10 percent, the row notes the mismatch and the current comparison still stands. An invalid fault result produces no rows. set_bus accepts bracing_test_xr. set_device accepts interrupting (symmetrical_ka, test_xr, voltage_v) and can clear interrupting.",
-        "motor_backfeed": "A motor remains a possible fault contributor while connected to the arc, even after the selected utility/generator main opens. Automatic single-device arc clearing fails visibly if any motor is still reachable after that branch opens. An already-open motor feeder branch disconnects its motor. A breaker that trips during the arc is not yet treated as an opening event; its time and motor-current decay require staged modeling. Place the motor on a separate bus behind a finite-impedance feeder branch with a switch/device to represent the breaker. The built-in sample has no motor feeder breaker, so its MCC arc-flash result is unresolved. An explicit equipment clearing_s may override only when it represents total exposure from all paths.",
+        "motor_backfeed": "The arc continues until the last connected utility, generator, or motor clears (IEEE 1584-2018 Clause 6.9). A single device that isolates every in-service source and leaves no motor uses that device's time. Otherwise each located device is timed at the initial arcing current through its own protected terminal, branches open at those times, and the bolted current is recalculated between openings. A motor with a feeder device clears when that device clears. A motor with no feeder device contributes for motor_contribution_s (default five 60 Hz cycles) and is then removed; that window is assumed because the guide does not publish a decay time. A source with no isolating device still fails. The built-in sample MCC has no motor feeder breaker, so its arc-flash row is calculated and marked assumed. An explicit equipment clearing_s overrides staging only when it represents total exposure from all paths. Do not invent feeder length or cable size.",
         "operating_cases": "Base switch.closed and source.in_service values define normal operation. Each named operating case overrides listed switch/source states. Its arc equipment starts with no inherited upstream_device, clearing_s, or fallback_duration_s; list case-specific values in equipment_states, or leave them absent for automatic protection selection or an explicit failure. At most one switch can control a branch. A switch group limits simultaneous closures using max_closed. `run` evaluates the base configuration and each named valid case; inspect per-case failures before using an arc-flash maximum.",
         "switch_model": "Opening a switch removes its entire referenced branch, including any transformer grounding shunt or line charging on that branch. For an independent breaker or ATS contact, use a separate short finite-impedance branch with separate bus nodes; put transformers and other equipment on their own branches. The closed field is required for every switch, especially normally open ties and ATS contacts.",
         "switch_kinds": ["breaker", "tie", "ats"],
@@ -781,8 +796,7 @@ mod tests {
         assert!(results.fault.unwrap().buses.len() == 3);
         let arcs = results.arc_flash.unwrap();
         assert!(arcs.iter().any(|r| r.bus_id == "pnl" && r.standard == "IEEE 1584-2018"));
-        assert!(results.arc_flash_failures.iter().any(|failure|
-            failure.bus_id == "mcc" && failure.error.contains("motor(s) m1 connected")));
+        assert!(arcs.iter().any(|row| row.bus_id == "mcc" && row.assumed && row.duration_note.contains("m1")));
         let svg = response.sld_svg.unwrap();
         assert!(svg.contains("MCC-1") && svg.contains("kA") && svg.contains("CAL/CM2"));
         let tcc = response.tcc_svg.unwrap();

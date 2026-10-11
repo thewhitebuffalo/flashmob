@@ -360,10 +360,10 @@ fn applied_two_band_fuse_validates_and_clears_on_the_slow_band() {
     let mut request = req(7);
     request.protected_branch = Some("feeder".into());
     let unmarked = apply_device(&lib(vec![sample_device("LV Fuse", vec![unit(100.0, vec![slow_then_fast()])])]), &request).unwrap();
-    // Two bands: the slower time is the high tolerance. The 10% / 15% factor is not applied again.
+    // Two bands: the slower time is still a melting time. Clause 6.9.2 adds 10% plus 0.004 s.
     let unmarked_clearing = curves::average_melt_clearing(&unmarked, 1000.0).unwrap();
-    assert!((unmarked_clearing.seconds - 1.0).abs() < 1e-12);
-    assert!(matches!(unmarked_clearing.adjustment, curves::MeltAdjustment::HighTolerance));
+    assert!((unmarked_clearing.seconds - (1.0 * 1.10 + 0.004)).abs() < 1e-12);
+    assert!(matches!(unmarked_clearing.adjustment, curves::MeltAdjustment::AverageMelt { melt_s, two_bands: true } if (melt_s - 1.0).abs() < 1e-12));
     assert!(curves::average_melt_clearing(&apply_one("Molded Case", slow_then_fast()).unwrap(), 1000.0).is_none());
     request.fuse_total_clearing = true;
     let device = apply_device(&lib(vec![sample_device("LV Fuse", vec![unit(100.0, vec![slow_then_fast()])])]), &request).unwrap();

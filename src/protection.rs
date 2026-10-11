@@ -311,7 +311,10 @@ mod fallback_tests {
         p.equipment[0].clearing_s = None;
         p.equipment[0].upstream_device = Some("brk-feeder".into());
         let result = study::run(&p, Studies::all()).unwrap();
-        assert!(result.arc_flash_failures.iter().any(|f| f.equipment_id == "af-mcc" && f.error.contains("does not isolate")));
+        assert!(result.arc_flash_failures.iter().any(|f|
+            f.equipment_id == "af-mcc" && f.error.contains("brk-feeder") && f.error.contains("isolates nothing")),
+            "{:?}", result.arc_flash_failures.iter().map(|f| &f.error).collect::<Vec<_>>());
+        assert!(result.arc_flash.as_ref().unwrap().iter().all(|row| row.equipment_id != "af-mcc"));
         p.equipment[0].fallback_duration_s = Some(-1.0);
         assert!(!p.validate().is_empty());
     }

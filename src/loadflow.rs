@@ -429,8 +429,8 @@ mod tests {
             name: "two bus".into(),
             s_base_mva: 100.0,
             buses: vec![
-                Bus { id: "a".into(), name: "A".into(), kv: 13.8, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None },
-                Bus { id: "b".into(), name: "B".into(), kv: 13.8, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None },
+                Bus { id: "a".into(), name: "A".into(), kv: 13.8, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None },
+                Bus { id: "b".into(), name: "B".into(), kv: 13.8, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None },
             ],
             branches: vec![Branch {
                 id: "l".into(),

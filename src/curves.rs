@@ -189,22 +189,21 @@ pub fn trip_time_device(device: &Device, amps: f64) -> Option<f64> {
     trip_time(&device.curve, amps)
 }
 
-/// IEEE 1584-2002 section 4.6 step 5. At or under this melting time, add 15%.
-const AVERAGE_MELT_BREAK_S: f64 = 0.03;
-const AVERAGE_MELT_SHORT_FACTOR: f64 = 1.15;
-const AVERAGE_MELT_LONG_FACTOR: f64 = 1.10;
-/// Plotted bottom of a fuse time-current curve. Current above that point uses this time.
+/// IEEE 1584-2018 Clause 6.9.2. Add 10% of the melting time plus this many seconds.
+const MELT_FACTOR: f64 = 1.10;
+const MELT_ADDER_S: f64 = 0.004;
+/// Plotted bottom of a fuse time-current curve. Current above that point, and any
+/// adjusted clearing time shorter than this, uses this time.
 const FUSE_CURVE_BOTTOM_S: f64 = 0.01;
 
 /// How a melting curve was turned into an estimated clearing time.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MeltAdjustment {
-    /// One band, read as the average melting curve.
-    AverageMelt { melt_s: f64, factor: f64 },
-    /// Two bands. The slower band is the high tolerance of one curve.
-    /// The 10% or 15% time factor is not applied again.
-    HighTolerance,
-    /// Arcing current is above the curve's 0.01 s point.
+    /// Average melt, or the slower band of a melt tolerance pair.
+    /// Clearing time is `max(0.01, 1.10 * melt_s + 0.004)`.
+    AverageMelt { melt_s: f64, two_bands: bool },
+    /// Arcing current is above the curve's 0.01 s point. No let-through data
+    /// was entered, so the effective arc current is not reduced.
     CurveBottom { last_a: f64 },
 }
 
@@ -219,16 +218,22 @@ impl MeltClearing {
     /// Basis for a study note. Names the rule and says the time is not label-ready.
     pub fn detail(&self, amps: f64) -> String {
         match self.adjustment {
-            MeltAdjustment::AverageMelt { melt_s, factor } => format!(
-                "IEEE 1584-2002 section 4.6 step 5 reads the average melting time {melt_s:.3} s at {amps:.0} A and multiplies by {factor:.2} (1.15 at or under 0.03 s, 1.10 above 0.03 s), giving {seconds:.3} s. This is not the published total-clearing curve and is not for an arc-flash label.",
-                seconds = self.seconds
-            ),
-            MeltAdjustment::HighTolerance => format!(
-                "The estimated clearing time {seconds:.3} s is the slower band at {amps:.0} A, the high tolerance of the published melting curve. IEEE 1584-2002 section 4.6 step 5 multiplies a single average-melt time by 1.15 at or under 0.03 s and by 1.10 above 0.03 s; that factor is not applied again on a tolerance band. This is not the published total-clearing curve and is not for an arc-flash label.",
-                seconds = self.seconds
-            ),
+            MeltAdjustment::AverageMelt { melt_s, two_bands } => {
+                let adjusted = melt_s * MELT_FACTOR + MELT_ADDER_S;
+                let floor = if adjusted < FUSE_CURVE_BOTTOM_S {
+                    format!(" The adjusted time {adjusted:.4} s is under 0.01 s, so 0.01 s is used.")
+                } else {
+                    String::new()
+                };
+                let seconds = self.seconds;
+                if two_bands {
+                    format!("The melting time {melt_s:.3} s is the slower band at {amps:.0} A, the high tolerance of the published melting curve. IEEE 1584-2018 Clause 6.9.2 adds 10% of that melting time plus 0.004 s, giving {seconds:.3} s.{floor} The slower band is not the published total-clearing curve and this estimate is not for an arc-flash label.")
+                } else {
+                    format!("IEEE 1584-2018 Clause 6.9.2 reads the average melting time {melt_s:.3} s at {amps:.0} A and adds 10% of that time plus 0.004 s, giving {seconds:.3} s.{floor} This is not the published total-clearing curve and is not for an arc-flash label.")
+                }
+            }
             MeltAdjustment::CurveBottom { last_a } => format!(
-                "The arcing current {amps:.0} A is above the melting curve's last point ({last_a:.0} A at 0.01 s). IEEE 1584-2002 section 4.6 step 5 uses 0.01 s. This is not the published total-clearing curve and is not for an arc-flash label."
+                "The arcing current {amps:.0} A is above the melting curve's last point ({last_a:.0} A at 0.01 s). IEEE 1584-2018 Clause 6.9.2 permits 0.01 s. No peak let-through data was entered, so the effective arc current was not reduced. This is not the published total-clearing curve and is not for an arc-flash label."
             ),
         }
     }
@@ -254,26 +259,25 @@ fn adjusted_melt(two_bands: bool, melt_s: f64) -> Option<MeltClearing> {
     if !melt_s.is_finite() || melt_s <= 0.0 {
         return None;
     }
-    if two_bands {
-        return Some(MeltClearing { seconds: melt_s, adjustment: MeltAdjustment::HighTolerance });
+    let adjusted = melt_s * MELT_FACTOR + MELT_ADDER_S;
+    if !adjusted.is_finite() || adjusted <= 0.0 {
+        return None;
     }
-    let factor = if melt_s <= AVERAGE_MELT_BREAK_S { AVERAGE_MELT_SHORT_FACTOR } else { AVERAGE_MELT_LONG_FACTOR };
-    let seconds = melt_s * factor;
-    seconds.is_finite().then_some(MeltClearing {
-        seconds,
-        adjustment: MeltAdjustment::AverageMelt { melt_s, factor },
+    Some(MeltClearing {
+        seconds: adjusted.max(FUSE_CURVE_BOTTOM_S),
+        adjustment: MeltAdjustment::AverageMelt { melt_s, two_bands },
     })
 }
 
 /// Estimated clearing for a library fuse whose curve is melting data.
 ///
-/// One band is the average melting curve: times 1.15 at or under 0.03 s, and
-/// times 1.10 above 0.03 s (IEEE 1584-2002 section 4.6 step 5). Two bands are
-/// a tolerance pair, so the slower band is the clearing time and that factor
-/// is not applied again. Current above a last point of 0.01 s uses 0.01 s.
-/// Current below the first point, or above a last point that is not that
-/// 0.01 s bottom, returns None. A total-clearing flag or `breaker_interrupting_s`
-/// keeps the ordinary clearing path instead.
+/// IEEE 1584-2018 Clause 6.9.2: add 10% of the melting time plus 0.004 s. If
+/// that total is under 0.01 s, use 0.01 s. The same adjustment applies to one
+/// average-melt band and to the slower band of a tolerance pair. It is skipped
+/// when the device is marked total clearing or has `breaker_interrupting_s`.
+/// Current above a last point of 0.01 s uses 0.01 s and does not reduce the
+/// arc current. Current below the first point, or above a last point that is
+/// not that 0.01 s bottom, returns None.
 pub fn average_melt_clearing(device: &Device, amps: f64) -> Option<MeltClearing> {
     if !average_melt_fuse(device) || !amps.is_finite() || amps <= 0.0 {
         return None;
@@ -293,7 +297,7 @@ pub fn average_melt_clearing(device: &Device, amps: f64) -> Option<MeltClearing>
 }
 
 /// Total clearing from a curve that already includes it, from breaker time
-/// added to the operating time, or from the IEEE 1584-2002 section 4.6 step 5
+/// added to the operating time, or from the IEEE 1584-2018 Clause 6.9.2
 /// estimate for a library fuse melting curve.
 pub fn clearing_time(device: &Device, amps: f64) -> Option<f64> {
     if let Some(melt) = average_melt_clearing(device, amps) {
@@ -398,6 +402,22 @@ impl DynamicRelay {
     /// Whether any element is timing (at or above its pickup) at this current.
     pub fn timing_at(&self, amps: f64) -> Result<bool, String> {
         Ok(self.element_times(amps)?.iter().any(Option::is_some))
+    }
+
+    /// Seconds until the earliest element already timing would operate if current stays at `amps`.
+    pub fn remaining_s(&self, amps: f64) -> Result<f64, String> {
+        let times = self.element_times(amps)?;
+        let mut best: Option<f64> = None;
+        for (n, time) in times.into_iter().enumerate() {
+            let Some(time) = time else { continue };
+            if time.is_infinite() { continue; }
+            if !time.is_finite() || time <= 0.0 {
+                return Err("calculated relay operating time is invalid at the sampled current".into());
+            }
+            let remaining = (1.0 - self.progress[n]).max(0.0) * time;
+            best = Some(best.map_or(remaining, |prior| prior.min(remaining)));
+        }
+        best.ok_or_else(|| "relay is not timing at this current".into())
     }
 
     /// Entered current pickups, including optional short-time and instantaneous elements.
@@ -859,7 +879,7 @@ mod point_curve_tests {
         let mut device = Device {
             id: "d".into(), name: "d".into(), bus: "b".into(), curve: curve(true, PointTail::Unavailable),
             basis: String::new(), protected_branch: None, breaker_interrupting_s: Some(0.05),
-            fuse_total_clearing: false, curve_is_total_clearing: false, library: None, interrupting: None,
+            fuse_total_clearing: false, curve_is_total_clearing: false, library: None, interrupting: None, current_limiting: None,
         };
         close(clearing_time(&device, 1000.0).unwrap(), 2.05);
         device.fuse_total_clearing = true;
@@ -924,32 +944,39 @@ mod point_curve_tests {
             fuse_total_clearing: false, curve_is_total_clearing: false,
             library: Some(crate::model::LibraryLink { device_id: 1, category: category.into(), ..Default::default() }),
             interrupting: None,
+            current_limiting: None,
         }
     }
 
     #[test]
-    fn average_melt_uses_fifteen_percent_at_or_under_30_ms_and_ten_above() {
+    fn average_melt_adds_ten_percent_plus_4_ms_and_floors_at_10_ms() {
         let short = fuse(flat(0.02), "Fuses - Low Voltage");
         let clearing = average_melt_clearing(&short, 400.0).unwrap();
-        let MeltAdjustment::AverageMelt { melt_s, factor } = clearing.adjustment else { panic!("{:?}", clearing.adjustment) };
+        let MeltAdjustment::AverageMelt { melt_s, two_bands } = clearing.adjustment else { panic!("{:?}", clearing.adjustment) };
         close(melt_s, 0.02);
-        assert_eq!(factor, 1.15);
-        close(clearing.seconds, melt_s * factor);
-        assert!(clearing.detail(400.0).contains("IEEE 1584-2002") && clearing.detail(400.0).contains("not for an arc-flash label"));
+        assert!(!two_bands);
+        close(clearing.seconds, 0.02 * 1.10 + 0.004);
+        assert!(clearing.detail(400.0).contains("IEEE 1584-2018") && clearing.detail(400.0).contains("not for an arc-flash label"));
 
         let boundary = fuse(flat(0.03), "LV Fuse");
-        close(clearing_time(&boundary, 400.0).unwrap(), 0.03 * 1.15);
+        close(clearing_time(&boundary, 400.0).unwrap(), 0.03 * 1.10 + 0.004);
 
         let long = fuse(flat(0.04), "Fuses - Low Voltage");
         let clearing = average_melt_clearing(&long, 400.0).unwrap();
-        let MeltAdjustment::AverageMelt { melt_s, factor } = clearing.adjustment else { panic!("{:?}", clearing.adjustment) };
+        let MeltAdjustment::AverageMelt { melt_s, two_bands } = clearing.adjustment else { panic!("{:?}", clearing.adjustment) };
         close(melt_s, 0.04);
-        assert_eq!(factor, 1.10);
-        close(clearing.seconds, melt_s * factor);
+        assert!(!two_bands);
+        close(clearing.seconds, melt_s * 1.10 + 0.004);
+
+        // 1.10 * 0.005 + 0.004 = 0.0095, which Clause 6.9.2 raises to 0.01 s.
+        let tiny = fuse(flat(0.005), "Fuses - Low Voltage");
+        let clearing = average_melt_clearing(&tiny, 400.0).unwrap();
+        close(clearing.seconds, 0.01);
+        assert!(clearing.detail(400.0).contains("under 0.01 s"));
     }
 
     #[test]
-    fn tolerance_band_uses_the_slower_time_without_a_second_factor() {
+    fn tolerance_band_still_adds_ten_percent_plus_4_ms() {
         let curve = CurveSpec::Points {
             points: vec![[100.0, 1.0], [1000.0, 0.02], [10000.0, 0.01]],
             max_points: Some(vec![[120.0, 1.2], [1000.0, 0.04], [10000.0, 0.01]]),
@@ -958,13 +985,15 @@ mod point_curve_tests {
         };
         let device = fuse(curve, "Fuses - Low Voltage");
         let clearing = average_melt_clearing(&device, 1000.0).unwrap();
-        close(clearing.seconds, 0.04);
-        assert_eq!(clearing.adjustment, MeltAdjustment::HighTolerance);
-        assert!(clearing.detail(1000.0).contains("not applied again"));
-        // Above the 0.01 s point of the slower band.
+        close(clearing.seconds, 0.04 * 1.10 + 0.004);
+        assert_eq!(clearing.adjustment, MeltAdjustment::AverageMelt { melt_s: 0.04, two_bands: true });
+        assert!(clearing.detail(1000.0).contains("slower band") && clearing.detail(1000.0).contains("not the published total-clearing curve"));
+        // Above the 0.01 s point of the slower band. No let-through data, so the
+        // arc current is not reduced.
         let above = average_melt_clearing(&device, 50_000.0).unwrap();
         close(above.seconds, 0.01);
         assert!(matches!(above.adjustment, MeltAdjustment::CurveBottom { last_a } if (last_a - 10000.0).abs() < 1e-9));
+        assert!(above.detail(50_000.0).contains("effective arc current was not reduced"));
     }
 
     #[test]
@@ -998,16 +1027,16 @@ mod point_curve_tests {
     }
 
     #[test]
-    fn held_tail_above_30_ms_still_takes_the_average_melt_factor() {
+    fn held_tail_still_takes_the_clause_692_adder() {
         let mut curve = flat(0.05);
         if let CurveSpec::Points { beyond_last, .. } = &mut curve {
             *beyond_last = PointTail::HoldLastTime;
         }
         let clearing = average_melt_clearing(&fuse(curve, "Fuses - Low Voltage"), 5_000.0).unwrap();
-        let MeltAdjustment::AverageMelt { melt_s, factor } = clearing.adjustment else { panic!("{:?}", clearing.adjustment) };
+        let MeltAdjustment::AverageMelt { melt_s, two_bands } = clearing.adjustment else { panic!("{:?}", clearing.adjustment) };
         close(melt_s, 0.05);
-        assert_eq!(factor, 1.10);
-        close(clearing.seconds, melt_s * factor);
+        assert!(!two_bands);
+        close(clearing.seconds, melt_s * 1.10 + 0.004);
     }
 
     #[test]

@@ -31,9 +31,21 @@ pub struct Project {
     /// Named deviations from the normal switch and source state.
     #[serde(default)]
     pub operating_cases: Vec<OperatingCase>,
-    /// Maximum arc duration reported for incident energy. IEEE 1584 discusses 2 s when a person can move away.
+    /// Maximum arc duration reported for incident energy. IEEE 1584-2018 Clause 6.9.1
+    /// allows 2 s only when a person can move away from the arc.
     #[serde(default = "default_cap")]
     pub arc_duration_cap_s: f64,
+    /// When true, a clearing time longer than `arc_duration_cap_s` is replaced
+    /// by the cap and the result is marked assumed. When false, the arc is not
+    /// capped. Existing studies default to true.
+    #[serde(default = "default_true")]
+    pub escape_possible: bool,
+    /// How long a motor with no feeder device keeps feeding the arc, in seconds.
+    /// IEEE 1584 requires the contribution and does not publish a decay time.
+    /// The default is five 60 Hz cycles. A motor behind a feeder device clears
+    /// when that device clears, and this window is not applied.
+    #[serde(default = "default_motor_contribution")]
+    pub motor_contribution_s: f64,
     #[serde(default)]
     pub prefault: Prefault,
     /// Inputs that were not on the source document. The text report prints every entry.
@@ -118,6 +130,11 @@ pub struct Bus {
     /// comparison is symmetrical only and is not an asymmetrical-duty pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bracing_test_xr: Option<f64>,
+    /// IEEE 1584 equipment class used when this bus has no arc-equipment record.
+    /// Absent means the class is inferred from the bus name, or every enclosed
+    /// class at this voltage is evaluated and the governing result is kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equipment_class: Option<EquipmentClass>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -506,6 +523,27 @@ pub struct Device {
     /// Snapshot. Studies do not reopen a library file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interrupting: Option<InterruptingRating>,
+    /// Manufacturer current-limiting let-through. Used only when the device
+    /// terminal current is at or above `threshold_a`. Annex H is not applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_limiting: Option<CurrentLimiting>,
+}
+
+/// Peak let-through threshold and the manufacturer's clearing data above it.
+/// IEEE 1584-2018 Clause 6.9.2.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentLimiting {
+    /// Device terminal current, in amperes, at which the fuse is current limiting.
+    pub threshold_a: f64,
+    /// Manufacturer total clearing time in the current-limiting region.
+    pub clearing_s: f64,
+    /// Manufacturer effective arc current, in kA. When this fuse is the only
+    /// source still feeding the arc, this current replaces the calculated
+    /// arcing current and the variation factor is not applied again. Absent
+    /// means the clearing time is used and the calculated arc current is kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_arc_ka: Option<f64>,
 }
 
 /// Symmetrical interrupting rating proved at one test X/R and voltage.
@@ -720,6 +758,9 @@ fn default_sbase() -> f64 {
 fn default_cap() -> f64 {
     2.0
 }
+fn default_motor_contribution() -> f64 {
+    5.0 / 60.0
+}
 fn default_vpu() -> f64 {
     1.0
 }
@@ -758,6 +799,8 @@ impl Default for Project {
             switch_groups: Vec::new(),
             operating_cases: Vec::new(),
             arc_duration_cap_s: default_cap(),
+            escape_possible: default_true(),
+            motor_contribution_s: default_motor_contribution(),
             prefault: Prefault::Flat,
             assumptions: Vec::new(),
             neutral_grounding: Vec::new(),
@@ -771,6 +814,8 @@ impl Project {
             name: "Sample".to_string(),
             s_base_mva: 100.0,
             arc_duration_cap_s: 2.0,
+            escape_possible: true,
+            motor_contribution_s: default_motor_contribution(),
             prefault: Prefault::Flat,
             assumptions: Vec::new(),
             switches: Vec::new(),
@@ -778,9 +823,9 @@ impl Project {
             operating_cases: Vec::new(),
             neutral_grounding: Vec::new(),
             buses: vec![
-                Bus { id: "util".into(), name: "Utility".into(), kv: 12.47, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None },
-                Bus { id: "mcc".into(), name: "MCC-1".into(), kv: 0.48, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None },
-                Bus { id: "pnl".into(), name: "Panel A".into(), kv: 0.48, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None },
+                Bus { id: "util".into(), name: "Utility".into(), kv: 12.47, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None },
+                Bus { id: "mcc".into(), name: "MCC-1".into(), kv: 0.48, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None },
+                Bus { id: "pnl".into(), name: "Panel A".into(), kv: 0.48, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None },
             ],
             branches: vec![
                 Branch {
@@ -869,7 +914,7 @@ impl Project {
                         inst_s: Some(0.05),
                     },
                     basis: String::new(),
-                    library: None, interrupting: None,
+                    library: None, interrupting: None, current_limiting: None,
                 },
                 Device {
                     protected_branch: Some("feeder".into()),
@@ -888,7 +933,7 @@ impl Project {
                         inst_s: Some(0.03),
                     },
                     basis: String::new(),
-                    library: None, interrupting: None,
+                    library: None, interrupting: None, current_limiting: None,
                 },
             ],
             equipment: vec![
@@ -1048,6 +1093,9 @@ impl Project {
         }
         if self.arc_duration_cap_s <= 0.0 {
             errors.push("arc_duration_cap_s must be positive".into());
+        }
+        if !(self.motor_contribution_s.is_finite() && self.motor_contribution_s > 0.0) {
+            errors.push("motor_contribution_s must be positive".into());
         }
         let mut seen: HashMap<String, &'static str> = HashMap::new();
         let mut claim = |id: &str, kind: &'static str, errors: &mut Vec<String>| {
@@ -1300,7 +1348,7 @@ impl Project {
         let mut check = |ok: bool, id: &str, what: &str| {
             if !ok { errors.push(format!("{id}: invalid {what}")); }
         };
-        check(positive(self.s_base_mva) && positive(self.arc_duration_cap_s), "project", "base or duration cap");
+        check(positive(self.s_base_mva) && positive(self.arc_duration_cap_s) && positive(self.motor_contribution_s), "project", "base, duration cap, or motor contribution");
         for b in &self.buses {
             check(positive(b.kv) && b.shunt_kvar.is_finite(), &b.id, "bus voltage or shunt");
             check(b.bracing_ka.map_or(true, positive) && b.main_rating_a.map_or(true, positive), &b.id, "equipment rating");
@@ -1346,6 +1394,10 @@ impl Project {
             if let Some(rating) = &d.interrupting {
                 check(positive(rating.symmetrical_ka) && positive(rating.test_xr)
                     && rating.voltage_v.is_finite() && rating.voltage_v >= 0.0, &d.id, "interrupting rating");
+            }
+            if let Some(limit) = &d.current_limiting {
+                check(positive(limit.threshold_a) && positive(limit.clearing_s)
+                    && limit.effective_arc_ka.map_or(true, positive), &d.id, "current-limiting let-through");
             }
             if let Some(id) = &d.protected_branch {
                 check(self.branches.iter().any(|b| b.id == *id && (b.from == d.bus || b.to == d.bus)), &d.id, "protected branch terminal");
@@ -1563,21 +1615,140 @@ mod tests {
     }
 }
 
-/// Electrode configurations evaluated for a bus without collected equipment.
-/// The arc-flash study reports the maximum incident energy and boundary among
-/// them, because the actual configuration is unknown.
-pub const ASSUMED_ENCLOSURE_ELECTRODES: [Electrode; 3] = [Electrode::VCB, Electrode::VCBB, Electrode::HCB];
+/// IEEE 1584-2018 equipment class (gap, enclosure, working distance, electrode).
+/// Tables 9 and 10. Each class uses one electrode. Open air is used only when
+/// the class is selected or the bus name says open air.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EquipmentClass {
+    LvSwitchgear,
+    LvMccPanelShallow,
+    LvMccPanelDeep,
+    LvCableJunctionShallow,
+    LvCableJunctionDeep,
+    MvMcc5kv,
+    /// 914.4 mm cube. The smaller published 5 kV switchgear size.
+    MvSwitchgear5kvSmall,
+    /// 1143 × 762 × 762 mm.
+    MvSwitchgear5kvLarge,
+    MvMcc15kv,
+    MvSwitchgear15kv,
+    OpenAirVertical,
+    OpenAirHorizontal,
+}
 
-/// Typical IEEE 1584 enclosure, gap, and working distance for a bus voltage.
-/// The returned electrode is only a nominal label (used by exports); arc-flash
-/// studies of assumed enclosures evaluate every `ASSUMED_ENCLOSURE_ELECTRODES`
-/// configuration with this geometry and report the governing maximum.
-pub fn typical_equipment(kv: f64) -> (Electrode, f64, f64, f64, f64, f64, &'static str) {
-    if kv <= 0.6 {
-        (Electrode::VCB, 25.0, 457.2, 355.6, 304.8, 250.0, "low-voltage equipment")
-    } else if kv <= 5.0 {
-        (Electrode::VCBB, 104.0, 914.4, 1143.0, 762.0, 762.0, "5 kV switchgear")
-    } else {
-        (Electrode::VCBB, 152.0, 914.4, 1143.0, 762.0, 762.0, "15 kV switchgear")
+/// Geometry and electrode for one equipment class at a bus voltage.
+#[derive(Clone, Copy, Debug)]
+pub struct EquipmentSpec {
+    pub class: EquipmentClass,
+    pub label: &'static str,
+    pub electrode: Electrode,
+    pub gap_mm: f64,
+    pub distance_mm: f64,
+    pub height_mm: f64,
+    pub width_mm: f64,
+    pub depth_mm: f64,
+    /// Open air has no typical gap in the enclosed-equipment table.
+    pub gap_not_collected: bool,
+}
+
+impl EquipmentClass {
+    pub fn spec(self, kv: f64) -> EquipmentSpec {
+        let (label, electrode, gap, distance, height, width, depth, gap_not_collected) = match self {
+            Self::LvSwitchgear => ("low-voltage switchgear", Electrode::VCB, 32.0, 609.6, 508.0, 508.0, 508.0, false),
+            // Depth is the shallow limit so the enclosure-size correction uses the shallow factor.
+            Self::LvMccPanelShallow => ("shallow low-voltage MCC or panelboard", Electrode::VCB, 25.0, 457.2, 355.6, 304.8, 203.2, false),
+            Self::LvMccPanelDeep => ("deep low-voltage MCC or panelboard", Electrode::VCB, 25.0, 457.2, 355.6, 304.8, 250.0, false),
+            Self::LvCableJunctionShallow => ("shallow low-voltage cable junction", Electrode::VCB, 13.0, 457.2, 355.6, 304.8, 203.2, false),
+            Self::LvCableJunctionDeep => ("deep low-voltage cable junction", Electrode::VCB, 13.0, 457.2, 355.6, 304.8, 250.0, false),
+            Self::MvMcc5kv => ("5 kV MCC", Electrode::VCB, 104.0, 914.4, 660.4, 660.4, 660.4, false),
+            Self::MvSwitchgear5kvSmall => ("5 kV switchgear, 914 mm enclosure", Electrode::VCB, 104.0, 914.4, 914.4, 914.4, 914.4, false),
+            Self::MvSwitchgear5kvLarge => ("5 kV switchgear, 1143 mm enclosure", Electrode::VCB, 104.0, 914.4, 1143.0, 762.0, 762.0, false),
+            Self::MvMcc15kv => ("15 kV MCC", Electrode::VCB, 152.0, 914.4, 914.4, 914.4, 914.4, false),
+            Self::MvSwitchgear15kv => ("15 kV switchgear", Electrode::VCB, 152.0, 914.4, 1143.0, 762.0, 762.0, false),
+            Self::OpenAirVertical => ("open air, vertical electrodes", Electrode::VOA, open_air_gap_mm(kv), 914.4, 1000.0, 1000.0, 1000.0, true),
+            Self::OpenAirHorizontal => ("open air, horizontal electrodes", Electrode::HOA, open_air_gap_mm(kv), 914.4, 1000.0, 1000.0, 1000.0, true),
+        };
+        EquipmentSpec { class: self, label, electrode, gap_mm: gap, distance_mm: distance, height_mm: height, width_mm: width, depth_mm: depth, gap_not_collected }
     }
+}
+
+fn open_air_gap_mm(kv: f64) -> f64 {
+    if kv <= 0.6 { 25.0 } else if kv <= 5.0 { 104.0 } else { 152.0 }
+}
+
+/// Enclosed classes at a bus voltage. Open air is not included.
+pub fn enclosed_classes(kv: f64) -> Vec<EquipmentClass> {
+    if kv <= 0.6 {
+        vec![
+            EquipmentClass::LvSwitchgear,
+            EquipmentClass::LvMccPanelShallow,
+            EquipmentClass::LvMccPanelDeep,
+            EquipmentClass::LvCableJunctionShallow,
+            EquipmentClass::LvCableJunctionDeep,
+        ]
+    } else if kv <= 5.0 {
+        vec![EquipmentClass::MvMcc5kv, EquipmentClass::MvSwitchgear5kvSmall, EquipmentClass::MvSwitchgear5kvLarge]
+    } else {
+        vec![EquipmentClass::MvMcc15kv, EquipmentClass::MvSwitchgear15kv]
+    }
+}
+
+/// Classes to evaluate for a bus that has no arc-equipment record.
+/// A selected class is used as entered. Otherwise the bus name selects the
+/// class. An unrecognized name evaluates every enclosed class at that voltage.
+pub fn classes_for_assumed_bus(bus: &Bus) -> Vec<EquipmentClass> {
+    if let Some(class) = bus.equipment_class {
+        return vec![class];
+    }
+    inferred_classes(&bus.name, bus.kv).unwrap_or_else(|| enclosed_classes(bus.kv))
+}
+
+fn inferred_classes(name: &str, kv: f64) -> Option<Vec<EquipmentClass>> {
+    let name = name.to_ascii_lowercase();
+    if name.contains("open air") || name.contains("open-air") || name.contains("outdoor") {
+        return Some(vec![EquipmentClass::OpenAirVertical, EquipmentClass::OpenAirHorizontal]);
+    }
+    let lv = kv <= 0.6;
+    let mid = kv <= 5.0;
+    if name.contains("cable") || name.contains("junction") {
+        return lv.then(|| vec![EquipmentClass::LvCableJunctionShallow, EquipmentClass::LvCableJunctionDeep]);
+    }
+    if name.contains("mcc") {
+        return Some(if lv {
+            vec![EquipmentClass::LvMccPanelShallow, EquipmentClass::LvMccPanelDeep]
+        } else if mid {
+            vec![EquipmentClass::MvMcc5kv]
+        } else {
+            vec![EquipmentClass::MvMcc15kv]
+        });
+    }
+    if name.contains("panel") || name.contains("pnl") {
+        return lv.then(|| vec![EquipmentClass::LvMccPanelShallow, EquipmentClass::LvMccPanelDeep]);
+    }
+    if name.contains("switchgear") || name.contains("switchboard") || name.contains("swg") || name.contains("mdp") {
+        return Some(if lv {
+            vec![EquipmentClass::LvSwitchgear]
+        } else if mid {
+            vec![EquipmentClass::MvSwitchgear5kvSmall, EquipmentClass::MvSwitchgear5kvLarge]
+        } else {
+            vec![EquipmentClass::MvSwitchgear15kv]
+        });
+    }
+    None
+}
+
+/// One representative geometry for exports. A study of a bus with no equipment
+/// record evaluates `classes_for_assumed_bus` and keeps the governing result.
+/// This single row is the smaller enclosed size when the name does not pick one class.
+pub fn typical_equipment(kv: f64) -> (Electrode, f64, f64, f64, f64, f64, &'static str) {
+    let class = if kv <= 0.6 {
+        EquipmentClass::LvMccPanelShallow
+    } else if kv <= 5.0 {
+        EquipmentClass::MvSwitchgear5kvSmall
+    } else {
+        EquipmentClass::MvSwitchgear15kv
+    };
+    let spec = class.spec(kv);
+    (spec.electrode, spec.gap_mm, spec.distance_mm, spec.height_mm, spec.width_mm, spec.depth_mm, spec.label)
 }
