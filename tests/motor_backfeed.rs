@@ -23,7 +23,9 @@ fn sample_main_stages_motor_contribution_and_panel_feeder_stays_single_device() 
     let mcc = output.arc_flash.as_ref().unwrap().iter().find(|row| row.equipment_id == "af-mcc")
         .expect("the MCC arc continues until the utility breaker and the motor contribution both end");
     assert!(mcc.assumed, "{}", mcc.duration_note);
+    assert!(!mcc.decrement_applied, "{}", mcc.duration_note);
     assert!(mcc.duration_note.contains("m1") && mcc.duration_note.contains("initial arcing current"), "{}", mcc.duration_note);
+    assert!(!mcc.duration_note.contains("was not integrated"), "{}", mcc.duration_note);
     assert!(output.arc_flash_failures.iter().all(|failure| failure.equipment_id != "af-mcc"));
 
     let panel = output.arc_flash.as_ref().unwrap().iter().find(|row| row.equipment_id == "af-pnl").unwrap();
@@ -32,7 +34,8 @@ fn sample_main_stages_motor_contribution_and_panel_feeder_stays_single_device() 
 }
 
 #[test]
-fn source_decrement_does_not_erase_connected_motor_backfeed() {
+fn source_decrement_is_integrated_across_motor_backfeed() {
+    let steady = run_arc(&Project::sample());
     let mut project = Project::sample();
     project.sources[0].decrement_curve = vec![
         DecrementPoint { time_s: 0.0, current_ratio: 1.0 },
@@ -40,10 +43,17 @@ fn source_decrement_does_not_erase_connected_motor_backfeed() {
     ];
     let output = run_arc(&project);
     let row = output.arc_flash.as_ref().unwrap().iter().find(|row| row.equipment_id == "af-mcc")
-        .expect("motor contribution is calculated; decrement is not integrated across clearing events");
-    assert!(row.assumed && !row.decrement_applied);
-    assert!(row.duration_note.contains("was not integrated"), "{}", row.duration_note);
+        .expect("motor contribution is calculated while source decrement is integrated between openings");
+    let steady_row = steady.arc_flash.as_ref().unwrap().iter().find(|row| row.equipment_id == "af-mcc").unwrap();
+    assert!(row.assumed && row.decrement_applied, "{}", row.duration_note);
+    assert!(row.duration_note.contains("integrated"), "{}", row.duration_note);
+    assert!(!row.duration_note.contains("was not integrated"), "{}", row.duration_note);
+    assert!(row.duration_note.contains("initial arcing current"), "{}", row.duration_note);
     assert!(row.duration_note.contains("m1"), "{}", row.duration_note);
+    assert!(row.decrement_source_ids.iter().any(|id| id == "grid"), "{:?}", row.decrement_source_ids);
+    let final_bolted = row.final_bolted_ka.expect("last decrement slice");
+    assert!(final_bolted < row.bolted_ka, "final {final_bolted}, initial {}", row.bolted_ka);
+    assert!(row.governing_cal_cm2 < steady_row.governing_cal_cm2, "decrement {}, steady {}", row.governing_cal_cm2, steady_row.governing_cal_cm2);
 }
 
 #[test]

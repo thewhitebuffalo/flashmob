@@ -624,7 +624,7 @@ fn evaluate_equipment(project: &Project, loadflow: Option<&LoadflowResult>, faul
         };
         (full_clear, min_clear, None)
     } else {
-        let staged = staged_exposure(project, loadflow, case, bus_fault, bolted, preview.i_arc_ka, preview.i_arc_min_ka, protection, !decrement_source_ids.is_empty())?;
+        let staged = staged_exposure(project, loadflow, case, bus_fault, bolted, preview.i_arc_ka, preview.i_arc_min_ka, protection, &decrement_source_ids)?;
         (staged.full.clone(), staged.reduced.clone(), Some(staged))
     };
     let mut full_clear = full_clear;
@@ -640,12 +640,19 @@ fn evaluate_equipment(project: &Project, loadflow: Option<&LoadflowResult>, faul
     input.arc_ka_override = full_clear.effective_arc_ka;
     input.arc_min_ka_override = min_clear.effective_arc_ka;
     let integrate_decrement = !decrement_source_ids.is_empty() && staged.is_none() && !limiting;
+    let staged_decrement = staged.as_ref().is_some_and(|exposure| exposure.decrement_integrated);
     let (out, final_slice) = if let Some(staged) = &staged {
         let mut out = arcflash::calculate(&input)?;
         let full = arcflash::integrate_profile(&input, &staged.full_segments, false)?;
         let reduced = arcflash::integrate_profile(&input, &staged.reduced_segments, true)?;
         apply_profile(&mut out, full, reduced);
-        (out, None)
+        let last = if staged.decrement_integrated {
+            out.warnings.push("Source-current decrement was integrated across clearing events with repeated quasi-steady three-phase network solves. Each device is still timed at the initial arcing current. Source X/R was held constant.".into());
+            Some(staged_final_slice(&input, &staged.full_segments, &staged.reduced_segments)?)
+        } else {
+            None
+        };
+        (out, last)
     } else if integrate_decrement {
         let (out, last) = calculate_decrement_arc(project, loadflow, &case.bus, &input, &decrement_source_ids, decrement_cache)?;
         (out, Some(last))
@@ -686,8 +693,8 @@ fn evaluate_equipment(project: &Project, loadflow: Option<&LoadflowResult>, faul
         duration_note: governing_clear.note.clone(),
         upstream_device: case.upstream_device.clone(),
         standard: out.standard.into(),
-        decrement_applied: integrate_decrement,
-        decrement_source_ids: if integrate_decrement { decrement_source_ids.clone() } else { Vec::new() },
+        decrement_applied: integrate_decrement || staged_decrement,
+        decrement_source_ids: if integrate_decrement || staged_decrement { decrement_source_ids } else { Vec::new() },
         final_bolted_ka: final_slice.as_ref().map(|last| last.bolted_ka),
         final_arcing_ka: final_slice.as_ref().map(|last| last.arcing_ka),
         final_arcing_min_ka: final_slice.as_ref().map(|last| last.arcing_min_ka),
@@ -941,6 +948,18 @@ struct FinalSlice {
     arcing_min_ka: f64,
 }
 
+fn staged_final_slice(input: &IeeeInput, full: &[EnergySegment], reduced: &[EnergySegment]) -> Result<FinalSlice, String> {
+    let last = |segments: &[EnergySegment]| segments.last().map(|segment| segment.ibf_ka)
+        .ok_or_else(|| "decrement profile has no slices".to_string());
+    let final_bolted_ka = last(full)?;
+    let final_reduced_bolted_ka = last(reduced)?;
+    Ok(FinalSlice {
+        bolted_ka: final_bolted_ka,
+        arcing_ka: arcflash::calculate(&IeeeInput { ibf_ka: final_bolted_ka, ..input.clone() })?.i_arc_ka,
+        arcing_min_ka: arcflash::calculate(&IeeeInput { ibf_ka: final_reduced_bolted_ka, ..input.clone() })?.i_arc_min_ka,
+    })
+}
+
 fn calculate_decrement_arc(project: &Project, loadflow: Option<&LoadflowResult>, bus_id: &str, input: &IeeeInput, decrement_source_ids: &[String], cache: &mut DecrementFaultCache) -> Result<(arcflash::IeeeOutput, FinalSlice), String> {
     let mut out = arcflash::calculate(input)?;
     let full_segments = decrement_segments(project, loadflow, bus_id, input.time_s, decrement_source_ids, cache)?;
@@ -1172,7 +1191,14 @@ fn clearing_gap(device: &Device, amps: f64, point_note: Option<(bool, String)>) 
         }
         CurveSpec::Points { .. } => {
             if curves::trip_time(&device.curve, amps).is_none() {
-                if curves::average_melt_fuse(device) {
+                if curves::fast_only_range(&device.curve, amps).is_some() {
+                    let melt = if curves::average_melt_fuse(device) {
+                        " The slower band of a two-band library fuse is a melt-tolerance pair, not the published total-clearing curve. IEEE 1584-2018 Clause 6.9.2 is not applied because the governing band has no time in this range. fuse_total_clearing stays off unless the caller sets it."
+                    } else {
+                        ""
+                    };
+                    format!("clearing for {name} [{id}] at {amps:.0} A.{melt}{extra}")
+                } else if curves::average_melt_fuse(device) {
                     format!("an operating time for {name} [{id}] at {amps:.0} A. IEEE 1584-2018 Clause 6.9.2 is not applied: the melting curve has no time at this current. Below the first point the fuse does not operate. Above the last point, 0.01 s is used only when that point is the 0.01 s bottom of the curve.{extra}")
                 } else {
                     format!("an operating time for {name} [{id}] at {amps:.0} A. The point curve does not produce a time at this current.{extra}")
@@ -1431,6 +1457,8 @@ struct StagedExposure {
     reduced: Clearing,
     full_segments: Vec<EnergySegment>,
     reduced_segments: Vec<EnergySegment>,
+    /// True when source decrement was integrated into the energy segments.
+    decrement_integrated: bool,
 }
 
 struct Infeed {
@@ -1451,19 +1479,26 @@ struct StageEvent {
 /// Arc duration when one device does not end every contribution.
 /// Devices are timed at the initial arcing current. Later topology uses a new
 /// bolted current. A motor with no feeder device is removed after
-/// `motor_contribution_s`. Source decrement is not integrated here.
-fn staged_exposure(project: &Project, _loadflow: Option<&LoadflowResult>, case: &ArcEquipment, fault: &crate::fault::BusFault, bolted_ka: f64, i_arc_ka: f64, i_arc_min_ka: f64, protection: &crate::protection::Protection, decrement_reaches: bool) -> Result<StagedExposure, String> {
+/// `motor_contribution_s`. When a decrement curve reaches the bus, each
+/// interval is subdivided and the source strength follows that curve.
+fn staged_exposure(project: &Project, _loadflow: Option<&LoadflowResult>, case: &ArcEquipment, fault: &crate::fault::BusFault, bolted_ka: f64, i_arc_ka: f64, i_arc_min_ka: f64, protection: &crate::protection::Protection, decrement_source_ids: &[String]) -> Result<StagedExposure, String> {
     let devices = select_stage_devices(project, case, protection)?;
-    let full = stage_one_current(project, case, fault, bolted_ka, i_arc_ka, &devices, decrement_reaches)?;
+    let full = stage_one_current(project, case, fault, bolted_ka, i_arc_ka, &devices, decrement_source_ids)?;
     let reduced = if (i_arc_ka - i_arc_min_ka).abs() < 1e-12 {
         full.clone()
     } else {
-        stage_one_current(project, case, fault, bolted_ka, i_arc_min_ka, &devices, decrement_reaches)?
+        stage_one_current(project, case, fault, bolted_ka, i_arc_min_ka, &devices, decrement_source_ids)?
     };
-    Ok(StagedExposure { full: full.0, reduced: reduced.0, full_segments: full.1, reduced_segments: reduced.1 })
+    Ok(StagedExposure {
+        full: full.0,
+        reduced: reduced.0,
+        full_segments: full.1,
+        reduced_segments: reduced.1,
+        decrement_integrated: !decrement_source_ids.is_empty(),
+    })
 }
 
-fn stage_one_current(project: &Project, case: &ArcEquipment, fault: &crate::fault::BusFault, bolted_ka: f64, i_arc_ka: f64, devices: &[&Device], decrement_reaches: bool) -> Result<(Clearing, Vec<EnergySegment>), String> {
+fn stage_one_current(project: &Project, case: &ArcEquipment, fault: &crate::fault::BusFault, bolted_ka: f64, i_arc_ka: f64, devices: &[&Device], decrement_source_ids: &[String]) -> Result<(Clearing, Vec<EnergySegment>), String> {
     let fraction = i_arc_ka / bolted_ka;
     let mut events = Vec::new();
     let mut extras = Vec::new();
@@ -1499,15 +1534,7 @@ fn stage_one_current(project: &Project, case: &ArcEquipment, fault: &crate::faul
         if !time_s.is_finite() || time_s <= 0.0 {
             return Err(format!("staged clearing time at bus '{}' is not a positive finite duration", case.bus));
         }
-        let width = time_s - cursor;
-        if width > 1e-12 {
-            let ibf_ka = if segments.is_empty() {
-                bolted_ka
-            } else {
-                bolted_after_clearing(project, &case.bus, &opened, &dropped)?
-            };
-            segments.push(EnergySegment { ibf_ka, duration_s: width });
-        }
+        append_stage_interval(project, case, bolted_ka, &mut segments, cursor, time_s, &opened, &dropped, decrement_source_ids)?;
         while index < events.len() && (events[index].time_s - time_s).abs() <= 1e-9 {
             if let Some(branch) = &events[index].branch {
                 if !opened.iter().any(|id| id == branch) { opened.push(branch.clone()); }
@@ -1537,11 +1564,50 @@ fn stage_one_current(project: &Project, case: &ArcEquipment, fault: &crate::faul
     for extra in extras {
         note.push_str(&extra);
     }
-    if decrement_reaches {
-        note.push_str(" Source decrement reaches this bus but was not integrated across multiple clearing events. Each interval holds source strength at its initial value.");
+    if !decrement_source_ids.is_empty() {
+        note.push_str(" Source decrement was integrated across clearing events. Source strength follows the entered decrement curve. Source X/R was held constant.");
     }
     clear.note.push_str(&note);
     Ok((clear, segments))
+}
+
+/// One stage interval. With no decrement curve this is one segment, and the
+/// first segment keeps the study bolted current. With a decrement curve the
+/// interval is split at 10 ms and at profile knots. Each slice solves the
+/// network at its midpoint with the branches already open and the motors
+/// already removed. Openings at `end_s` are applied by the caller after this
+/// returns. Trip times are not recalculated here.
+fn append_stage_interval(project: &Project, case: &ArcEquipment, bolted_ka: f64, segments: &mut Vec<EnergySegment>, start_s: f64, end_s: f64, opened: &[String], dropped: &[String], decrement_source_ids: &[String]) -> Result<(), String> {
+    if end_s - start_s <= 1e-12 {
+        return Ok(());
+    }
+    if decrement_source_ids.is_empty() {
+        let ibf_ka = if segments.is_empty() {
+            bolted_ka
+        } else {
+            bolted_after_clearing(project, &case.bus, opened, dropped)?
+        };
+        segments.push(EnergySegment { ibf_ka, duration_s: end_s - start_s });
+        return Ok(());
+    }
+    let mut slice_start = start_s;
+    while end_s - slice_start > 1e-12 {
+        if segments.len() >= 10_000 {
+            return Err("source-current decrement interval exceeds 10,000 slices; reduce the arc duration or provide a shorter exposure limit".into());
+        }
+        let slice_end = next_decrement_end(project, decrement_source_ids, slice_start, end_s);
+        if slice_end <= slice_start {
+            return Err("source-current decrement slice did not advance".into());
+        }
+        let width = slice_end - slice_start;
+        if width > 1e-12 {
+            let midpoint = slice_start + width / 2.0;
+            let ibf_ka = bolted_after_decrement(project, &case.bus, opened, dropped, midpoint)?;
+            segments.push(EnergySegment { ibf_ka, duration_s: width });
+        }
+        slice_start = slice_end;
+    }
+    Ok(())
 }
 
 fn truncate_segments(segments: &mut Vec<EnergySegment>, cap: f64) {
@@ -1674,6 +1740,23 @@ fn bus_distance(project: &Project, start: &str) -> std::collections::HashMap<Str
     distance
 }
 
+fn bolted_after_decrement(project: &Project, bus_id: &str, opened: &[String], dropped: &[String], time_s: f64) -> Result<f64, String> {
+    let mut snapshot = project.clone();
+    for branch_id in opened {
+        open_branch(&mut snapshot, branch_id);
+    }
+    snapshot.motors.retain(|motor| !dropped.iter().any(|id| id == &motor.id));
+    for source in snapshot.sources.iter_mut().filter(|source| source.in_service && !source.decrement_curve.is_empty()) {
+        let ratio = source.decrement_ratio_at(time_s);
+        source.mva_sc *= ratio;
+    }
+    let fault = solve_staged_fault(&mut snapshot)?;
+    fault.buses.iter().find(|bus| bus.id == bus_id)
+        .and_then(|bus| bus.three_phase.as_ref().map(|point| point.symmetrical_ka))
+        .filter(|ka| ka.is_finite() && *ka > 0.0)
+        .ok_or_else(|| format!("no three-phase fault current at bus '{bus_id}' during a staged decrement"))
+}
+
 fn bolted_after_clearing(project: &Project, bus_id: &str, opened: &[String], dropped: &[String]) -> Result<f64, String> {
     let mut snapshot = project.clone();
     for branch_id in opened {
@@ -1793,6 +1876,24 @@ struct DutyPick {
     symmetrical_ka: f64,
     system_xr: Option<f64>,
     comparison: duty::DutyComparison,
+}
+
+/// Interrupting duty from a fault study of `project`.
+///
+/// A converged load-flow prefault is used only when the project asks for one.
+/// An unconverged or missing load flow leaves the fault invalid, matching a
+/// study. The error is the fault message, or "fault study is invalid".
+pub fn interrupting_duty_rows(project: &Project) -> Result<Vec<InterruptingDuty>, String> {
+    let loadflow = if project.prefault == Prefault::Loadflow {
+        Some(loadflow::solve(project)?)
+    } else {
+        None
+    };
+    let fault = fault::solve(project, loadflow.as_ref())?;
+    if !fault.valid {
+        return Err(fault.error.unwrap_or_else(|| "fault study is invalid".into()));
+    }
+    interrupting_duties(project, &fault)
 }
 
 fn interrupting_duties(project: &Project, fault: &FaultResult) -> Result<Vec<InterruptingDuty>, String> {

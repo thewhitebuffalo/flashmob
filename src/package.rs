@@ -34,6 +34,13 @@ impl PackageExport {
 
 pub fn export(project: &Project) -> PackageExport {
     let names = Names::new(project);
+    let (duty, duty_error) = interrupting_duty_csv(project);
+    let mut notes = import_notes(project);
+    if !duty_error.is_empty() {
+        notes.push('\n');
+        notes.push_str(&duty_error);
+        notes.push('\n');
+    }
     let mut files = vec![
         PackageFile { name: "project.json".into(), content: serde_json::to_string_pretty(project).expect("project serializes") },
         PackageFile { name: "project.xml".into(), content: xml(project, &names) },
@@ -45,15 +52,52 @@ pub fn export(project: &Project) -> PackageExport {
         PackageFile { name: "loads.csv".into(), content: loads_csv(project, &names) },
         PackageFile { name: "motors.csv".into(), content: motors_csv(project, &names) },
         PackageFile { name: "protective-devices.csv".into(), content: devices_csv(project, &names) },
+        PackageFile { name: "interrupting-duty.csv".into(), content: duty },
         PackageFile { name: "switches.csv".into(), content: switches_csv(project, &names) },
         PackageFile { name: "connections.csv".into(), content: connections_csv(project, &names) },
         PackageFile { name: "revit-panels.csv".into(), content: revit_panels_csv(project, &names) },
         PackageFile { name: "revit-circuits.csv".into(), content: revit_circuits_csv(project, &names) },
         PackageFile { name: "components.tab".into(), content: components_tab(project, &names) },
-        PackageFile { name: "IMPORT.txt".into(), content: import_notes(project) },
+        PackageFile { name: "IMPORT.txt".into(), content: notes },
     ];
     files.retain(|f| !f.content.is_empty());
     PackageExport { files }
+}
+
+fn interrupting_duty_csv(project: &Project) -> (String, String) {
+    let header = [
+        "Id", "Name", "Kind", "Fault", "Bus", "SymmetricalKA", "SystemXR", "HalfCycleRmsKA",
+        "RatedSymmetricalKA", "TestXR", "RatedHalfCycleRmsKA", "AdjustedSymmetricalKA", "Status", "Note",
+    ];
+    let mut body = csv_line(&header);
+    let optional = |value: Option<f64>| value.map(fmt).unwrap_or_default();
+    match crate::study::interrupting_duty_rows(project) {
+        Ok(rows) => {
+            for row in rows {
+                body.push_str(&csv_line(&[
+                    &row.id,
+                    &row.name,
+                    &row.kind,
+                    &row.fault,
+                    &row.bus_id,
+                    &fmt(row.symmetrical_ka),
+                    &optional(row.system_xr),
+                    &fmt(row.half_cycle_rms_ka),
+                    &fmt(row.rated_symmetrical_ka),
+                    &optional(row.test_xr),
+                    &optional(row.rated_half_cycle_rms_ka),
+                    &optional(row.adjusted_symmetrical_ka),
+                    &row.status,
+                    &row.note,
+                ]));
+            }
+            (body, String::new())
+        }
+        Err(err) => (
+            body,
+            format!("interrupting-duty.csv has a header only. The fault study did not produce duty rows: {err}"),
+        ),
+    }
 }
 
 /// How `write_dir` treats files that already exist.
@@ -453,6 +497,9 @@ fn xml(project: &Project, names: &Names) -> String {
                 ("BreakerInterruptingTime", "s", device.breaker_interrupting_s.map(fmt).unwrap_or_default()),
                 ("FuseTotalClearingCurve", "", device.fuse_total_clearing.to_string()),
                 ("CurveIsTotalClearing", "", device.curve_includes_clearing().to_string()),
+                ("InterruptingSymmetricalKA", "kA", device.interrupting.as_ref().map(|rating| fmt(rating.symmetrical_ka)).unwrap_or_default()),
+                ("InterruptingTestXR", "", device.interrupting.as_ref().map(|rating| fmt(rating.test_xr)).unwrap_or_default()),
+                ("InterruptingVoltageV", "V", device.interrupting.as_ref().map(|rating| fmt(rating.voltage_v)).unwrap_or_default()),
             ]),
         ));
     }
@@ -720,9 +767,13 @@ fn devices_csv(project: &Project, names: &Names) -> String {
         "BreakerInterruptingTimeS",
         "FuseTotalClearingCurve",
         "CurveIsTotalClearing",
+        "InterruptingSymmetricalKA",
+        "InterruptingTestXR",
+        "InterruptingVoltageV",
     ]);
     for device in &project.devices {
         let f = device_fields(&device.curve, device.fuse_total_clearing);
+        let rating = device.interrupting.as_ref();
         s.push_str(&csv_line(&[
             &names.of(&device.id),
             &names.of(&device.bus),
@@ -740,6 +791,9 @@ fn devices_csv(project: &Project, names: &Names) -> String {
             &device.breaker_interrupting_s.map(fmt).unwrap_or_default(),
             &device.fuse_total_clearing.to_string(),
             &device.curve_includes_clearing().to_string(),
+            &rating.map(|rating| fmt(rating.symmetrical_ka)).unwrap_or_default(),
+            &rating.map(|rating| fmt(rating.test_xr)).unwrap_or_default(),
+            &rating.map(|rating| fmt(rating.voltage_v)).unwrap_or_default(),
         ]));
     }
     s
@@ -1042,7 +1096,8 @@ verify the data against the selected target tool version.
   utilities.csv             every source: service status, slack role, short-circuit MVA, X/R
   loads.csv                 constant kVA loads
   motors.csv                horsepower and subtransient reactance
-  protective-devices.csv    pickup, time dial, delays, short time, instantaneous
+  protective-devices.csv    pickup, time dial, delays, short time, instantaneous, interrupting rating
+  interrupting-duty.csv     bus bracing and device interrupting duty from a fault study
   switches.csv              switches, their branch, kind, and normal state
   connections.csv           from bus, to bus, normal state, and controlling switch
   components.tab            summary, tab delimited
@@ -1102,7 +1157,15 @@ Protective devices
   FuseTotalClearingCurve = true. CurveIsTotalClearing = true when the curve
   already includes total clearing (every fuse total-clearing curve, and any
   other device entered with curve_is_total_clearing); BreakerInterruptingTime
-  is then empty.
+  is then empty. InterruptingSymmetricalKA, InterruptingTestXR, and
+  InterruptingVoltageV are the entered interrupting rating. They are blank
+  when none is entered. The same three names are ProtectiveDevice XML
+  attributes.
+
+Interrupting duty
+  interrupting-duty.csv lists each braced bus and each device that has an
+  interrupting rating. Ids are the Flashmob model ids. The rows come from a
+  fault study of this project. This file is not a verified vendor import.
 
 Arc-flash equipment
   buses.csv carries the first equipment record entered on the bus, or a
@@ -1590,6 +1653,44 @@ mod tests {
         let sources = rows(file(&exported, "utilities.csv"));
         assert_eq!(sources[0]["Name"], "Utility-2");
         assert_eq!(sources[0]["Bus"], "Utility");
+        assert_eq!(main["InterruptingSymmetricalKA"], "");
+        assert!(file(&exported, "interrupting-duty.csv").lines().next().unwrap().contains("Status"));
+    }
+
+    #[test]
+    fn interrupting_ratings_and_duty_rows_are_exported() {
+        let mut project = Project::sample();
+        project.buses[1].bracing_ka = Some(65.0);
+        project.buses[1].bracing_test_xr = Some(5.0);
+        project.devices[0].interrupting = Some(crate::model::InterruptingRating {
+            symmetrical_ka: 65.0, test_xr: 5.0, voltage_v: 480.0,
+        });
+        let exported = export(&project);
+        let devices = file(&exported, "protective-devices.csv");
+        assert!(devices.contains("InterruptingSymmetricalKA,InterruptingTestXR,InterruptingVoltageV"));
+        let main = rows(devices).into_iter().find(|row| row["Name"] == "MCC main").unwrap();
+        assert_eq!(main["InterruptingSymmetricalKA"], "65");
+        assert_eq!(main["InterruptingTestXR"], "5");
+        assert_eq!(main["InterruptingVoltageV"], "480");
+        assert!(exported.xml().contains("Name=\"InterruptingSymmetricalKA\""));
+        let duty = file(&exported, "interrupting-duty.csv");
+        assert!(duty.contains("brk-main") && duty.contains("MCC main"), "{duty}");
+        assert!(duty.contains("bus_bracing") && duty.contains("device"), "{duty}");
+        assert!(duty.contains("within_rating") || duty.contains("exceeds_rating") || duty.contains("not_adjusted"), "{duty}");
+        assert!(file(&exported, "IMPORT.txt").contains("interrupting-duty.csv"));
+        assert!(file(&exported, "IMPORT.txt").contains("InterruptingSymmetricalKA"));
+    }
+
+    #[test]
+    fn invalid_fault_exports_a_duty_header_only() {
+        let mut project = Project::sample();
+        project.buses[0].kv = 0.0;
+        let exported = export(&project);
+        let duty = file(&exported, "interrupting-duty.csv");
+        assert_eq!(duty.lines().count(), 1, "{duty}");
+        let notes = file(&exported, "IMPORT.txt");
+        assert!(notes.contains("interrupting-duty.csv has a header only"), "{notes}");
+        assert!(notes.contains("The fault study did not produce duty rows"), "{notes}");
     }
 
     #[test]

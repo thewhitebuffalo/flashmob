@@ -334,10 +334,10 @@ fn exec_and_package_carry_curve_is_total_clearing() {
     assert!(response.project.devices[0].curve_is_total_clearing && !response.project.devices[0].fuse_total_clearing);
     assert!(response.project.devices.iter().find(|d| d.id == "extra").unwrap().curve_is_total_clearing);
     let csv = std::fs::read_to_string(dir.join("protective-devices.csv")).unwrap();
-    assert!(csv.lines().next().unwrap().ends_with("FuseTotalClearingCurve,CurveIsTotalClearing"), "{csv}");
+    assert!(csv.lines().next().unwrap().ends_with("FuseTotalClearingCurve,CurveIsTotalClearing,InterruptingSymmetricalKA,InterruptingTestXR,InterruptingVoltageV"), "{csv}");
     std::fs::remove_dir_all(&dir).unwrap();
     let main_line = csv.lines().find(|l| l.contains("Point Curve")).unwrap();
-    assert!(main_line.ends_with("false,true"), "{main_line}");
+    assert!(main_line.ends_with("false,true,,,"), "{main_line}");
 
     let unset = exec::exec_request(&serde_json::json!({"project": response.project, "commands": [
         {"op": "set_device", "id": "brk-main", "curve_is_total_clearing": false, "breaker_interrupting_s": 0.08}
@@ -405,6 +405,29 @@ fn library_fuse_above_the_10_ms_point_uses_10_ms() {
     assert!(row.assumed);
     assert!(row.duration_note.contains("0.01 s") && row.duration_note.contains("band interpretation is assumed"), "{}", row.duration_note);
     assert!(!row.duration_note.contains("no operating time"), "{}", row.duration_note);
+}
+
+#[test]
+fn fast_band_gap_names_the_unresolved_range_and_does_not_use_the_fast_time() {
+    let mut gap = project(points(
+        &[[100.0, 1.0], [1_000_000.0, 0.01]],
+        Some(&[[1_000_000.0, 2.0], [2_000_000.0, 0.05]]),
+        PointTail::Unavailable,
+        BandInterpretation::Entered,
+    ));
+    as_library_fuse(&mut gap, "Fuses - Low Voltage");
+    assert!(!gap.devices[0].fuse_total_clearing);
+    let out = run(&gap);
+    assert!(out.arc_flash.as_ref().unwrap().iter().all(|row| row.equipment_id != "af-mcc"));
+    let failure = out.arc_flash_failures.iter().find(|f| f.equipment_id == "af-mcc").unwrap();
+    assert!(failure.error.contains("unresolved from 100 A up to 1000000 A"), "{}", failure.error);
+    assert!(failure.error.contains("faster band's time is not used") && failure.error.contains("first time is not held"), "{}", failure.error);
+    assert!(failure.error.contains("melt-tolerance pair") && failure.error.contains("fuse_total_clearing stays off"), "{}", failure.error);
+    assert!(failure.error.contains("IEEE 1584-2018 Clause 6.9.2 is not applied"), "{}", failure.error);
+    assert!(!failure.error.contains("does not operate"), "{}", failure.error);
+    let coord = out.coordination.as_ref().unwrap().iter().find(|row| row.device_id == "brk-main").unwrap();
+    assert!(coord.trip_at_bolted_s.is_none() && coord.min_band_trip_s.is_some(), "{:?}", coord);
+    assert!(coord.note.contains("unresolved from 100 A up to 1000000 A"), "{}", coord.note);
 }
 
 #[test]

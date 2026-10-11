@@ -42,6 +42,29 @@ fn governing_band<'a>(points: &'a [[f64; 2]], max_points: &'a Option<Vec<[f64; 2
     max_points.as_deref().unwrap_or(points)
 }
 
+/// Ampere range in which only the faster band has started.
+///
+/// The slower band governs, so a time from the faster band is not a clearing
+/// time. Returns the faster band's first current and the slower band's first
+/// current when `fast_first <= amps < slow_first`. One band, a slower band
+/// that starts at or before the faster band, or a current outside that range
+/// returns None.
+pub fn fast_only_range(curve: &CurveSpec, amps: f64) -> Option<(f64, f64)> {
+    let CurveSpec::Points { points, max_points: Some(max), .. } = curve else { return None };
+    let (Some(&[fast_a, _]), Some(&[slow_a, _])) = (points.first(), max.first()) else { return None };
+    if !(fast_a < slow_a) || !amps.is_finite() || amps < fast_a || amps >= slow_a {
+        return None;
+    }
+    Some((fast_a, slow_a))
+}
+
+/// Names the unresolved fast-to-slow range. Does not supply a clearing time.
+pub fn band_gap_note(fast_a: f64, slow_a: f64, amps: f64) -> String {
+    format!(
+        "Clearing is unresolved from {fast_a:.0} A up to {slow_a:.0} A: at {amps:.0} A only the faster band has started. The slower band governs. The faster band's time is not used, and the slower band's first time is not held."
+    )
+}
+
 fn check_band(points: &[[f64; 2]], name: &str) -> Result<(), String> {
     if points.len() < 2 { return Err(format!("{name} needs at least two points")); }
     if points.iter().flatten().any(|v| !v.is_finite() || *v <= 0.0) {
@@ -110,6 +133,9 @@ pub fn point_curve_note(curve: &CurveSpec, amps: f64) -> Option<(bool, String)> 
         } else {
             "The point curve's interpretation (what its single band represents) is assumed.".to_string()
         });
+    }
+    if let Some((fast_a, slow_a)) = fast_only_range(curve, amps) {
+        notes.push(band_gap_note(fast_a, slow_a, amps));
     }
     (!notes.is_empty()).then(|| (assumed, notes.join(" ")))
 }
@@ -227,7 +253,7 @@ impl MeltClearing {
                 };
                 let seconds = self.seconds;
                 if two_bands {
-                    format!("The melting time {melt_s:.3} s is the slower band at {amps:.0} A, the high tolerance of the published melting curve. IEEE 1584-2018 Clause 6.9.2 adds 10% of that melting time plus 0.004 s, giving {seconds:.3} s.{floor} The slower band is not the published total-clearing curve and this estimate is not for an arc-flash label.")
+                    format!("The melting time {melt_s:.3} s is the slower band at {amps:.0} A, the high tolerance of the published melting curve. IEEE 1584-2018 Clause 6.9.2 adds 10% of that melting time plus 0.004 s, giving {seconds:.3} s.{floor} The slower band is not the published total-clearing curve and this estimate is not for an arc-flash label. A two-band library fuse stays a melt-tolerance pair. fuse_total_clearing stays off unless the caller sets it.")
                 } else {
                     format!("IEEE 1584-2018 Clause 6.9.2 reads the average melting time {melt_s:.3} s at {amps:.0} A and adds 10% of that time plus 0.004 s, giving {seconds:.3} s.{floor} This is not the published total-clearing curve and is not for an arc-flash label.")
                 }
@@ -842,6 +868,15 @@ mod point_curve_tests {
         // Between the two bands' first currents only the fast band operates.
         assert!(trip_time_fast_band(&c, 110.0).is_some());
         assert_eq!(trip_time(&c, 110.0), None);
+        assert_eq!(fast_only_range(&c, 110.0), Some((100.0, 120.0)));
+        assert_eq!(fast_only_range(&c, 100.0), Some((100.0, 120.0)));
+        assert_eq!(fast_only_range(&c, 120.0), None);
+        assert_eq!(fast_only_range(&c, 99.9), None);
+        let (assumed, note) = point_curve_note(&c, 110.0).unwrap();
+        assert!(!assumed, "{note}");
+        assert!(note.contains("unresolved from 100 A up to 120 A"), "{note}");
+        assert!(note.contains("faster band's time is not used") && note.contains("first time is not held"), "{note}");
+        assert_eq!(point_curve_note(&c, 50.0), None);
         assert_eq!(trip_time(&c, 0.0), None);
         assert_eq!(trip_time(&c, f64::NAN), None);
     }
@@ -987,7 +1022,9 @@ mod point_curve_tests {
         let clearing = average_melt_clearing(&device, 1000.0).unwrap();
         close(clearing.seconds, 0.04 * 1.10 + 0.004);
         assert_eq!(clearing.adjustment, MeltAdjustment::AverageMelt { melt_s: 0.04, two_bands: true });
-        assert!(clearing.detail(1000.0).contains("slower band") && clearing.detail(1000.0).contains("not the published total-clearing curve"));
+        let detail = clearing.detail(1000.0);
+        assert!(detail.contains("slower band") && detail.contains("not the published total-clearing curve"), "{detail}");
+        assert!(detail.contains("melt-tolerance pair") && detail.contains("fuse_total_clearing stays off"), "{detail}");
         // Above the 0.01 s point of the slower band. No let-through data, so the
         // arc current is not reduced.
         let above = average_melt_clearing(&device, 50_000.0).unwrap();

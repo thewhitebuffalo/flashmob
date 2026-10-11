@@ -429,7 +429,7 @@ impl State {
             "fuse_total_clearing": fuse_total_clearing,
             "basis": basis,
             "notes": notes,
-            "note": "The copied curve is a snapshot marked assumed. The slower band is not total clearing unless fuse_total_clearing was set on this call. A fuse category may estimate clearing from the melting curve by IEEE 1584-2018 Clause 6.9.2 (10% of the melting time plus 0.004 s, or 0.01 s when that total is shorter); that estimate is assumed and is not an arc-flash label.",
+            "note": "The copied curve is a snapshot marked assumed. The slower band is not total clearing unless fuse_total_clearing was set on this call. In the current range where only the fast band has started, clearing is unresolved and that range is named. A fuse category may estimate clearing from the melting curve by IEEE 1584-2018 Clause 6.9.2 (10% of the melting time plus 0.004 s, or 0.01 s when that total is shorter); that estimate is assumed and is not an arc-flash label.",
         }))
     }
 

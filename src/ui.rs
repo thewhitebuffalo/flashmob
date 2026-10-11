@@ -773,6 +773,13 @@ impl App {
             edited |= labeled_text(ui, "Name", &mut device.name);
             edited |= labeled_text(ui, "Bus", &mut device.bus);
             ui.label(RichText::new("Bus is checked on Run.").color(color("#94A3B8")));
+            let mut branch = device.protected_branch.clone().unwrap_or_default();
+            if labeled_text(ui, "protected_branch", &mut branch) {
+                edited = true;
+                let trimmed = branch.trim();
+                device.protected_branch = if trimmed.is_empty() { None } else { Some(trimmed.to_string()) };
+            }
+            ui.label(RichText::new("Branch id this device interrupts. Run checks that it exists and touches this bus.").color(color("#94A3B8")));
             edited |= edit_breaker_time(ui, device, &mut refusal);
             edited |= edit_clearing_flags(ui, device, &mut refusal);
             edited |= labeled_text(ui, "Basis", &mut device.basis);
@@ -971,6 +978,8 @@ impl App {
             let form = &mut self.library_form;
             labeled_text(ui, "Project id", &mut form.id);
             labeled_text(ui, "Bus", &mut form.bus);
+            labeled_text(ui, "protected_branch", &mut form.protected_branch);
+            ui.label(RichText::new("Branch id the device interrupts. Empty leaves it unset.").color(color("#94A3B8")));
             labeled_text(ui, "Name", &mut form.name);
             labeled_text(ui, "rating_a", &mut form.rating_a);
             labeled_text(ui, "sensor_a", &mut form.sensor_a);
@@ -1027,6 +1036,15 @@ impl App {
             }
             Ok(Some(parsed))
         };
+        let protected_branch = text(&self.library_form.protected_branch);
+        if let Some(branch_id) = &protected_branch {
+            let connected = self.project.branches.iter().any(|branch| {
+                branch.id == *branch_id && (branch.from == bus || branch.to == bus)
+            });
+            if !connected {
+                return Err(format!("protected_branch '{branch_id}' is not a branch connected to bus '{bus}'."));
+            }
+        }
         let lt_pickup_function = text(&self.library_form.lt_pickup_function);
         let lt_pickup_label = text(&self.library_form.lt_pickup_label);
         let lt_delay_function = text(&self.library_form.lt_delay_function);
@@ -1042,7 +1060,7 @@ impl App {
             id: id.to_string(),
             name: self.library_form.name.trim().to_string(),
             bus: bus.to_string(),
-            protected_branch: None,
+            protected_branch,
             rating_a: number(&self.library_form.rating_a, "rating_a")?,
             current_base_a: number(&self.library_form.current_base_a, "current_base_a")?,
             voltage_v: number(&self.library_form.voltage_v, "voltage_v")?,
@@ -1107,6 +1125,7 @@ impl App {
 struct LibraryForm {
     id: String,
     bus: String,
+    protected_branch: String,
     name: String,
     rating_a: String,
     sensor_a: String,
