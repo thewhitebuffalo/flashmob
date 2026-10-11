@@ -158,14 +158,17 @@ Current on a TCC is referred to the chosen voltage, so a device on another windi
 
 Buses are entered in physical units: kV, ohms, kVA, and percent impedance. The system base defaults to 100 MVA.
 
-This is a study tool for building and checking a model. It does not ship a manufacturer device library (one can be converted for reference; see [Device libraries](#device-libraries)), ANSI C37.010 NACD multipliers, three-winding transformers, or DC systems.
+This is a study tool for building and checking a model. Manufacturer curves come from the installed device library (see [Device libraries](#device-libraries)). The built-in sample is an example plant, not a device catalog. Tests use small written libraries so each rule can be checked on its own. Flashmob does not ship ANSI C37.010 NACD multipliers, three-winding transformers, or DC systems.
 
 ## Device libraries
 
-`flashmob import-library` converts a binary manufacturer device library into Flashmob's library JSON (`format: "flashmob-device-library"`, `version: 1`). `flashmob library` searches the result.
+`flashmob import-library` converts a binary manufacturer device library into Flashmob's library JSON (`format: "flashmob-device-library"`, `version: 1`). `flashmob library` searches a library file.
+
+The installed library is `~/Library/Application Support/flashmob/device-library.json` on macOS, and `~/.local/share/flashmob/device-library.json` elsewhere. `FLASHMOB_LIBRARY` overrides that path. `./device-library.json` is used when the installed file is absent. The Library button loads this file. `flashmob library` and `flashmob apply-library` use it when you do not pass a path. The converted file stays on the machine that built it. It is not part of the git repository. A study still stores only the curve copied onto a device.
 
 ```bash
 flashmob import-library devices.lib -o device-library.json --compact
+flashmob library bussmann lpj --limit 5
 flashmob library device-library.json bussmann lpj --limit 5
 ```
 
@@ -201,6 +204,7 @@ A device may carry an optional `library` link recording where its data came from
 `flashmob apply-library` copies one library characteristic onto a project device. The copy is a snapshot: the project stores the curve, and studies use that curve only, never the library file. The device's `library` link records the source. The path is chosen by the request, not by the device category. If any long-time, short-time, or instantaneous setting is named, trip settings are applied. Otherwise a selected `time_dial_curve_family` is a relay dial curve. Otherwise one point curve is copied. `basis` is `assumed`. `curve_is_total_clearing` and `breaker_interrupting_s` stay unset. A symmetrical interrupting rating is copied when the usable library rows agree: interrupting kA and test X/R must be positive, `--voltage-v` keeps rows within 0.05% of that voltage, and the sensor or trip-unit amperes prefer a matching row. Several different duties are left unset and named on the link. A zero interrupting rating is not copied. `fuse_total_clearing` stays false unless you set it after confirming that the governing band is total clearing.
 
 ```bash
+flashmob apply-library --device-id 12 --id fuse-1 --bus mcc --project project.json -o project.json
 flashmob apply-library device-library.json --device-id 12 --id fuse-1 --bus mcc --project project.json -o project.json
 ```
 

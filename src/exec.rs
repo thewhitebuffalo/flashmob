@@ -718,7 +718,7 @@ pub fn schema() -> serde_json::Value {
             "sld": "flashmob sld project.json -o diagram.svg",
             "tcc": "flashmob tcc project.json -o curves.svg --csv curves.csv --ref-kv 0.48",
             "export_package": "flashmob export-package project.json -o package-export    # --force to replace existing files",
-            "apply_library": "flashmob apply-library device-library.json --device-id 1 --id fuse-1 --bus mcc [--project project.json] [-o out.json]"
+            "apply_library": "flashmob apply-library [device-library.json] --device-id 1 --id fuse-1 --bus mcc [--project project.json] [-o out.json]. Omit the library path to use the installed device library."
         },
         "exec_request": {
             "project": null,

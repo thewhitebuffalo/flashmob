@@ -12,6 +12,7 @@
 //! guessed.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -251,5 +252,124 @@ impl Library {
             let hay = format!("{} {} {} {} {} {}", d.manufacturer, d.category, d.device_type, d.style, d.catalog, d.reference).to_lowercase();
             terms.iter().all(|t| hay.contains(t))
         }).collect()
+    }
+}
+
+/// Directory for the converted manufacturer library on this machine.
+/// macOS uses `~/Library/Application Support/flashmob`. Other systems use
+/// `~/.local/share/flashmob`. The file is not part of a study project.
+pub fn installed_library_dir() -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    if cfg!(target_os = "macos") {
+        Some(home.join("Library/Application Support/flashmob"))
+    } else {
+        Some(home.join(".local/share/flashmob"))
+    }
+}
+
+/// `device-library.json` inside [`installed_library_dir`]. The file may be absent.
+pub fn installed_library_file() -> Option<PathBuf> {
+    installed_library_dir().map(|dir| dir.join("device-library.json"))
+}
+
+/// First existing library file. `FLASHMOB_LIBRARY` wins when it is set.
+/// Then the installed file, then `./device-library.json`.
+pub fn installed_library_path() -> Option<PathBuf> {
+    // A set FLASHMOB_LIBRARY is the only candidate. A missing file does not
+    // fall through to the installed path.
+    if let Some(env) = std::env::var_os("FLASHMOB_LIBRARY") {
+        if !env.is_empty() {
+            let path = PathBuf::from(env);
+            return path.is_file().then_some(path);
+        }
+    }
+    let mut paths = Vec::new();
+    if let Some(path) = installed_library_file() {
+        paths.push(path);
+    }
+    paths.push(PathBuf::from("device-library.json"));
+    paths.into_iter().find(|path| path.is_file())
+}
+
+/// The installed library, or an error that names where it was expected.
+pub fn require_installed_library() -> Result<PathBuf, String> {
+    if let Some(env) = std::env::var_os("FLASHMOB_LIBRARY") {
+        if !env.is_empty() {
+            let path = PathBuf::from(&env);
+            if path.is_file() {
+                return Ok(path);
+            }
+            return Err(format!("could not read {}: not a file", path.display()));
+        }
+    }
+    if let Some(path) = installed_library_path() {
+        return Ok(path);
+    }
+    match installed_library_file() {
+        Some(path) => Err(format!(
+            "no installed device library at {}. Pass a library JSON path, or set FLASHMOB_LIBRARY.",
+            path.display()
+        )),
+        None => Err("no installed device library. Pass a library JSON path, or set FLASHMOB_LIBRARY.".into()),
+    }
+}
+
+/// `explicit` when it is a file. Otherwise the installed library.
+pub fn require_library_file(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
+    match explicit {
+        Some(path) if path.is_file() => Ok(path),
+        Some(path) => Err(format!("could not read {}: not a file", path.display())),
+        None => require_installed_library(),
+    }
+}
+
+/// Search arguments. An existing file in the first argument is the library.
+/// A missing `.json` path or a path that contains a separator is an error.
+/// Any other arguments are search terms against the installed library.
+pub fn split_library_search(args: &[String], installed: Option<&Path>) -> Result<(PathBuf, Vec<String>), String> {
+    if let Some(first) = args.first() {
+        let path = PathBuf::from(first);
+        let looks_like_path = first.ends_with(".json") || first.contains('/') || first.contains('\\');
+        if path.is_file() {
+            return Ok((path, args.iter().skip(1).cloned().collect()));
+        }
+        if looks_like_path {
+            return Err(format!("could not read {first}: not a file"));
+        }
+    }
+    match installed {
+        Some(path) if path.is_file() => Ok((path.to_path_buf(), args.to_vec())),
+        Some(path) => Err(format!(
+            "no installed device library at {}. Pass a library JSON path, or set FLASHMOB_LIBRARY.",
+            path.display()
+        )),
+        None => Err("no installed device library. Pass a library JSON path, or set FLASHMOB_LIBRARY.".into()),
+    }
+}
+
+#[cfg(test)]
+mod installed_path_tests {
+    use super::*;
+
+    #[test]
+    fn search_uses_an_explicit_file_and_otherwise_the_installed_library() {
+        let dir = std::env::temp_dir().join(format!("flashmob-lib-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let present = dir.join("device-library.json");
+        std::fs::write(&present, b"{}").unwrap();
+        let missing = dir.join("missing.json");
+
+        let (path, terms) = split_library_search(&[present.display().to_string(), "lpj".into()], None).unwrap();
+        assert_eq!(path, present);
+        assert_eq!(terms, vec!["lpj".to_string()]);
+
+        let (path, terms) = split_library_search(&["lpj".into()], Some(present.as_path())).unwrap();
+        assert_eq!(path, present);
+        assert_eq!(terms, vec!["lpj".to_string()]);
+
+        let err = split_library_search(&[missing.display().to_string()], Some(present.as_path())).unwrap_err();
+        assert!(err.contains("not a file"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -226,6 +226,7 @@ impl eframe::App for App {
                 }
                 if ui.button("Library").clicked() {
                     self.library_open = true;
+                    self.autoload_library();
                 }
             });
             ui.horizontal(|ui| {
@@ -847,7 +848,9 @@ impl App {
         if !self.library_error.is_empty() {
             ui.label(RichText::new(&self.library_error).color(color("#FF5555")));
         }
-        if self.library.is_some() {
+        let device_count = self.library.as_ref().map(|library| library.devices.len());
+        if let Some(count) = device_count {
+            ui.label(RichText::new(format!("{count} devices")).color(color("#94A3B8")));
             ui.horizontal(|ui| {
                 ui.label("Search");
                 ui.text_edit_singleline(&mut self.library_search);
@@ -860,16 +863,32 @@ impl App {
         self.library_form(ui);
     }
 
+    fn autoload_library(&mut self) {
+        if self.library.is_some() {
+            return;
+        }
+        match flashmob::library::require_installed_library() {
+            Ok(path) => self.load_library_file(&path),
+            Err(err) => self.library_error = err,
+        }
+    }
+
     fn open_library(&mut self) {
         let Some(path) = rfd::FileDialog::new().add_filter("Device library", &["json"]).pick_file() else { return };
-        match std::fs::read_to_string(&path).map_err(|err| err.to_string()).and_then(|text| Library::from_json(&text)) {
+        self.load_library_file(&path);
+    }
+
+    fn load_library_file(&mut self, path: &std::path::Path) {
+        match std::fs::read_to_string(path).map_err(|err| err.to_string()).and_then(|text| Library::from_json(&text)) {
             Ok(library) => {
+                let count = library.devices.len();
                 self.library_path = path.display().to_string();
                 self.library = Some(library);
                 self.library_selected = None;
                 self.library_hits.clear();
                 self.library_hits_for = "\u{1}".into();
                 self.library_error.clear();
+                self.status = format!("Opened library, {count} devices. {}", path.display());
             }
             // A bad file stays in this window. The open project is left as it is.
             Err(err) => self.library_error = format!("Could not open {}: {err}", path.display()),

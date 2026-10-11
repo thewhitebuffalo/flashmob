@@ -127,8 +127,9 @@ enum Command {
         redact: Vec<String>,
     },
     /// Search a Flashmob library JSON file. Prints matching devices as JSON.
+    /// The first argument is a library file when that path exists or ends in .json.
+    /// Otherwise the installed device library is searched.
     Library {
-        path: PathBuf,
         /// Terms that must all appear in manufacturer, category, type, style, catalog, or reference.
         terms: Vec<String>,
         /// Print at most this many devices.
@@ -138,8 +139,8 @@ enum Command {
     /// Copy a library point curve, relay dial curve, or trip setting onto a project device.
     /// Prints the device JSON, or the whole project when --project is set.
     ApplyLibrary {
-        /// Flashmob device-library JSON.
-        library: PathBuf,
+        /// Flashmob device-library JSON. Omit to use the installed library.
+        library: Option<PathBuf>,
         #[arg(long)]
         device_id: u32,
         #[arg(long)]
@@ -314,16 +315,24 @@ fn main() -> ExitCode {
             Err(err) => fail(&err),
         },
         Command::ImportLibrary { input, output, compact, force, redact } => import_library(&input, &output, compact, force, &redact),
-        Command::Library { path, terms, limit } => {
+        Command::Library { terms, limit } => {
+            let (path, terms) = match resolve_library_search(terms) {
+                Ok(split) => split,
+                Err(err) => return fail(&err),
+            };
             let library = match std::fs::read_to_string(&path).map_err(|err| format!("could not read {}: {err}", path.display()))
                 .and_then(|text| flashmob::library::Library::from_json(&text)) {
                 Ok(library) => library,
                 Err(err) => return fail(&err),
             };
             let found = library.search(&terms);
-            emit(&serde_json::json!({"ok": true, "matches": found.len(), "devices": found.into_iter().take(limit).collect::<Vec<_>>()}), false)
+            emit(&serde_json::json!({"ok": true, "library": path.display().to_string(), "matches": found.len(), "devices": found.into_iter().take(limit).collect::<Vec<_>>()}), false)
         }
         Command::ApplyLibrary { library, device_id, id, bus, name, rating_a, current_base_a, voltage_v, function_name, protected_branch, library_name, fuse_total_clearing, dial, ct_ratio, tap_a, sensor_a, lt_pickup_function, lt_pickup_label, lt_delay_function, lt_delay_label, lt_delay_multiple, st_pickup_function, st_pickup_label, st_delay_function, st_delay_label, inst_function, inst_label, inst_s, pickup_base, project, output } => {
+            let library = match flashmob::library::require_library_file(library) {
+                Ok(path) => path,
+                Err(err) => return fail(&err),
+            };
             let library_path = library.display().to_string();
             let paired = |function: &Option<String>, label: &Option<String>, name: &str| {
                 flashmob::library_apply::setting_ref(function, label, name)
@@ -364,6 +373,20 @@ fn main() -> ExitCode {
             }
         }
     }
+}
+
+fn resolve_library_search(terms: Vec<String>) -> Result<(PathBuf, Vec<String>), String> {
+    let explicit = terms.first().is_some_and(|first| {
+        let path = PathBuf::from(first);
+        let looks_like_path = first.ends_with(".json") || first.contains('/') || first.contains('\\');
+        path.is_file() || looks_like_path
+    });
+    let installed = if explicit {
+        None
+    } else {
+        Some(flashmob::library::require_installed_library()?)
+    };
+    flashmob::library::split_library_search(&terms, installed.as_deref())
 }
 
 fn apply_library_device(library_path: &std::path::Path, request: &flashmob::library::ApplyDevice, output: Option<&std::path::Path>) -> ExitCode {
