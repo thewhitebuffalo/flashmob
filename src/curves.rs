@@ -189,9 +189,116 @@ pub fn trip_time_device(device: &Device, amps: f64) -> Option<f64> {
     trip_time(&device.curve, amps)
 }
 
-/// Total clearing requires either a curve that already includes total clearing
-/// (`fuse_total_clearing` or `curve_is_total_clearing`) or breaker time.
+/// IEEE 1584-2002 section 4.6 step 5. At or under this melting time, add 15%.
+const AVERAGE_MELT_BREAK_S: f64 = 0.03;
+const AVERAGE_MELT_SHORT_FACTOR: f64 = 1.15;
+const AVERAGE_MELT_LONG_FACTOR: f64 = 1.10;
+/// Plotted bottom of a fuse time-current curve. Current above that point uses this time.
+const FUSE_CURVE_BOTTOM_S: f64 = 0.01;
+
+/// How a melting curve was turned into an estimated clearing time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MeltAdjustment {
+    /// One band, read as the average melting curve.
+    AverageMelt { melt_s: f64, factor: f64 },
+    /// Two bands. The slower band is the high tolerance of one curve.
+    /// The 10% or 15% time factor is not applied again.
+    HighTolerance,
+    /// Arcing current is above the curve's 0.01 s point.
+    CurveBottom { last_a: f64 },
+}
+
+/// Estimated total clearing from a fuse melting curve. Not a published total-clearing curve.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MeltClearing {
+    pub seconds: f64,
+    pub adjustment: MeltAdjustment,
+}
+
+impl MeltClearing {
+    /// Basis for a study note. Names the rule and says the time is not label-ready.
+    pub fn detail(&self, amps: f64) -> String {
+        match self.adjustment {
+            MeltAdjustment::AverageMelt { melt_s, factor } => format!(
+                "IEEE 1584-2002 section 4.6 step 5 reads the average melting time {melt_s:.3} s at {amps:.0} A and multiplies by {factor:.2} (1.15 at or under 0.03 s, 1.10 above 0.03 s), giving {seconds:.3} s. This is not the published total-clearing curve and is not for an arc-flash label.",
+                seconds = self.seconds
+            ),
+            MeltAdjustment::HighTolerance => format!(
+                "The estimated clearing time {seconds:.3} s is the slower band at {amps:.0} A, the high tolerance of the published melting curve. IEEE 1584-2002 section 4.6 step 5 multiplies a single average-melt time by 1.15 at or under 0.03 s and by 1.10 above 0.03 s; that factor is not applied again on a tolerance band. This is not the published total-clearing curve and is not for an arc-flash label.",
+                seconds = self.seconds
+            ),
+            MeltAdjustment::CurveBottom { last_a } => format!(
+                "The arcing current {amps:.0} A is above the melting curve's last point ({last_a:.0} A at 0.01 s). IEEE 1584-2002 section 4.6 step 5 uses 0.01 s. This is not the published total-clearing curve and is not for an arc-flash label."
+            ),
+        }
+    }
+}
+
+fn library_fuse(device: &Device) -> bool {
+    device.library.as_ref().is_some_and(|link| link.category.to_ascii_lowercase().contains("fuse"))
+}
+
+fn is_fuse_curve_bottom(last_s: f64) -> bool {
+    last_s.is_finite() && (last_s - FUSE_CURVE_BOTTOM_S).abs() <= 1e-6 * FUSE_CURVE_BOTTOM_S
+}
+
+/// A library fuse with a point curve, and neither a total-clearing flag nor breaker time.
+pub fn average_melt_fuse(device: &Device) -> bool {
+    library_fuse(device)
+        && !device.curve_includes_clearing()
+        && device.breaker_interrupting_s.is_none()
+        && matches!(device.curve, CurveSpec::Points { .. })
+}
+
+fn adjusted_melt(two_bands: bool, melt_s: f64) -> Option<MeltClearing> {
+    if !melt_s.is_finite() || melt_s <= 0.0 {
+        return None;
+    }
+    if two_bands {
+        return Some(MeltClearing { seconds: melt_s, adjustment: MeltAdjustment::HighTolerance });
+    }
+    let factor = if melt_s <= AVERAGE_MELT_BREAK_S { AVERAGE_MELT_SHORT_FACTOR } else { AVERAGE_MELT_LONG_FACTOR };
+    let seconds = melt_s * factor;
+    seconds.is_finite().then_some(MeltClearing {
+        seconds,
+        adjustment: MeltAdjustment::AverageMelt { melt_s, factor },
+    })
+}
+
+/// Estimated clearing for a library fuse whose curve is melting data.
+///
+/// One band is the average melting curve: times 1.15 at or under 0.03 s, and
+/// times 1.10 above 0.03 s (IEEE 1584-2002 section 4.6 step 5). Two bands are
+/// a tolerance pair, so the slower band is the clearing time and that factor
+/// is not applied again. Current above a last point of 0.01 s uses 0.01 s.
+/// Current below the first point, or above a last point that is not that
+/// 0.01 s bottom, returns None. A total-clearing flag or `breaker_interrupting_s`
+/// keeps the ordinary clearing path instead.
+pub fn average_melt_clearing(device: &Device, amps: f64) -> Option<MeltClearing> {
+    if !average_melt_fuse(device) || !amps.is_finite() || amps <= 0.0 {
+        return None;
+    }
+    let CurveSpec::Points { points, max_points, beyond_last, .. } = &device.curve else { return None };
+    let two_bands = max_points.is_some();
+    match point_time(governing_band(points, max_points), amps) {
+        PointTime::Below => None,
+        PointTime::Beyond { last_a, last_s } if is_fuse_curve_bottom(last_s) => Some(MeltClearing {
+            seconds: FUSE_CURVE_BOTTOM_S,
+            adjustment: MeltAdjustment::CurveBottom { last_a },
+        }),
+        PointTime::Beyond { last_s, .. } if *beyond_last == PointTail::HoldLastTime => adjusted_melt(two_bands, last_s),
+        PointTime::Beyond { .. } => None,
+        PointTime::Within(melt_s) => adjusted_melt(two_bands, melt_s),
+    }
+}
+
+/// Total clearing from a curve that already includes it, from breaker time
+/// added to the operating time, or from the IEEE 1584-2002 section 4.6 step 5
+/// estimate for a library fuse melting curve.
 pub fn clearing_time(device: &Device, amps: f64) -> Option<f64> {
+    if let Some(melt) = average_melt_clearing(device, amps) {
+        return Some(melt.seconds);
+    }
     let operating = trip_time_device(device, amps).filter(|t| t.is_finite() && *t > 0.0)?;
     if device.curve_includes_clearing() && device.breaker_interrupting_s.is_some() { return None; }
     if device.curve_includes_clearing() { Some(operating) }
@@ -799,6 +906,108 @@ mod point_curve_tests {
 
         assert!(DynamicRelay::new(&CurveSpec::Points { points: vec![[1.0, 1.0]], max_points: None,
             beyond_last: PointTail::Unavailable, band_interpretation: BandInterpretation::Entered }).is_err());
+    }
+
+    fn flat(time_s: f64) -> CurveSpec {
+        CurveSpec::Points {
+            points: vec![[100.0, time_s], [1000.0, time_s]],
+            max_points: None,
+            beyond_last: PointTail::Unavailable,
+            band_interpretation: BandInterpretation::Entered,
+        }
+    }
+
+    fn fuse(curve: CurveSpec, category: &str) -> Device {
+        Device {
+            id: "d".into(), name: "d".into(), bus: "b".into(), curve,
+            basis: String::new(), protected_branch: None, breaker_interrupting_s: None,
+            fuse_total_clearing: false, curve_is_total_clearing: false,
+            library: Some(crate::model::LibraryLink { device_id: 1, category: category.into(), ..Default::default() }),
+            interrupting: None,
+        }
+    }
+
+    #[test]
+    fn average_melt_uses_fifteen_percent_at_or_under_30_ms_and_ten_above() {
+        let short = fuse(flat(0.02), "Fuses - Low Voltage");
+        let clearing = average_melt_clearing(&short, 400.0).unwrap();
+        let MeltAdjustment::AverageMelt { melt_s, factor } = clearing.adjustment else { panic!("{:?}", clearing.adjustment) };
+        close(melt_s, 0.02);
+        assert_eq!(factor, 1.15);
+        close(clearing.seconds, melt_s * factor);
+        assert!(clearing.detail(400.0).contains("IEEE 1584-2002") && clearing.detail(400.0).contains("not for an arc-flash label"));
+
+        let boundary = fuse(flat(0.03), "LV Fuse");
+        close(clearing_time(&boundary, 400.0).unwrap(), 0.03 * 1.15);
+
+        let long = fuse(flat(0.04), "Fuses - Low Voltage");
+        let clearing = average_melt_clearing(&long, 400.0).unwrap();
+        let MeltAdjustment::AverageMelt { melt_s, factor } = clearing.adjustment else { panic!("{:?}", clearing.adjustment) };
+        close(melt_s, 0.04);
+        assert_eq!(factor, 1.10);
+        close(clearing.seconds, melt_s * factor);
+    }
+
+    #[test]
+    fn tolerance_band_uses_the_slower_time_without_a_second_factor() {
+        let curve = CurveSpec::Points {
+            points: vec![[100.0, 1.0], [1000.0, 0.02], [10000.0, 0.01]],
+            max_points: Some(vec![[120.0, 1.2], [1000.0, 0.04], [10000.0, 0.01]]),
+            beyond_last: PointTail::Unavailable,
+            band_interpretation: BandInterpretation::Assumed,
+        };
+        let device = fuse(curve, "Fuses - Low Voltage");
+        let clearing = average_melt_clearing(&device, 1000.0).unwrap();
+        close(clearing.seconds, 0.04);
+        assert_eq!(clearing.adjustment, MeltAdjustment::HighTolerance);
+        assert!(clearing.detail(1000.0).contains("not applied again"));
+        // Above the 0.01 s point of the slower band.
+        let above = average_melt_clearing(&device, 50_000.0).unwrap();
+        close(above.seconds, 0.01);
+        assert!(matches!(above.adjustment, MeltAdjustment::CurveBottom { last_a } if (last_a - 10000.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn melt_estimate_stops_below_the_curve_and_above_a_longer_tail() {
+        let device = fuse(flat(0.2), "Fuses - Low Voltage");
+        assert!(average_melt_clearing(&device, 50.0).is_none());
+        assert!(clearing_time(&device, 50.0).is_none());
+        let mut long_tail = flat(0.05);
+        if let CurveSpec::Points { points, .. } = &mut long_tail {
+            points[1][1] = 0.05;
+        }
+        // 0.05 s is not the 0.01 s bottom, and the tail is unavailable.
+        assert!(average_melt_clearing(&fuse(long_tail, "LV Fuse"), 5_000.0).is_none());
+    }
+
+    #[test]
+    fn melt_estimate_does_not_apply_to_a_breaker_or_a_marked_clearing_curve() {
+        let curve = flat(0.04);
+        assert!(average_melt_clearing(&fuse(curve.clone(), "Molded Case"), 400.0).is_none());
+        assert!(clearing_time(&fuse(curve.clone(), "Molded Case"), 400.0).is_none());
+        let mut marked = fuse(curve.clone(), "Fuses - Low Voltage");
+        marked.fuse_total_clearing = true;
+        assert!(average_melt_clearing(&marked, 400.0).is_none());
+        close(clearing_time(&marked, 400.0).unwrap(), 0.04);
+        let mut breaker = fuse(curve, "Fuses - Low Voltage");
+        breaker.breaker_interrupting_s = Some(0.05);
+        assert!(average_melt_clearing(&breaker, 400.0).is_none());
+        close(clearing_time(&breaker, 400.0).unwrap(), 0.09);
+        breaker.fuse_total_clearing = true;
+        assert!(clearing_time(&breaker, 400.0).is_none());
+    }
+
+    #[test]
+    fn held_tail_above_30_ms_still_takes_the_average_melt_factor() {
+        let mut curve = flat(0.05);
+        if let CurveSpec::Points { beyond_last, .. } = &mut curve {
+            *beyond_last = PointTail::HoldLastTime;
+        }
+        let clearing = average_melt_clearing(&fuse(curve, "Fuses - Low Voltage"), 5_000.0).unwrap();
+        let MeltAdjustment::AverageMelt { melt_s, factor } = clearing.adjustment else { panic!("{:?}", clearing.adjustment) };
+        close(melt_s, 0.05);
+        assert_eq!(factor, 1.10);
+        close(clearing.seconds, melt_s * factor);
     }
 
     #[test]

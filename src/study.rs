@@ -665,6 +665,9 @@ fn decrement_duration(project: &Project, loadflow: Option<&LoadflowResult>, equi
     if device.curve_is_total_clearing {
         return missing(format!("a trip-only curve and breaker_interrupting_s for upstream device {} [{}]. curve_is_total_clearing is set, and the time-varying model integrates trip-element time rather than a total-clearing curve", device.name, device.id));
     }
+    if curves::average_melt_fuse(device) {
+        return missing(format!("a clearing time for upstream device {} [{}] that follows the decaying fault current. The device is a fuse with a melting curve. IEEE 1584-2002 section 4.6 step 5 reads one time at one arcing current, and that single time is not used while a source decrement reaches this bus. Enter clearing_s for the total exposure, or remove the decrement curve", device.name, device.id));
+    }
     let Some(interrupting_s) = device.breaker_interrupting_s else {
         return missing(format!("breaker_interrupting_s on upstream device {} [{}]. The time-varying model adds breaker interruption after the trip curve operates", device.name, device.id));
     };
@@ -1054,7 +1057,11 @@ fn clearing_gap(device: &Device, amps: f64, point_note: Option<(bool, String)>) 
         }
         CurveSpec::Points { .. } => {
             if curves::trip_time(&device.curve, amps).is_none() {
-                format!("an operating time for {name} [{id}] at {amps:.0} A. The point curve does not produce a time at this current.{extra}")
+                if curves::average_melt_fuse(device) {
+                    format!("an operating time for {name} [{id}] at {amps:.0} A. IEEE 1584-2002 section 4.6 step 5 is not applied: the melting curve has no time at this current. Below the first point the fuse does not operate. Above the last point, 0.01 s is used only when that point is the 0.01 s bottom of the curve.{extra}")
+                } else {
+                    format!("an operating time for {name} [{id}] at {amps:.0} A. The point curve does not produce a time at this current.{extra}")
+                }
             } else if !device.curve_includes_clearing() && device.breaker_interrupting_s.is_none() {
                 format!("total clearing for {name} [{id}] at {amps:.0} A. The curve has an operating time, but it is not marked total clearing and breaker_interrupting_s is absent. For a fuse, set fuse_total_clearing only when the governing band is the published total-clearing curve. For a breaker, enter breaker_interrupting_s.{extra}")
             } else {
@@ -1104,6 +1111,18 @@ fn duration(project: &Project, case: &ArcEquipment, fault: &crate::fault::BusFau
     }
     reject_connected_motors(project, device, &case.bus)?;
     let point_note = curves::point_curve_note(&device.curve, amps);
+    if let Some(melt) = curves::average_melt_clearing(device, amps) {
+        let mut clear = finish_clearing(melt.seconds, cap, &format!("estimated clearing time of {} at {amps:.0} A through its protected terminal (network terminal current; loadflow prefault includes initial branch flow)", device.name), not_a_label);
+        clear.assumed = true;
+        clear.note.push(' ');
+        clear.note.push_str(&melt.detail(amps));
+        if !matches!(melt.adjustment, curves::MeltAdjustment::CurveBottom { .. }) {
+            add_point_note(&mut clear, point_note);
+        } else if point_note.as_ref().is_some_and(|(assumed, _)| *assumed) {
+            clear.note.push_str(" The point curve's band interpretation is assumed.");
+        }
+        return Ok(clear);
+    }
     let Some(raw) = curves::clearing_time(device, amps) else {
         return missing_arc_flash(&case.bus, &clearing_gap(device, amps, point_note));
     };
@@ -1200,6 +1219,7 @@ fn coordination(project: &Project, fault: &FaultResult) -> Vec<CoordRow> {
             let min_band = amps.filter(|_| two_bands).and_then(|a| curves::trip_time_fast_band(&device.curve, a));
             let point_note = amps.and_then(|a| curves::point_curve_note(&device.curve, a))
                 .map(|(_, note)| format!(" {note}")).unwrap_or_default();
+            let melt_note = amps.and_then(|a| curves::average_melt_clearing(device, a).map(|melt| format!(" {}", melt.detail(a)))).unwrap_or_default();
             let band_note = if two_bands { " Point curve: times use the slower (max) band; min_band_trip_s is the faster band." } else { "" };
             CoordRow {
                 device_id: device.id.clone(),
@@ -1212,7 +1232,7 @@ fn coordination(project: &Project, fault: &FaultResult) -> Vec<CoordRow> {
                 total_clearing_s: total,
                 min_band_trip_s: min_band,
                 fault_bus_id: fault_bus.clone(),
-                note: format!("Current is the protected branch terminal contribution for a three-phase fault at bus '{fault_bus}' ({location}); operating and total-clearing times are separate. Unassigned terminals/times are unavailable.{band_note}{point_note}"),
+                note: format!("Current is the protected branch terminal contribution for a three-phase fault at bus '{fault_bus}' ({location}); operating and total-clearing times are separate. Unassigned terminals/times are unavailable.{band_note}{point_note}{melt_note}"),
             }
         })
         .collect()

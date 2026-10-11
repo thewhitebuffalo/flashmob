@@ -123,6 +123,8 @@ fn identify_with_index(project: &Project, bus: &str, index: &Index) -> Protectio
     result.device_id = Some(device.id.clone());
     result.clearing_data = if matches!(device.curve, CurveSpec::SettingsNotCollected { .. }) {
         "missing_curve"
+    } else if crate::curves::average_melt_fuse(device) {
+        "average_melt_adjustment"
     } else if !device.curve_includes_clearing() && device.breaker_interrupting_s.is_none() {
         "missing_interrupting_time"
     } else { "entered" }.into();

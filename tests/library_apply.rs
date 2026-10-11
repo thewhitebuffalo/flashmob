@@ -360,7 +360,11 @@ fn applied_two_band_fuse_validates_and_clears_on_the_slow_band() {
     let mut request = req(7);
     request.protected_branch = Some("feeder".into());
     let unmarked = apply_device(&lib(vec![sample_device("LV Fuse", vec![unit(100.0, vec![slow_then_fast()])])]), &request).unwrap();
-    assert!(curves::clearing_time(&unmarked, 1000.0).is_none());
+    // Two bands: the slower time is the high tolerance. The 10% / 15% factor is not applied again.
+    let unmarked_clearing = curves::average_melt_clearing(&unmarked, 1000.0).unwrap();
+    assert!((unmarked_clearing.seconds - 1.0).abs() < 1e-12);
+    assert!(matches!(unmarked_clearing.adjustment, curves::MeltAdjustment::HighTolerance));
+    assert!(curves::average_melt_clearing(&apply_one("Molded Case", slow_then_fast()).unwrap(), 1000.0).is_none());
     request.fuse_total_clearing = true;
     let device = apply_device(&lib(vec![sample_device("LV Fuse", vec![unit(100.0, vec![slow_then_fast()])])]), &request).unwrap();
     assert!(device.fuse_total_clearing);
@@ -371,6 +375,7 @@ fn applied_two_band_fuse_validates_and_clears_on_the_slow_band() {
     assert!(errors.is_empty(), "{errors:?}");
 
     assert!(device.breaker_interrupting_s.is_none());
+    assert!(curves::average_melt_clearing(&device, 1000.0).is_none());
     assert!((curves::clearing_time(&device, 1000.0).unwrap() - 1.0).abs() < 1e-12);
     let amps = (100.0_f64 * 1000.0).sqrt();
     let slow = [[100.0, 10.0], [1000.0, 1.0]];

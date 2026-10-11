@@ -345,3 +345,101 @@ fn exec_and_package_carry_curve_is_total_clearing() {
     assert!(unset.ok, "{:?} {:?}", unset.error, unset.validation_errors);
     assert!(!unset.project.devices[0].curve_is_total_clearing);
 }
+
+fn as_library_fuse(project: &mut Project, category: &str) {
+    project.devices[0].breaker_interrupting_s = None;
+    project.devices[0].fuse_total_clearing = false;
+    project.devices[0].curve_is_total_clearing = false;
+    project.devices[0].library = Some(LibraryLink {
+        device_id: 1,
+        category: category.into(),
+        ..LibraryLink::default()
+    });
+}
+
+#[test]
+fn library_fuse_average_melt_sets_an_assumed_arc_duration() {
+    let mut p = project(one_band(&[[100.0, 10.0], [100_000.0, 0.2]], PointTail::Unavailable));
+    as_library_fuse(&mut p, "Fuses - Low Voltage");
+    let out = run(&p);
+    let row = arc(&out);
+    let melt = curves::trip_time(&p.devices[0].curve, row.arcing_ka * 1000.0).unwrap();
+    let melt_min = curves::trip_time(&p.devices[0].curve, row.arcing_min_ka * 1000.0).unwrap();
+    assert!(melt > 0.03 && melt_min > 0.03, "{melt} {melt_min}");
+    close(row.time_s, melt * 1.10);
+    close(row.time_min_s, melt_min * 1.10);
+    assert!(row.assumed);
+    assert!(row.duration_note.contains("IEEE 1584-2002") && row.duration_note.contains("not for an arc-flash label"), "{}", row.duration_note);
+    let protection = out.protection.iter().find(|r| r.device_id.as_deref() == Some("brk-main")).unwrap();
+    assert_eq!(protection.clearing_data, "average_melt_adjustment");
+    let coord = out.coordination.as_ref().unwrap().iter().find(|r| r.device_id == "brk-main").unwrap();
+    let bolted_melt = curves::trip_time(&p.devices[0].curve, coord.bolted_ka.unwrap() * 1000.0).unwrap();
+    close(coord.total_clearing_s.unwrap(), bolted_melt * 1.10);
+    assert!(coord.note.contains("IEEE 1584-2002"), "{}", coord.note);
+}
+
+#[test]
+fn library_fuse_at_or_under_30_ms_uses_fifteen_percent() {
+    let mut p = project(one_band(&[[1.0, 0.02], [1_000_000.0, 0.02]], PointTail::Unavailable));
+    as_library_fuse(&mut p, "LV Fuse");
+    let out = run(&p);
+    let row = arc(&out);
+    close(row.time_s, 0.02 * 1.15);
+    close(row.time_min_s, 0.02 * 1.15);
+}
+
+#[test]
+fn library_fuse_above_the_10_ms_point_uses_10_ms() {
+    let mut p = project(points(
+        &[[100.0, 1.0], [1000.0, 0.01]],
+        Some(&[[120.0, 1.2], [1500.0, 0.01]]),
+        PointTail::Unavailable,
+        BandInterpretation::Assumed,
+    ));
+    as_library_fuse(&mut p, "Fuses - Low Voltage");
+    let out = run(&p);
+    let row = arc(&out);
+    assert!(row.arcing_ka * 1000.0 > 1500.0);
+    close(row.time_s, 0.01);
+    close(row.time_min_s, 0.01);
+    assert!(row.assumed);
+    assert!(row.duration_note.contains("0.01 s") && row.duration_note.contains("band interpretation is assumed"), "{}", row.duration_note);
+    assert!(!row.duration_note.contains("no operating time"), "{}", row.duration_note);
+}
+
+#[test]
+fn library_fuse_off_the_curve_still_fails_and_a_breaker_does_not_use_the_rule() {
+    let mut below = project(one_band(&[[1_000_000.0, 1.0], [2_000_000.0, 0.01]], PointTail::Unavailable));
+    as_library_fuse(&mut below, "Fuses - Low Voltage");
+    let out = run(&below);
+    assert!(out.arc_flash.as_ref().unwrap().iter().all(|row| row.equipment_id != "af-mcc"));
+    let failure = out.arc_flash_failures.iter().find(|f| f.equipment_id == "af-mcc").unwrap();
+    assert!(failure.error.contains("IEEE 1584-2002") && failure.error.contains("does not operate"), "{}", failure.error);
+
+    let mut tail = project(one_band(&[[100.0, 1.0], [1000.0, 0.05]], PointTail::Unavailable));
+    as_library_fuse(&mut tail, "Fuses - Low Voltage");
+    let out = run(&tail);
+    let failure = out.arc_flash_failures.iter().find(|f| f.equipment_id == "af-mcc").unwrap();
+    assert!(failure.error.contains("0.01 s bottom"), "{}", failure.error);
+
+    let mut breaker = project(one_band(&[[100.0, 1.0], [100_000.0, 0.2]], PointTail::Unavailable));
+    breaker.devices[0].breaker_interrupting_s = None;
+    let out = run(&breaker);
+    let failure = out.arc_flash_failures.iter().find(|f| f.equipment_id == "af-mcc").unwrap();
+    assert!(failure.error.contains("total clearing"), "{}", failure.error);
+    assert!(!failure.error.contains("IEEE 1584-2002"), "{}", failure.error);
+}
+
+#[test]
+fn source_decrement_does_not_use_the_single_current_melt_estimate() {
+    let mut p = project(one_band(&[[1.0, 0.02], [1_000_000.0, 0.02]], PointTail::Unavailable));
+    as_library_fuse(&mut p, "Fuses - Low Voltage");
+    p.sources[0].decrement_curve = vec![
+        DecrementPoint { time_s: 0.0, current_ratio: 1.0 },
+        DecrementPoint { time_s: 0.2, current_ratio: 0.5 },
+    ];
+    let out = run(&p);
+    assert!(out.arc_flash.as_ref().unwrap().iter().all(|row| row.equipment_id != "af-mcc"));
+    let failure = out.arc_flash_failures.iter().find(|f| f.equipment_id == "af-mcc").unwrap();
+    assert!(failure.error.contains("decaying fault current") && failure.error.contains("IEEE 1584-2002"), "{}", failure.error);
+}

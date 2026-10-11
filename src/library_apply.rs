@@ -3,7 +3,8 @@
 //! The curve on the device is a snapshot. Studies use that curve and do not
 //! read the library again. A point curve's band identity is inferred, so the
 //! result is marked assumed. The slower band is not treated as total clearing
-//! unless the caller sets `fuse_total_clearing`. A dial family or a trip
+//! unless the caller sets `fuse_total_clearing`. A fuse category may later
+//! estimate clearing from that melting curve; the flag stays off. A dial family or a trip
 //! setting is chosen only by the request, not by the device category.
 
 use crate::curves::{self, PointTime};
