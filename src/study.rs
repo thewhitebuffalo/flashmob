@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::arcflash::{self, EnergySegment, IeeeInput};
 use crate::curves::{self, curve_label};
+use crate::duty;
 use crate::fault::{self, FaultResult};
 use crate::loadflow::{self, LoadflowResult};
 use crate::model::{typical_equipment, ArcEquipment, Project, ASSUMED_ENCLOSURE_ELECTRODES};
@@ -48,6 +49,8 @@ pub struct StudyOutput {
     pub warnings: Vec<String>,
     pub loadflow: Option<LoadflowResult>,
     pub fault: Option<FaultResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interrupting: Vec<InterruptingDuty>,
     pub arc_flash: Option<Vec<ArcRow>>,
     pub coordination: Option<Vec<CoordRow>>,
     pub arc_flash_failures: Vec<ArcFailure>,
@@ -204,6 +207,24 @@ pub struct CoordRow {
     pub note: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InterruptingDuty {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub fault: String,
+    pub bus_id: String,
+    pub symmetrical_ka: f64,
+    pub system_xr: Option<f64>,
+    pub half_cycle_rms_ka: f64,
+    pub rated_symmetrical_ka: f64,
+    pub test_xr: Option<f64>,
+    pub rated_half_cycle_rms_ka: Option<f64>,
+    pub adjusted_symmetrical_ka: Option<f64>,
+    pub status: String,
+    pub note: String,
+}
+
 pub fn run(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
     let started = std::time::Instant::now();
     let mut normal = run_one(project, studies)?;
@@ -300,6 +321,13 @@ fn run_one(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
         None
     };
     if let Some(error) = fault.as_ref().and_then(|f| f.error.as_ref()) { warnings.push(error.clone()); }
+    let interrupting = if let Some(solved) = fault.as_ref().filter(|result| result.valid) {
+        let rows = interrupting_duties(project, solved)?;
+        warnings.extend(duty_warnings(&rows));
+        rows
+    } else {
+        Vec::new()
+    };
     let mut seen = std::collections::HashSet::new();
     warnings.retain(|warning| seen.insert(warning.clone()));
 
@@ -315,6 +343,7 @@ fn run_one(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
         warnings,
         loadflow: if studies.loadflow { loadflow } else { None },
         fault: if studies.fault { fault } else { None },
+        interrupting,
         arc_flash,
         coordination,
         arc_flash_failures,
@@ -1193,6 +1222,154 @@ fn coordination_fault_bus(project: &Project, device: &crate::model::Device, faul
     }
 }
 
+struct DutyPick {
+    fault_name: &'static str,
+    symmetrical_ka: f64,
+    system_xr: Option<f64>,
+    comparison: duty::DutyComparison,
+}
+
+fn interrupting_duties(project: &Project, fault: &FaultResult) -> Result<Vec<InterruptingDuty>, String> {
+    let mut rows = Vec::new();
+    for bus in &project.buses {
+        if let Some(row) = bracing_duty(bus, fault)? {
+            rows.push(row);
+        }
+    }
+    for device in &project.devices {
+        if let Some(row) = device_duty(project, device, fault)? {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
+fn bracing_duty(bus: &crate::model::Bus, fault: &FaultResult) -> Result<Option<InterruptingDuty>, String> {
+    let Some(rated) = bus.bracing_ka else { return Ok(None) };
+    let Some(bus_fault) = fault.buses.iter().find(|row| row.id == bus.id) else { return Ok(None) };
+    let mut chosen: Option<(&crate::fault::FaultPoint, &'static str)> = None;
+    for (name, point) in [("three_phase", bus_fault.three_phase.as_ref()), ("line_to_ground", bus_fault.line_to_ground.as_ref())] {
+        let Some(point) = point else { continue };
+        if chosen.as_ref().map_or(true, |(prior, _)| point.half_cycle_rms_ka > prior.half_cycle_rms_ka) {
+            chosen = Some((point, name));
+        }
+    }
+    let Some((point, fault_name)) = chosen else { return Ok(None) };
+    let comparison = duty::compare(&duty::DutyInput {
+        symmetrical_ka: point.symmetrical_ka,
+        system_xr: point.x_over_r,
+        rated_symmetrical_ka: rated,
+        test_xr: bus.bracing_test_xr,
+    })?;
+    Ok(Some(duty_row(
+        &bus.id, &bus.name, "bus_bracing", fault_name, &bus.id,
+        point.symmetrical_ka, point.x_over_r, rated, bus.bracing_test_xr, &comparison,
+        "Equipment bracing compared with the greater of the three-phase and line-to-ground bus faults.".into(),
+    )))
+}
+
+fn device_duty(project: &Project, device: &crate::model::Device, fault: &FaultResult) -> Result<Option<InterruptingDuty>, String> {
+    let Some(rating) = &device.interrupting else { return Ok(None) };
+    let mut best: Option<DutyPick> = None;
+    // Branch terminal current is stored only for the bolted three-phase fault.
+    // Do not pair that magnitude with the line-to-ground X/R.
+    if let Some(branch) = device.protected_branch.as_ref().and_then(|id| project.branches.iter().find(|b| b.id == *id)) {
+        for terminal in [&branch.from, &branch.to] {
+            let Some(bus_fault) = fault.buses.iter().find(|row| row.id == *terminal) else { continue };
+            let Some(point) = bus_fault.three_phase.as_ref() else { continue };
+            let Some(amps) = device_current(project, device, bus_fault, 1.0) else { continue };
+            keep_larger(&mut best, "three_phase", amps / 1000.0, point.x_over_r, rating.symmetrical_ka, Some(rating.test_xr))?;
+        }
+    } else if let Some(bus_fault) = fault.buses.iter().find(|row| row.id == device.bus) {
+        for (name, point) in [("three_phase", bus_fault.three_phase.as_ref()), ("line_to_ground", bus_fault.line_to_ground.as_ref())] {
+            let Some(point) = point else { continue };
+            keep_larger(&mut best, name, point.symmetrical_ka, point.x_over_r, rating.symmetrical_ka, Some(rating.test_xr))?;
+        }
+    }
+    let Some(best) = best else { return Ok(None) };
+    let mut note = if device.protected_branch.is_some() {
+        "Device current is the bolted three-phase current through the protected branch. Line-to-ground current through the device is not stored, so it was not compared. Device current uses the faulted bus Thevenin X/R. This is not a separate-network breaker duty.".to_string()
+    } else {
+        "No protected branch; bus fault current was used. The greater of the three-phase and line-to-ground bus faults was kept. Device current uses the faulted bus Thevenin X/R. This is not a separate-network breaker duty.".to_string()
+    };
+    if rating.voltage_v > 0.0 {
+        if let Some(bus) = project.bus(&device.bus) {
+            let rated_kv = rating.voltage_v / 1000.0;
+            if (bus.kv / rated_kv - 1.0).abs() > 0.10 {
+                note.push_str(" Rating voltage does not match the bus nominal voltage.");
+            }
+        }
+    }
+    Ok(Some(duty_row(
+        &device.id, &device.name, "device", best.fault_name, &device.bus,
+        best.symmetrical_ka, best.system_xr, rating.symmetrical_ka, Some(rating.test_xr), &best.comparison, note,
+    )))
+}
+
+fn keep_larger(best: &mut Option<DutyPick>, fault_name: &'static str, symmetrical_ka: f64, system_xr: Option<f64>, rated_symmetrical_ka: f64, test_xr: Option<f64>) -> Result<(), String> {
+    let comparison = duty::compare(&duty::DutyInput {
+        symmetrical_ka,
+        system_xr,
+        rated_symmetrical_ka,
+        test_xr,
+    })?;
+    if best.as_ref().map_or(true, |prior| comparison.half_cycle_rms_ka > prior.comparison.half_cycle_rms_ka) {
+        *best = Some(DutyPick { fault_name, symmetrical_ka, system_xr, comparison });
+    }
+    Ok(())
+}
+
+fn duty_row(
+    id: &str, name: &str, kind: &str, fault_name: &str, bus_id: &str,
+    symmetrical_ka: f64, system_xr: Option<f64>, rated: f64, test_xr: Option<f64>,
+    comparison: &duty::DutyComparison, note: String,
+) -> InterruptingDuty {
+    InterruptingDuty {
+        id: id.into(),
+        name: name.into(),
+        kind: kind.into(),
+        fault: fault_name.into(),
+        bus_id: bus_id.into(),
+        symmetrical_ka,
+        system_xr,
+        half_cycle_rms_ka: comparison.half_cycle_rms_ka,
+        rated_symmetrical_ka: rated,
+        test_xr,
+        rated_half_cycle_rms_ka: comparison.rated_half_cycle_rms_ka,
+        adjusted_symmetrical_ka: comparison.adjusted_symmetrical_ka,
+        status: comparison.status.as_str().into(),
+        note,
+    }
+}
+
+fn duty_warnings(rows: &[InterruptingDuty]) -> Vec<String> {
+    rows.iter().filter_map(|row| match row.status.as_str() {
+        "exceeds_rating" => Some(exceeds_warning(row)),
+        "not_adjusted" => Some(format!(
+            "{}: rating was compared without a test X/R, so asymmetrical duty was not checked",
+            row.id
+        )),
+        _ => None,
+    }).collect()
+}
+
+fn exceeds_warning(row: &InterruptingDuty) -> String {
+    let (ka, label) = match row.adjusted_symmetrical_ka {
+        Some(ka) => (ka, "adjusted"),
+        None => (row.rated_symmetrical_ka, "rated"),
+    };
+    match row.test_xr {
+        Some(xr) => format!(
+            "{}: {:.6} kA symmetrical exceeds the {label} rating {:.6} kA at test X/R {xr}",
+            row.id, row.symmetrical_ka, ka
+        ),
+        None => format!(
+            "{}: {:.6} kA symmetrical exceeds the {label} rating {:.6} kA",
+            row.id, row.symmetrical_ka, ka
+        ),
+    }
+}
+
 pub fn text_report(project: &Project, out: &StudyOutput) -> String {
     let mut lines = vec![
         format!("Flashmob  {}", project.name),
@@ -1239,6 +1416,17 @@ pub fn text_report(project: &Project, out: &StudyOutput) -> String {
         }
         if let Some(main) = bus.main_rating_a {
             lines.push(format!("    Main rating  {main:.0} A, collected. Trip-unit delay and instantaneous are not this rating."));
+        }
+        for row in out.interrupting.iter().filter(|row| row.bus_id == bus.id) {
+            let xr = row.system_xr.map(|v| format!("{v:.2}")).unwrap_or_else(|| "infinite".into());
+            let limit = match row.adjusted_symmetrical_ka {
+                Some(ka) => format!("adjusted {ka:.3} kA"),
+                None => format!("rated {:.3} kA", row.rated_symmetrical_ka),
+            };
+            lines.push(format!(
+                "    Interrupting duty  {} ({}) {}  {:.3} kA symmetrical  X/R {}  half-cycle {:.3} kA  {}  {}  {}",
+                row.id, row.kind, row.fault, row.symmetrical_ka, xr, row.half_cycle_rms_ka, limit, row.status, row.note
+            ));
         }
         if let Some(rows) = &out.arc_flash {
             let mine: Vec<_> = rows.iter().filter(|row| row.bus_id == bus.id).collect();
@@ -1473,7 +1661,7 @@ mod operating_case_regression {
 
     fn bus(id: &str) -> Bus {
         Bus { id: id.into(), name: id.into(), kv: 0.48, shunt_kvar: 0.0,
-            bracing_ka: None, main_rating_a: None }
+            bracing_ka: None, main_rating_a: None, bracing_test_xr: None }
     }
 
     fn line(id: &str, from: &str, to: &str) -> Branch {

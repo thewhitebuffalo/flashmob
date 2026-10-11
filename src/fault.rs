@@ -288,6 +288,27 @@ pub fn iec_kappa(r_over_x: f64, kv: f64) -> f64 {
     kappa_b.max((1.15 * kappa_b).min(cap))
 }
 
+/// First-half-cycle asymmetrical rms / symmetrical rms.
+/// None means infinite X/R (purely inductive): factor is sqrt(3).
+/// Some(0.0) is purely resistive: factor is 1.
+pub fn half_cycle_factor(x_over_r: Option<f64>) -> Result<f64, String> {
+    let Some(xr) = x_over_r else {
+        return Ok(3.0_f64.sqrt());
+    };
+    if !xr.is_finite() || xr < 0.0 {
+        return Err("X/R must be finite and nonnegative".into());
+    }
+    if xr == 0.0 {
+        return Ok(1.0);
+    }
+    // sqrt(1 + 2 * exp(-2 * pi / (X/R)))
+    let factor = (1.0 + 2.0 * (-2.0 * std::f64::consts::PI / xr).exp()).sqrt();
+    if !factor.is_finite() {
+        return Err("non-finite half-cycle factor".into());
+    }
+    Ok(factor)
+}
+
 /// Peak and half-cycle asymmetrical currents from the Thevenin impedance.
 /// The half-cycle RMS uses the Thevenin X/R directly (no meshed-network
 /// correction); it is not an ANSI C37.010 separate-R/X calculation.
@@ -300,13 +321,13 @@ fn asymmetry(i_sym: f64, z: Cplx, kv: f64) -> Result<(Option<f64>, f64, f64), St
         return Err("asymmetry requires finite nonnegative R and X and nonzero impedance".into());
     }
     if z.im == 0.0 {
-        return Ok((Some(0.0), std::f64::consts::SQRT_2 * i_sym, i_sym));
+        return Ok((Some(0.0), std::f64::consts::SQRT_2 * i_sym, i_sym * half_cycle_factor(Some(0.0))?));
     }
     let r_over_x = z.re / z.im;
     let xr = if z.re == 0.0 { None } else { Some(z.im / z.re) };
     let kappa = iec_kappa(r_over_x, kv);
     let peak = kappa * std::f64::consts::SQRT_2 * i_sym;
-    let asym = i_sym * (1.0 + 2.0 * (-2.0 * std::f64::consts::PI * r_over_x).exp()).sqrt();
+    let asym = i_sym * half_cycle_factor(xr)?;
     if !peak.is_finite() || !asym.is_finite() { return Err("non-finite asymmetrical current".into()); }
     Ok((xr, peak, asym))
 }
@@ -319,7 +340,7 @@ mod tests {
     #[test]
     fn utility_fault_matches_short_circuit_mva() {
         let project = Project {
-            buses: vec![Bus { id: "a".into(), name: "A".into(), kv: 13.8, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None }],
+            buses: vec![Bus { id: "a".into(), name: "A".into(), kv: 13.8, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None }],
             sources: vec![Source {
                 id: "s".into(),
                 name: "grid".into(),
@@ -351,8 +372,8 @@ mod tests {
         let project = Project {
             s_base_mva: 100.0,
             buses: vec![
-                Bus { id: "hv".into(), name: "HV".into(), kv: 12.47, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None },
-                Bus { id: "lv".into(), name: "LV".into(), kv: 0.48, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None },
+                Bus { id: "hv".into(), name: "HV".into(), kv: 12.47, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None },
+                Bus { id: "lv".into(), name: "LV".into(), kv: 0.48, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None },
             ],
             branches: vec![Branch {
                 id: "t".into(),

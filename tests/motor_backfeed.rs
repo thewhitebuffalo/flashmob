@@ -57,7 +57,7 @@ fn motor_feeder_breaker_only_removes_backfeed_when_its_contact_is_open() {
     project.devices[0].breaker_interrupting_s = Some(0.04);
     project.buses.push(Bus {
         id: "motor-bus".into(), name: "Motor feeder load end".into(), kv: 0.48,
-        shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None,
+        shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None,
     });
     project.branches.push(Branch {
         id: "motor-feeder".into(), name: "Motor feeder".into(),
@@ -77,7 +77,7 @@ fn motor_feeder_breaker_only_removes_backfeed_when_its_contact_is_open() {
         bus: "mcc".into(), protected_branch: Some("motor-feeder".into()),
         curve: CurveSpec::Definite { pickup_a: 1.0, time_s: 0.05 },
         breaker_interrupting_s: Some(0.04), fuse_total_clearing: false,
-        basis: "collected".into(), curve_is_total_clearing: false, library: None,
+        basis: "collected".into(), curve_is_total_clearing: false, library: None, interrupting: None,
     });
 
     let closed = run_arc(&project);

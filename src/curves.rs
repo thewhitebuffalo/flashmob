@@ -752,7 +752,7 @@ mod point_curve_tests {
         let mut device = Device {
             id: "d".into(), name: "d".into(), bus: "b".into(), curve: curve(true, PointTail::Unavailable),
             basis: String::new(), protected_branch: None, breaker_interrupting_s: Some(0.05),
-            fuse_total_clearing: false, curve_is_total_clearing: false, library: None,
+            fuse_total_clearing: false, curve_is_total_clearing: false, library: None, interrupting: None,
         };
         close(clearing_time(&device, 1000.0).unwrap(), 2.05);
         device.fuse_total_clearing = true;

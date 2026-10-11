@@ -433,7 +433,7 @@ mod tests {
             kv: 0.48,
             shunt_kvar: 0.0,
             bracing_ka: None,
-            main_rating_a: None,
+            main_rating_a: None, bracing_test_xr: None,
         });
         project.devices.push(Device {
             id: "unplaced".into(),
@@ -446,7 +446,7 @@ mod tests {
             breaker_interrupting_s: None,
             fuse_total_clearing: false,
             curve_is_total_clearing: false,
-            basis: String::new(), library: None,
+            basis: String::new(), library: None, interrupting: None,
         });
         let view = topology(&project).unwrap();
         let spare = view.buses.iter().find(|bus| bus.id == "spare").unwrap();

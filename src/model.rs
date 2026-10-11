@@ -114,6 +114,10 @@ pub struct Bus {
     /// Collected main or bus ampere rating. Not a trip-unit setting.
     #[serde(default)]
     pub main_rating_a: Option<f64>,
+    /// Test X/R of the equipment bracing rating. Absent means the bracing
+    /// comparison is symmetrical only and is not an asymmetrical-duty pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bracing_test_xr: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -498,6 +502,19 @@ pub struct Device {
     /// never the library file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub library: Option<LibraryLink>,
+    /// Symmetrical interrupting rating and the test X/R it was proved at.
+    /// Snapshot. Studies do not reopen a library file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupting: Option<InterruptingRating>,
+}
+
+/// Symmetrical interrupting rating proved at one test X/R and voltage.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InterruptingRating {
+    pub symmetrical_ka: f64,
+    pub test_xr: f64,
+    pub voltage_v: f64,
 }
 
 impl Device {
@@ -761,9 +778,9 @@ impl Project {
             operating_cases: Vec::new(),
             neutral_grounding: Vec::new(),
             buses: vec![
-                Bus { id: "util".into(), name: "Utility".into(), kv: 12.47, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None },
-                Bus { id: "mcc".into(), name: "MCC-1".into(), kv: 0.48, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None },
-                Bus { id: "pnl".into(), name: "Panel A".into(), kv: 0.48, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None },
+                Bus { id: "util".into(), name: "Utility".into(), kv: 12.47, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None },
+                Bus { id: "mcc".into(), name: "MCC-1".into(), kv: 0.48, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None },
+                Bus { id: "pnl".into(), name: "Panel A".into(), kv: 0.48, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None },
             ],
             branches: vec![
                 Branch {
@@ -852,7 +869,7 @@ impl Project {
                         inst_s: Some(0.05),
                     },
                     basis: String::new(),
-                    library: None,
+                    library: None, interrupting: None,
                 },
                 Device {
                     protected_branch: Some("feeder".into()),
@@ -871,7 +888,7 @@ impl Project {
                         inst_s: Some(0.03),
                     },
                     basis: String::new(),
-                    library: None,
+                    library: None, interrupting: None,
                 },
             ],
             equipment: vec![
@@ -1287,6 +1304,7 @@ impl Project {
         for b in &self.buses {
             check(positive(b.kv) && b.shunt_kvar.is_finite(), &b.id, "bus voltage or shunt");
             check(b.bracing_ka.map_or(true, positive) && b.main_rating_a.map_or(true, positive), &b.id, "equipment rating");
+            check(b.bracing_test_xr.map_or(true, positive), &b.id, "bracing test X/R");
         }
         for b in &self.branches {
             match b.kind {
@@ -1325,6 +1343,10 @@ impl Project {
         }
         for d in &self.devices {
             check(d.breaker_interrupting_s.map_or(true, positive) && !(d.curve_includes_clearing() && d.breaker_interrupting_s.is_some()), &d.id, "clearing-time definition");
+            if let Some(rating) = &d.interrupting {
+                check(positive(rating.symmetrical_ka) && positive(rating.test_xr)
+                    && rating.voltage_v.is_finite() && rating.voltage_v >= 0.0, &d.id, "interrupting rating");
+            }
             if let Some(id) = &d.protected_branch {
                 check(self.branches.iter().any(|b| b.id == *id && (b.from == d.bus || b.to == d.bus)), &d.id, "protected branch terminal");
             }

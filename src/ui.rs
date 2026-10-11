@@ -1,9 +1,12 @@
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 
-use flashmob::model::Project;
+use flashmob::library::Library;
+use flashmob::model::{BandInterpretation, CurveSpec, Device, IecKind, IeeeKind, PointTail, Project};
 use flashmob::sld;
-use flashmob::study::{self, Studies, StudyOutput};
+use flashmob::study::{self, InterruptingDuty, Studies, StudyOutput};
 use flashmob::tcc::{self, TccPlot};
+
+const STALE_STATUS: &str = "Results stale — model edited; run the study";
 
 pub fn launch(project: Option<std::path::PathBuf>) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -47,6 +50,19 @@ struct App {
     diagram: Option<sld::Diagram>,
     /// TCC for the reference voltage it was drawn at; cleared with the diagram.
     tcc_plot: Option<(f64, Result<TccPlot, String>)>,
+    /// Device selected on the Devices tab. Independent of the one-line bus selection.
+    selected_device: Option<String>,
+    /// Library picker. The file is not stored on the project.
+    library_open: bool,
+    library: Option<Library>,
+    library_path: String,
+    library_search: String,
+    /// Device ids for `library_search`. Rebuilt when the search text or the open library changes.
+    library_hits: Vec<u32>,
+    library_hits_for: String,
+    library_selected: Option<u32>,
+    library_error: String,
+    library_form: LibraryForm,
 }
 
 fn read_project_file(path: &std::path::Path) -> Result<Project, String> {
@@ -62,6 +78,7 @@ enum Tab {
     Fault,
     Arc,
     Tcc,
+    Devices,
 }
 
 impl App {
@@ -80,6 +97,16 @@ impl App {
             tcc_kv: 0.48,
             diagram: None,
             tcc_plot: None,
+            selected_device: None,
+            library_open: false,
+            library: None,
+            library_path: String::new(),
+            library_search: String::new(),
+            library_hits: Vec::new(),
+            library_hits_for: "\u{1}".into(),
+            library_selected: None,
+            library_error: String::new(),
+            library_form: LibraryForm::default(),
         };
         match path {
             Some(path) => match read_project_file(&path) {
@@ -176,6 +203,7 @@ impl eframe::App for App {
                 if ui.button("Sample").clicked() {
                     self.project = Project::sample();
                     self.selected = None;
+                    self.selected_device = None;
                     self.fit_view = true;
                     self.error = None;
                     self.run_study();
@@ -196,6 +224,9 @@ impl eframe::App for App {
                 if ui.button("Export Package").clicked() {
                     self.export_package();
                 }
+                if ui.button("Library").clicked() {
+                    self.library_open = true;
+                }
             });
             ui.horizontal(|ui| {
                 for (tab, label) in [
@@ -204,6 +235,7 @@ impl eframe::App for App {
                     (Tab::Fault, "Short circuit"),
                     (Tab::Arc, "Arc flash"),
                     (Tab::Tcc, "TCC"),
+                    (Tab::Devices, "Devices"),
                 ] {
                     ui.selectable_value(&mut self.tab, tab, label);
                 }
@@ -234,6 +266,7 @@ impl eframe::App for App {
             });
         });
         self.warnings_window(ui.ctx());
+        self.library_window(ui.ctx());
         egui::Panel::right("inspector").default_size(300.0).show(ui, |ui| {
             self.inspector(ui);
         });
@@ -243,6 +276,7 @@ impl eframe::App for App {
             Tab::Fault => self.fault(ui),
             Tab::Arc => self.arc(ui),
             Tab::Tcc => self.tcc(ui),
+            Tab::Devices => self.devices(ui),
         });
     }
 }
@@ -416,26 +450,40 @@ impl App {
     }
 
     fn fault(&self, ui: &mut egui::Ui) {
-        let Some(fault) = self.results.as_ref().and_then(|r| r.fault.as_ref()) else {
+        let Some(results) = &self.results else {
             ui.label("No short-circuit result.");
             return;
         };
-        ui.label(format!("Prefault requested: {}; used: {}", fault.prefault_requested, fault.prefault));
-        if !fault.valid { ui.label(fault.error.as_deref().unwrap_or("Invalid fault result")); return; }
-        egui::Grid::new("fault").striped(true).show(ui, |ui| {
-            for heading in ["Bus", "3P kA", "LG kA", "LL kA", "LLG kA", "X/R", "IEC peak"] {
-                ui.label(RichText::new(heading).strong());
+        let Some(fault) = results.fault.as_ref() else {
+            ui.label("No short-circuit result.");
+            return;
+        };
+        egui::ScrollArea::vertical().id_salt("fault-scroll").show(ui, |ui| {
+            ui.label(format!("Prefault requested: {}; used: {}", fault.prefault_requested, fault.prefault));
+            if !fault.valid {
+                ui.label(fault.error.as_deref().unwrap_or("Invalid fault result"));
+                return;
             }
-            ui.end_row();
-            for bus in &fault.buses {
-                ui.label(&bus.name);
-                ui.label(ka(bus.three_phase.as_ref().map(|p| p.symmetrical_ka)));
-                ui.label(ka(bus.line_to_ground.as_ref().map(|p| p.symmetrical_ka)));
-                ui.label(ka(bus.line_to_line.as_ref().map(|p| p.symmetrical_ka)));
-                ui.label(ka(bus.line_to_line_ground.as_ref().map(|p| p.symmetrical_ka)));
-                ui.label(bus.three_phase.as_ref().map(|p| p.x_over_r.map(|v| format!("{v:.1}")).unwrap_or_else(|| "∞".into())).unwrap_or_else(|| "—".into()));
-                ui.label(ka(bus.three_phase.as_ref().map(|p| p.iec_peak_ka)));
+            egui::Grid::new("fault").striped(true).show(ui, |ui| {
+                for heading in ["Bus", "3P kA", "LG kA", "LL kA", "LLG kA", "X/R", "IEC peak"] {
+                    ui.label(RichText::new(heading).strong());
+                }
                 ui.end_row();
+                for bus in &fault.buses {
+                    ui.label(&bus.name);
+                    ui.label(ka(bus.three_phase.as_ref().map(|p| p.symmetrical_ka)));
+                    ui.label(ka(bus.line_to_ground.as_ref().map(|p| p.symmetrical_ka)));
+                    ui.label(ka(bus.line_to_line.as_ref().map(|p| p.symmetrical_ka)));
+                    ui.label(ka(bus.line_to_line_ground.as_ref().map(|p| p.symmetrical_ka)));
+                    ui.label(bus.three_phase.as_ref().map(|p| p.x_over_r.map(|v| format!("{v:.1}")).unwrap_or_else(|| "∞".into())).unwrap_or_else(|| "—".into()));
+                    ui.label(ka(bus.three_phase.as_ref().map(|p| p.iec_peak_ka)));
+                    ui.end_row();
+                }
+            });
+            if !results.interrupting.is_empty() {
+                ui.add_space(8.0);
+                ui.label(RichText::new("Interrupting duty").strong());
+                duty_grid(ui, &results.interrupting);
             }
         });
     }
@@ -512,7 +560,7 @@ impl App {
             ui.label("That bus is no longer in the project.");
             return;
         };
-        if edited { self.invalidate(); self.status = "Results stale — model edited; run the study".into(); }
+        if edited { self.invalidate(); self.status = STALE_STATUS.into(); }
         if let Some(results) = &self.results {
             if let Some(protection) = results.protection.iter().find(|p| p.bus_id == id) {
                 ui.separator();
@@ -528,6 +576,14 @@ impl App {
                 }
                 if let Some(p) = &fault.line_to_ground {
                     ui.label(format!("LG  {:.2} kA", p.symmetrical_ka));
+                }
+            }
+            let duties: Vec<&InterruptingDuty> = results.interrupting.iter().filter(|row| row.bus_id == id).collect();
+            if !duties.is_empty() {
+                ui.separator();
+                ui.label(RichText::new("Interrupting").strong());
+                for row in duties {
+                    duty_label(ui, row);
                 }
             }
             if let Some(rows) = &results.arc_flash {
@@ -573,6 +629,7 @@ impl App {
                 Ok(project) => {
                     self.project = project;
                     self.selected = None;
+                    self.selected_device = None;
                     self.fit_view = true;
                     self.error = None;
                     self.run_study();
@@ -652,6 +709,724 @@ impl App {
             }
         }
     }
+
+    fn mark_stale(&mut self) {
+        self.invalidate();
+        self.status = STALE_STATUS.into();
+    }
+
+    fn devices(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().id_salt("devices-tab").auto_shrink([false, false]).show(ui, |ui| {
+            self.device_list(ui);
+            ui.separator();
+            self.device_editor(ui);
+        });
+    }
+
+    fn device_list(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("DEVICES").strong().color(color("#E2E8F0")));
+        if self.project.devices.is_empty() {
+            ui.label("No devices.");
+            return;
+        }
+        let mut choose = None;
+        egui::Grid::new("device-list").striped(true).show(ui, |ui| {
+            for heading in ["Id", "Name", "Bus", "Curve"] {
+                ui.label(RichText::new(heading).strong());
+            }
+            ui.end_row();
+            for device in &self.project.devices {
+                let selected = self.selected_device.as_deref() == Some(device.id.as_str());
+                let ink = if selected { color("#00FF66") } else { color("#E2E8F0") };
+                let mut clicked = false;
+                clicked |= ui.selectable_label(selected, RichText::new(&device.id).color(ink)).clicked();
+                clicked |= ui.selectable_label(selected, RichText::new(&device.name).color(ink)).clicked();
+                clicked |= ui.selectable_label(selected, RichText::new(&device.bus).color(ink)).clicked();
+                clicked |= ui.selectable_label(selected, RichText::new(flashmob::curves::curve_label(&device.curve)).color(ink)).clicked();
+                if clicked {
+                    choose = Some(device.id.clone());
+                }
+                ui.end_row();
+            }
+        });
+        if let Some(id) = choose {
+            self.selected_device = Some(id);
+        }
+    }
+
+    fn device_editor(&mut self, ui: &mut egui::Ui) {
+        let Some(id) = self.selected_device.clone() else {
+            ui.label("Select a device.");
+            return;
+        };
+        if !self.project.devices.iter().any(|device| device.id == id) {
+            self.selected_device = None;
+            ui.label("That device is no longer in the project.");
+            return;
+        }
+        ui.label(RichText::new(format!("ID  {id}")).strong().color(color("#00FF66")));
+        let mut edited = false;
+        let mut remove = false;
+        let mut refusal = None;
+        if let Some(device) = self.project.devices.iter_mut().find(|device| device.id == id) {
+            edited |= labeled_text(ui, "Name", &mut device.name);
+            edited |= labeled_text(ui, "Bus", &mut device.bus);
+            ui.label(RichText::new("Bus is checked on Run.").color(color("#94A3B8")));
+            edited |= edit_breaker_time(ui, device, &mut refusal);
+            edited |= edit_clearing_flags(ui, device, &mut refusal);
+            edited |= labeled_text(ui, "Basis", &mut device.basis);
+            edited |= edit_interrupting(ui, device);
+            ui.separator();
+            let curve_id = device.id.clone();
+            edited |= edit_curve(ui, &curve_id, &mut device.curve);
+            if let Some(link) = &device.library {
+                ui.separator();
+                ui.label(RichText::new("Library").strong());
+                ui.label(format!("Manufacturer  {}", link.manufacturer));
+                ui.label(format!("Style  {}", link.style));
+                ui.label(format!("Category  {}", link.category));
+                if link.unsupported_elements.is_empty() {
+                    ui.label(RichText::new("unsupported_elements  none").color(color("#94A3B8")));
+                } else {
+                    ui.label("unsupported_elements");
+                    for item in &link.unsupported_elements {
+                        ui.label(RichText::new(item).color(color("#94A3B8")));
+                    }
+                }
+            }
+            ui.separator();
+            if ui.button("Remove").clicked() {
+                remove = true;
+            }
+        }
+        if remove {
+            if let Some(index) = self.project.devices.iter().position(|device| device.id == id) {
+                self.project.devices.remove(index);
+            }
+            self.selected_device = None;
+            edited = true;
+        }
+        if edited {
+            self.mark_stale();
+            if let Some(message) = refusal {
+                self.status = format!("{message} {STALE_STATUS}");
+            }
+        } else if let Some(message) = refusal {
+            self.status = message;
+        }
+    }
+
+    fn library_window(&mut self, ctx: &egui::Context) {
+        if !self.library_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("LIBRARY")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(760.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().id_salt("library-scroll").max_height(640.0).show(ui, |ui| {
+                    self.library_contents(ui);
+                });
+            });
+        self.library_open = open;
+    }
+
+    fn library_contents(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("Open library").clicked() {
+                self.open_library();
+            }
+            if !self.library_path.is_empty() {
+                ui.label(RichText::new(&self.library_path).color(color("#94A3B8")));
+            }
+        });
+        ui.label(RichText::new("The library file is not stored in the project.").color(color("#94A3B8")));
+        if !self.library_error.is_empty() {
+            ui.label(RichText::new(&self.library_error).color(color("#FF5555")));
+        }
+        if self.library.is_some() {
+            ui.horizontal(|ui| {
+                ui.label("Search");
+                ui.text_edit_singleline(&mut self.library_search);
+            });
+            self.library_matches(ui);
+        } else {
+            ui.label("No library open.");
+        }
+        ui.separator();
+        self.library_form(ui);
+    }
+
+    fn open_library(&mut self) {
+        let Some(path) = rfd::FileDialog::new().add_filter("Device library", &["json"]).pick_file() else { return };
+        match std::fs::read_to_string(&path).map_err(|err| err.to_string()).and_then(|text| Library::from_json(&text)) {
+            Ok(library) => {
+                self.library_path = path.display().to_string();
+                self.library = Some(library);
+                self.library_selected = None;
+                self.library_hits.clear();
+                self.library_hits_for = "\u{1}".into();
+                self.library_error.clear();
+            }
+            // A bad file stays in this window. The open project is left as it is.
+            Err(err) => self.library_error = format!("Could not open {}: {err}", path.display()),
+        }
+    }
+
+    fn library_matches(&mut self, ui: &mut egui::Ui) {
+        self.refresh_library_hits();
+        let current = self.library_selected;
+        let choose = self.draw_library_matches(ui, current);
+        if let Some(id) = choose {
+            self.library_selected = Some(id);
+        }
+    }
+
+    fn refresh_library_hits(&mut self) {
+        if self.library.is_none() {
+            self.library_hits.clear();
+            self.library_hits_for.clear();
+            return;
+        }
+        if self.library_hits_for == self.library_search {
+            return;
+        }
+        let terms: Vec<String> = self.library_search.split_whitespace().map(str::to_string).collect();
+        self.library_hits = self.library.as_ref().map(|library| {
+            library.search(&terms).into_iter().map(|device| device.id).collect()
+        }).unwrap_or_default();
+        self.library_hits_for = self.library_search.clone();
+    }
+
+    fn draw_library_matches(&self, ui: &mut egui::Ui, current: Option<u32>) -> Option<u32> {
+        let Some(library) = self.library.as_ref() else { return None };
+        ui.label(RichText::new(format!("{} matches", self.library_hits.len())).color(color("#94A3B8")));
+        if self.library_hits.len() > 40 {
+            ui.label(RichText::new("Showing 40.").color(color("#94A3B8")));
+        }
+        let mut choose = None;
+        egui::Grid::new("library-matches").striped(true).show(ui, |ui| {
+            for heading in ["Id", "Manufacturer", "Style", "Category"] {
+                ui.label(RichText::new(heading).strong());
+            }
+            ui.end_row();
+            for id in self.library_hits.iter().take(40) {
+                let Some(device) = library.devices.iter().find(|device| device.id == *id) else { continue };
+                let selected = current == Some(device.id);
+                let ink = if selected { color("#00FF66") } else { color("#E2E8F0") };
+                let mut clicked = false;
+                clicked |= ui.selectable_label(selected, RichText::new(device.id.to_string()).color(ink)).clicked();
+                clicked |= ui.selectable_label(selected, RichText::new(&device.manufacturer).color(ink)).clicked();
+                clicked |= ui.selectable_label(selected, RichText::new(&device.style).color(ink)).clicked();
+                clicked |= ui.selectable_label(selected, RichText::new(&device.category).color(ink)).clicked();
+                if clicked {
+                    choose = Some(device.id);
+                }
+                ui.end_row();
+            }
+        });
+        if let Some(id) = choose.or(current) {
+            if let Some(device) = library.devices.iter().find(|device| device.id == id) {
+                show_library_device(ui, device);
+            }
+        }
+        choose
+    }
+
+    fn library_form(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Apply").strong());
+        ui.label(RichText::new("Project id and bus are required. Every other field is optional.").color(color("#94A3B8")));
+        match self.library_selected {
+            Some(id) => ui.label(RichText::new(format!("Library device {id}")).color(color("#00FF66"))),
+            None => ui.label(RichText::new("No library device selected.").color(color("#94A3B8"))),
+        };
+        let apply;
+        {
+            let form = &mut self.library_form;
+            labeled_text(ui, "Project id", &mut form.id);
+            labeled_text(ui, "Bus", &mut form.bus);
+            labeled_text(ui, "Name", &mut form.name);
+            labeled_text(ui, "rating_a", &mut form.rating_a);
+            labeled_text(ui, "sensor_a", &mut form.sensor_a);
+            labeled_text(ui, "current_base_a", &mut form.current_base_a);
+            labeled_text(ui, "voltage_v", &mut form.voltage_v);
+            labeled_text(ui, "function_name", &mut form.function_name);
+            labeled_text(ui, "dial", &mut form.dial);
+            labeled_text(ui, "ct_ratio", &mut form.ct_ratio);
+            labeled_text(ui, "tap_a", &mut form.tap_a);
+            labeled_pair(ui, "lt_pickup", &mut form.lt_pickup_function, &mut form.lt_pickup_label);
+            labeled_pair(ui, "lt_delay", &mut form.lt_delay_function, &mut form.lt_delay_label);
+            labeled_text(ui, "lt_delay_multiple", &mut form.lt_delay_multiple);
+            labeled_pair(ui, "st_pickup", &mut form.st_pickup_function, &mut form.st_pickup_label);
+            labeled_pair(ui, "st_delay", &mut form.st_delay_function, &mut form.st_delay_label);
+            labeled_pair(ui, "inst", &mut form.inst_function, &mut form.inst_label);
+            labeled_text(ui, "inst_s", &mut form.inst_s);
+            labeled_text(ui, "pickup_base", &mut form.pickup_base);
+            ui.label(RichText::new("pickup_base is sensor, long_time, or empty.").color(color("#94A3B8")));
+            ui.checkbox(&mut form.fuse_total_clearing, "Fuse total clearing");
+            apply = ui.button("Apply").clicked();
+        }
+        if apply {
+            self.apply_selected_library();
+        }
+    }
+
+    fn library_request(&self, device_id: u32) -> Result<flashmob::library::ApplyDevice, String> {
+        let id = self.library_form.id.trim();
+        let bus = self.library_form.bus.trim();
+        if id.is_empty() || bus.is_empty() {
+            return Err("Project device id and bus are required.".into());
+        }
+        if self.library_path.is_empty() {
+            return Err("Open a library first.".into());
+        }
+        let pickup_base = match self.library_form.pickup_base.trim().to_ascii_lowercase().as_str() {
+            "" => None,
+            "sensor" => Some("sensor".to_string()),
+            "long_time" => Some("long_time".to_string()),
+            other => return Err(format!("pickup_base must be sensor, long_time, or empty, not {other}.")),
+        };
+        let text = |value: &str| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+        };
+        let number = |value: &str, name: &str| -> Result<Option<f64>, String> {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            let parsed: f64 = trimmed.parse().map_err(|_| format!("{name} is not a number."))?;
+            if !parsed.is_finite() {
+                return Err(format!("{name} is not finite."));
+            }
+            Ok(Some(parsed))
+        };
+        let lt_pickup_function = text(&self.library_form.lt_pickup_function);
+        let lt_pickup_label = text(&self.library_form.lt_pickup_label);
+        let lt_delay_function = text(&self.library_form.lt_delay_function);
+        let lt_delay_label = text(&self.library_form.lt_delay_label);
+        let st_pickup_function = text(&self.library_form.st_pickup_function);
+        let st_pickup_label = text(&self.library_form.st_pickup_label);
+        let st_delay_function = text(&self.library_form.st_delay_function);
+        let st_delay_label = text(&self.library_form.st_delay_label);
+        let inst_function = text(&self.library_form.inst_function);
+        let inst_label = text(&self.library_form.inst_label);
+        Ok(flashmob::library::ApplyDevice {
+            device_id,
+            id: id.to_string(),
+            name: self.library_form.name.trim().to_string(),
+            bus: bus.to_string(),
+            protected_branch: None,
+            rating_a: number(&self.library_form.rating_a, "rating_a")?,
+            current_base_a: number(&self.library_form.current_base_a, "current_base_a")?,
+            voltage_v: number(&self.library_form.voltage_v, "voltage_v")?,
+            function_name: text(&self.library_form.function_name),
+            library_name: self.library_path.clone(),
+            fuse_total_clearing: self.library_form.fuse_total_clearing,
+            dial: number(&self.library_form.dial, "dial")?,
+            ct_ratio: number(&self.library_form.ct_ratio, "ct_ratio")?,
+            tap_a: number(&self.library_form.tap_a, "tap_a")?,
+            sensor_a: number(&self.library_form.sensor_a, "sensor_a")?,
+            lt_pickup: flashmob::library_apply::setting_ref(&lt_pickup_function, &lt_pickup_label, "lt_pickup")?,
+            lt_delay: flashmob::library_apply::setting_ref(&lt_delay_function, &lt_delay_label, "lt_delay")?,
+            lt_delay_multiple: number(&self.library_form.lt_delay_multiple, "lt_delay_multiple")?,
+            st_pickup: flashmob::library_apply::setting_ref(&st_pickup_function, &st_pickup_label, "st_pickup")?,
+            st_delay: flashmob::library_apply::setting_ref(&st_delay_function, &st_delay_label, "st_delay")?,
+            inst: flashmob::library_apply::setting_ref(&inst_function, &inst_label, "inst")?,
+            inst_s: number(&self.library_form.inst_s, "inst_s")?,
+            pickup_base,
+        })
+    }
+
+    fn apply_selected_library(&mut self) {
+        let Some(device_id) = self.library_selected else {
+            self.library_error = "Select a library device.".into();
+            return;
+        };
+        if self.library.is_none() {
+            self.library_error = "Open a library first.".into();
+            return;
+        }
+        let request = match self.library_request(device_id) {
+            Ok(request) => request,
+            Err(err) => {
+                self.library_error = err;
+                return;
+            }
+        };
+        let applied = self.library.as_ref().map(|library| flashmob::library::apply_device(library, &request));
+        let Some(applied) = applied else {
+            self.library_error = "Open a library first.".into();
+            return;
+        };
+        let device = match applied {
+            Ok(device) => device,
+            Err(err) => {
+                self.library_error = err;
+                return;
+            }
+        };
+        if self.project.devices.iter().any(|existing| existing.id == device.id) {
+            self.library_error = format!("Device {} is already in the project.", device.id);
+            return;
+        }
+        self.selected_device = Some(device.id.clone());
+        self.project.devices.push(device);
+        self.library_error.clear();
+        self.mark_stale();
+    }
+}
+
+#[derive(Default)]
+struct LibraryForm {
+    id: String,
+    bus: String,
+    name: String,
+    rating_a: String,
+    sensor_a: String,
+    current_base_a: String,
+    voltage_v: String,
+    function_name: String,
+    dial: String,
+    ct_ratio: String,
+    tap_a: String,
+    lt_pickup_function: String,
+    lt_pickup_label: String,
+    lt_delay_function: String,
+    lt_delay_label: String,
+    lt_delay_multiple: String,
+    st_pickup_function: String,
+    st_pickup_label: String,
+    st_delay_function: String,
+    st_delay_label: String,
+    inst_function: String,
+    inst_label: String,
+    inst_s: String,
+    pickup_base: String,
+    fuse_total_clearing: bool,
+}
+
+fn labeled_text(ui: &mut egui::Ui, label: &str, text: &mut String) -> bool {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).color(color("#94A3B8")));
+        ui.add(egui::TextEdit::singleline(text).desired_width(280.0)).changed()
+    }).inner
+}
+
+fn labeled_pair(ui: &mut egui::Ui, label: &str, function: &mut String, setting: &mut String) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).color(color("#94A3B8")));
+        ui.add(egui::TextEdit::singleline(function).desired_width(160.0).hint_text("function"));
+        ui.add(egui::TextEdit::singleline(setting).desired_width(140.0).hint_text("label"));
+    });
+}
+
+fn drag_value(ui: &mut egui::Ui, label: &str, value: &mut f64, speed: f64, range: std::ops::RangeInclusive<f64>, suffix: &'static str) -> bool {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).color(color("#94A3B8")));
+        let drag = egui::DragValue::new(value).speed(speed).range(range).clamp_existing_to_range(false);
+        let drag = if suffix.is_empty() { drag } else { drag.suffix(suffix) };
+        ui.add(drag).changed()
+    }).inner
+}
+
+/// Empty text clears the value. A half-typed number is kept only while the field has focus.
+fn optional_f64(ui: &mut egui::Ui, salt: impl egui::AsId, label: &str, value: &mut Option<f64>) -> bool {
+    let id = egui::Id::new(salt);
+    let ctx = ui.ctx().clone();
+    let mut text = ctx.data(|data| data.get_temp::<String>(id)).unwrap_or_else(|| format_num_opt(*value));
+    let response = ui.horizontal(|ui| {
+        ui.label(RichText::new(label).color(color("#94A3B8")));
+        ui.add(egui::TextEdit::singleline(&mut text).desired_width(140.0).hint_text("none"))
+    }).inner;
+    let mut edited = false;
+    if response.changed() {
+        if text.trim().is_empty() {
+            if value.is_some() {
+                *value = None;
+                edited = true;
+            }
+        } else if let Some(parsed) = parse_f64(text.trim()) {
+            if *value != Some(parsed) {
+                *value = Some(parsed);
+                edited = true;
+            }
+        }
+    }
+    if response.has_focus() {
+        ctx.data_mut(|data| data.insert_temp(id, text));
+    } else {
+        ctx.data_mut(|data| { data.remove_temp::<String>(id); });
+    }
+    edited
+}
+
+fn edit_breaker_time(ui: &mut egui::Ui, device: &mut Device, refusal: &mut Option<String>) -> bool {
+    let blocked = device.fuse_total_clearing || device.curve_is_total_clearing;
+    let mut time = device.breaker_interrupting_s;
+    let mut dragged = false;
+    let mut clear = false;
+    let mut set = false;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Breaker interrupting").color(color("#94A3B8")));
+        if blocked || time.is_none() {
+            let shown = time.map(|value| format!("{value} s")).unwrap_or_else(|| "none".into());
+            ui.label(RichText::new(shown).color(color("#94A3B8")));
+        } else if let Some(value) = time.as_mut() {
+            dragged = ui.add(
+                egui::DragValue::new(value).speed(0.001).range(0.0..=1.0e6).clamp_existing_to_range(false).suffix(" s"),
+            ).changed();
+        }
+        if time.is_some() {
+            clear = ui.button("Clear").clicked();
+        } else {
+            set = ui.button("Set").clicked();
+        }
+    });
+    if clear {
+        device.breaker_interrupting_s = None;
+        return true;
+    }
+    if set {
+        if blocked {
+            *refusal = Some("Clear the total-clearing flag before entering a breaker interrupting time.".into());
+            return false;
+        }
+        // Seed for the drag. This is not an interrupting rating.
+        device.breaker_interrupting_s = Some(0.05);
+        return true;
+    }
+    if !blocked && dragged {
+        device.breaker_interrupting_s = time;
+        return true;
+    }
+    false
+}
+
+fn edit_clearing_flags(ui: &mut egui::Ui, device: &mut Device, refusal: &mut Option<String>) -> bool {
+    let mut edited = false;
+    ui.horizontal(|ui| {
+        edited |= toggle_clearing_flag(ui, device, true, "Fuse total clearing", refusal);
+        edited |= toggle_clearing_flag(ui, device, false, "Curve is total clearing", refusal);
+    });
+    ui.label(RichText::new("A total-clearing flag cannot be combined with a breaker interrupting time.").color(color("#94A3B8")));
+    edited
+}
+
+/// A flag is refused while a breaker time is set. Turning a flag off leaves that time alone.
+fn toggle_clearing_flag(ui: &mut egui::Ui, device: &mut Device, fuse: bool, label: &str, refusal: &mut Option<String>) -> bool {
+    let mut enabled = if fuse { device.fuse_total_clearing } else { device.curve_is_total_clearing };
+    if !ui.checkbox(&mut enabled, label).changed() {
+        return false;
+    }
+    if enabled && device.breaker_interrupting_s.is_some() {
+        *refusal = Some("Clear the breaker interrupting time before setting a total-clearing flag.".into());
+        return false;
+    }
+    if fuse {
+        device.fuse_total_clearing = enabled;
+    } else {
+        device.curve_is_total_clearing = enabled;
+    }
+    if enabled {
+        device.breaker_interrupting_s = None;
+    }
+    true
+}
+
+fn edit_interrupting(ui: &mut egui::Ui, device: &mut Device) -> bool {
+    let Some((symmetrical_ka, test_xr, voltage_v)) = device.interrupting.as_ref().map(|rating| {
+        (rating.symmetrical_ka, rating.test_xr, rating.voltage_v)
+    }) else {
+        return false;
+    };
+    ui.separator();
+    ui.label(RichText::new("Interrupting rating").strong());
+    ui.label(format!("Symmetrical {} kA", format_num(symmetrical_ka)));
+    ui.label(format!("Test X/R {}", format_num(test_xr)));
+    ui.label(format!("Voltage {} V", format_num(voltage_v)));
+    // Shown only when a rating is already on the device. The editor does not invent one.
+    if ui.button("Clear interrupting rating").clicked() {
+        device.interrupting = None;
+        return true;
+    }
+    false
+}
+
+fn edit_curve(ui: &mut egui::Ui, device_id: &str, curve: &mut CurveSpec) -> bool {
+    let mut edited = false;
+    match curve {
+        CurveSpec::Definite { pickup_a, time_s } => {
+            ui.label(RichText::new("DEFINITE").strong());
+            edited |= drag_value(ui, "Pickup", pickup_a, 10.0, 0.0..=1.0e9, " A");
+            edited |= drag_value(ui, "Time", time_s, 0.001, 0.0..=1.0e6, " s");
+        }
+        CurveSpec::Ieee { kind, pickup_a, td, inst_a, inst_s } => {
+            ui.label(RichText::new(format!("IEEE {}", ieee_name(*kind))).strong());
+            edited |= drag_value(ui, "Pickup", pickup_a, 10.0, 0.0..=1.0e9, " A");
+            edited |= drag_value(ui, "Time dial", td, 0.01, 0.0..=1.0e4, "");
+            ui.label(RichText::new("Empty optional fields are cleared.").color(color("#94A3B8")));
+            edited |= optional_f64(ui, (device_id, "ieee-inst-a"), "Inst", inst_a);
+            edited |= optional_f64(ui, (device_id, "ieee-inst-s"), "Inst time", inst_s);
+        }
+        CurveSpec::Iec { kind, pickup_a, tms, inst_a, inst_s } => {
+            ui.label(RichText::new(format!("IEC {}", iec_name(*kind))).strong());
+            edited |= drag_value(ui, "Pickup", pickup_a, 10.0, 0.0..=1.0e9, " A");
+            edited |= drag_value(ui, "TMS", tms, 0.01, 0.0..=1.0e4, "");
+            ui.label(RichText::new("Empty optional fields are cleared.").color(color("#94A3B8")));
+            edited |= optional_f64(ui, (device_id, "iec-inst-a"), "Inst", inst_a);
+            edited |= optional_f64(ui, (device_id, "iec-inst-s"), "Inst time", inst_s);
+        }
+        CurveSpec::ThermalMagnetic { lt_pickup_a, lt_delay_s, st_pickup_a, st_delay_s, inst_a, inst_s } => {
+            ui.label(RichText::new("THERMAL MAGNETIC").strong());
+            edited |= drag_value(ui, "LT pickup", lt_pickup_a, 10.0, 0.0..=1.0e9, " A");
+            edited |= drag_value(ui, "LT delay", lt_delay_s, 0.001, 0.0..=1.0e6, " s");
+            ui.label(RichText::new("Empty optional fields are cleared.").color(color("#94A3B8")));
+            edited |= optional_f64(ui, (device_id, "tm-st-a"), "ST pickup", st_pickup_a);
+            edited |= optional_f64(ui, (device_id, "tm-st-s"), "ST delay", st_delay_s);
+            edited |= optional_f64(ui, (device_id, "tm-inst-a"), "Inst", inst_a);
+            edited |= optional_f64(ui, (device_id, "tm-inst-s"), "Inst time", inst_s);
+        }
+        CurveSpec::Points { points, max_points, beyond_last, band_interpretation } => {
+            ui.label(RichText::new("POINTS").strong());
+            ui.label(format!("{} points", points.len()));
+            ui.label(if max_points.is_some() { "max_points present" } else { "max_points absent" });
+            ui.label(format!("beyond_last {}", tail_name(*beyond_last)));
+            ui.label(format!("band_interpretation {}", band_name(*band_interpretation)));
+        }
+        CurveSpec::SettingsNotCollected { note } => {
+            ui.label(RichText::new("SETTINGS NOT COLLECTED").strong());
+            if note.is_empty() {
+                ui.label(RichText::new("No note.").color(color("#94A3B8")));
+            } else {
+                ui.label(note.as_str());
+            }
+        }
+    }
+    edited
+}
+
+fn show_library_device(ui: &mut egui::Ui, device: &flashmob::library::LibraryDevice) {
+    ui.separator();
+    ui.label(RichText::new(format!("{}  {}  {}", device.id, device.manufacturer, device.style)).strong().color(color("#E2E8F0")));
+    ui.label(RichText::new(&device.category).color(color("#94A3B8")));
+    ui.label(RichText::new("Trip units").strong());
+    if device.trip_units.is_empty() {
+        ui.label(RichText::new("none").color(color("#94A3B8")));
+    }
+    for unit in &device.trip_units {
+        ui.label(format!("Rating {} A", format_num(unit.rating_a)));
+        for function in &unit.functions {
+            let name = if function.name.is_empty() { "(unnamed)" } else { function.name.as_str() };
+            ui.label(RichText::new(format!("  {name}  {}", function.kind)).color(color("#94A3B8")));
+        }
+    }
+    ui.label(RichText::new("Frames").strong());
+    if device.frames.is_empty() {
+        ui.label(RichText::new("none").color(color("#94A3B8")));
+    }
+    for frame in &device.frames {
+        let sensors = if frame.sensors_a.is_empty() {
+            "none".to_string()
+        } else {
+            frame.sensors_a.iter().map(|amps| format_num(*amps)).collect::<Vec<_>>().join(", ")
+        };
+        ui.label(format!("Frame {} A  sensors {sensors}", format_num(frame.rating_a)));
+    }
+}
+
+fn duty_grid(ui: &mut egui::Ui, rows: &[InterruptingDuty]) {
+    egui::Grid::new("interrupting-duty").striped(true).show(ui, |ui| {
+        for heading in ["Id", "Name", "Bus", "Sym kA", "Rating kA", "Status"] {
+            ui.label(RichText::new(heading).strong());
+        }
+        ui.end_row();
+        for row in rows {
+            let ink = duty_color(&row.status);
+            let rating = match row.adjusted_symmetrical_ka {
+                Some(ka) => format!("{ka:.3} adjusted"),
+                None => format!("{:.3} rated", row.rated_symmetrical_ka),
+            };
+            ui.label(RichText::new(&row.id).color(ink)).on_hover_text(&row.note);
+            ui.label(RichText::new(&row.name).color(ink)).on_hover_text(&row.note);
+            ui.label(RichText::new(&row.bus_id).color(ink)).on_hover_text(&row.note);
+            ui.label(RichText::new(format!("{:.3}", row.symmetrical_ka)).color(ink)).on_hover_text(&row.note);
+            ui.label(RichText::new(rating).color(ink)).on_hover_text(&row.note);
+            ui.label(RichText::new(&row.status).color(ink)).on_hover_text(&row.note);
+            ui.end_row();
+        }
+    });
+}
+
+fn duty_label(ui: &mut egui::Ui, row: &InterruptingDuty) {
+    let rating = match row.adjusted_symmetrical_ka {
+        Some(ka) => format!("{ka:.3} kA adjusted"),
+        None => format!("{:.3} kA rated", row.rated_symmetrical_ka),
+    };
+    let text = format!("{}  {:.3} kA symmetrical  {rating}  {}", row.id, row.symmetrical_ka, row.status);
+    ui.label(RichText::new(text).color(duty_color(&row.status))).on_hover_text(&row.note);
+}
+
+fn duty_color(status: &str) -> Color32 {
+    match status {
+        "exceeds_rating" | "not_adjusted" => color("#FFB300"),
+        _ => color("#E2E8F0"),
+    }
+}
+
+fn ieee_name(kind: IeeeKind) -> &'static str {
+    match kind {
+        IeeeKind::ModeratelyInverse => "moderately inverse",
+        IeeeKind::VeryInverse => "very inverse",
+        IeeeKind::ExtremelyInverse => "extremely inverse",
+    }
+}
+
+fn iec_name(kind: IecKind) -> &'static str {
+    match kind {
+        IecKind::Si => "SI",
+        IecKind::Vi => "VI",
+        IecKind::Ei => "EI",
+        IecKind::Lti => "LTI",
+    }
+}
+
+fn tail_name(tail: PointTail) -> &'static str {
+    match tail {
+        PointTail::HoldLastTime => "hold_last_time",
+        PointTail::Unavailable => "unavailable",
+    }
+}
+
+fn band_name(band: BandInterpretation) -> &'static str {
+    match band {
+        BandInterpretation::Entered => "entered",
+        BandInterpretation::Assumed => "assumed",
+    }
+}
+
+fn format_num(value: f64) -> String {
+    if !value.is_finite() {
+        return value.to_string();
+    }
+    let text = format!("{value:.6}");
+    if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        text
+    }
+}
+
+fn format_num_opt(value: Option<f64>) -> String {
+    value.map(format_num).unwrap_or_default()
+}
+
+fn parse_f64(text: &str) -> Option<f64> {
+    let value: f64 = text.parse().ok()?;
+    value.is_finite().then_some(value)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

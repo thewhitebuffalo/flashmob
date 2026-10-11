@@ -5,6 +5,7 @@
 pub mod arcflash;
 pub mod connectivity;
 pub mod curves;
+pub mod duty;
 pub mod exec;
 pub mod fault;
 pub mod library;

@@ -1,9 +1,10 @@
-//! Applying a library point curve onto a project device.
+//! Applying a library curve or trip setting onto a project device.
 //! Libraries here are built in code. Nothing reads a manufacturer file.
 
 use flashmob::curves::{self, PointTime};
 use flashmob::exec::{self, Command};
-use flashmob::library::{apply_device, ApplyDevice, Function, FunctionData, Library, LibraryDevice, PointCurve, Rating, TripUnit, FORMAT, VERSION};
+use flashmob::library::{apply_device, ApplyDevice, DialCurve, Function, FunctionData, Frame, Library, LibraryDevice, PointCurve, Rating, Setting, TripUnit, FORMAT, VERSION};
+use flashmob::library_apply::SettingRef;
 use flashmob::model::{BandInterpretation, CurveSpec, Device, PointTail, Project};
 
 fn lib(devices: Vec<LibraryDevice>) -> Library {
@@ -62,6 +63,18 @@ fn req(device_id: u32) -> ApplyDevice {
         function_name: None,
         library_name: "test-lib".into(),
         fuse_total_clearing: false,
+        dial: None,
+        ct_ratio: None,
+        tap_a: None,
+        sensor_a: None,
+        lt_pickup: None,
+        lt_delay: None,
+        lt_delay_multiple: None,
+        st_pickup: None,
+        st_delay: None,
+        inst: None,
+        inst_s: None,
+        pickup_base: None,
     }
 }
 
@@ -394,5 +407,263 @@ fn apply_cmd(library_path: String, id: &str) -> Command {
         protected_branch: None,
         library_name: String::new(),
         fuse_total_clearing: false,
+        dial: None,
+        ct_ratio: None,
+        tap_a: None,
+        sensor_a: None,
+        lt_pickup_function: None,
+        lt_pickup_label: None,
+        lt_delay_function: None,
+        lt_delay_label: None,
+        lt_delay_multiple: None,
+        st_pickup_function: None,
+        st_pickup_label: None,
+        st_delay_function: None,
+        st_delay_label: None,
+        inst_function: None,
+        inst_label: None,
+        inst_s: None,
+        pickup_base: None,
     }
+}
+
+fn dial_fn(label: &str, dial: f64, multiples: &[f64], times: &[f64]) -> Function {
+    Function {
+        name: "51".into(),
+        kind: "time_dial_curve_family".into(),
+        data: FunctionData {
+            settings: vec![Setting { label: label.into(), value: dial }],
+            dial_current_multiples: multiples.to_vec(),
+            dial_curves: vec![DialCurve { dial, time_s: times.to_vec() }],
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn setting_fn(name: &str, header_second: u32, settings: &[(&str, f64)], arrays: &[Vec<f64>]) -> Function {
+    Function {
+        name: name.into(),
+        kind: "pickup_settings".into(),
+        data: FunctionData {
+            header_codes: [0, header_second],
+            settings: settings.iter().map(|(label, value)| Setting { label: (*label).into(), value: *value }).collect(),
+            arrays: arrays.to_vec(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn breaker(functions: Vec<Function>) -> LibraryDevice {
+    let mut device = sample_device("Molded Case", vec![unit(0.0, functions)]);
+    device.frames = vec![Frame { rating_a: 600.0, sensors_a: vec![400.0] }];
+    device
+}
+
+fn trip_req() -> ApplyDevice {
+    let mut request = req(7);
+    request.sensor_a = Some(400.0);
+    request.lt_pickup = Some(SettingRef { function: "LTPU".into(), label: "0.5".into() });
+    request.lt_delay = Some(SettingRef { function: "LTD".into(), label: "3".into() });
+    request.lt_delay_multiple = Some(6.0);
+    request.pickup_base = Some("sensor".into());
+    request
+}
+
+fn thermal(device: &Device) -> (f64, f64, Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
+    match device.curve {
+        CurveSpec::ThermalMagnetic { lt_pickup_a, lt_delay_s, st_pickup_a, st_delay_s, inst_a, inst_s } => {
+            (lt_pickup_a, lt_delay_s, st_pickup_a, st_delay_s, inst_a, inst_s)
+        }
+        ref other => panic!("expected a thermal-magnetic curve, got {other:?}"),
+    }
+}
+
+fn dial_request(tap_a: Option<f64>, ct_ratio: Option<f64>) -> ApplyDevice {
+    let mut request = req(7);
+    request.dial = Some(5.0);
+    request.ct_ratio = ct_ratio;
+    request.tap_a = tap_a;
+    request
+}
+
+#[test]
+fn dial_curve_scales_to_primary_amperes() {
+    let function = dial_fn("5", 5.0, &[2.0, 10.0], &[1.0, 0.1]);
+    let device = apply_device(&lib(vec![sample_device("Relay", vec![unit(5.0, vec![function])])]), &dial_request(Some(5.0), Some(120.0))).unwrap();
+    let (points, max_points, tail, interpretation) = points_of(&device);
+    assert_eq!(points, [[1200.0, 1.0], [6000.0, 0.1]]);
+    assert!(max_points.is_none());
+    assert!(!device.fuse_total_clearing);
+    assert!(!device.curve_is_total_clearing);
+    assert!(device.breaker_interrupting_s.is_none());
+    assert!(device.interrupting.is_none());
+    assert_eq!(device.basis, "assumed");
+    assert_eq!(tail, PointTail::Unavailable);
+    assert_eq!(interpretation, BandInterpretation::Assumed);
+    let notes = &device.library.as_ref().unwrap().unsupported_elements;
+    assert!(notes.iter().any(|note| note == "dial 5 scaled by tap 5 A and CT ratio 120"), "{notes:?}");
+}
+
+#[test]
+fn dial_curve_requires_ct_ratio() {
+    let function = dial_fn("5A", 5.0, &[2.0, 10.0], &[1.0, 0.1]);
+    let err = apply_device(&lib(vec![sample_device("Relay", vec![unit(5.0, vec![function])])]), &dial_request(Some(5.0), None)).unwrap_err();
+    assert!(err.contains("ct_ratio is required to scale a relay dial curve to primary amperes"), "{err}");
+}
+
+#[test]
+fn dial_label_without_amperes_requires_tap() {
+    let function = dial_fn("5", 5.0, &[2.0, 10.0], &[1.0, 0.1]);
+    let err = apply_device(&lib(vec![sample_device("Relay", vec![unit(5.0, vec![function])])]), &dial_request(None, Some(120.0))).unwrap_err();
+    assert!(err.contains("tap_a (secondary amperes) is required; ct_ratio alone does not set the pickup"), "{err}");
+}
+
+#[test]
+fn dial_label_ending_in_a_assumes_secondary_tap() {
+    let function = dial_fn("5A", 5.0, &[2.0, 10.0], &[1.0, 0.1]);
+    let device = apply_device(&lib(vec![sample_device("Relay", vec![unit(5.0, vec![function])])]), &dial_request(None, Some(120.0))).unwrap();
+    let (points, max_points, _, _) = points_of(&device);
+    assert_eq!(points, [[1200.0, 1.0], [6000.0, 0.1]]);
+    assert!(max_points.is_none());
+    assert!(!device.fuse_total_clearing);
+    let notes = &device.library.as_ref().unwrap().unsupported_elements;
+    assert!(notes.iter().any(|note| note == "tap 5 A taken from the dial label, assumed secondary amperes"), "{notes:?}");
+    assert!(notes.iter().any(|note| note == "dial 5 scaled by tap 5 A and CT ratio 120"), "{notes:?}");
+}
+
+#[test]
+fn sensor_pickup_base_scales_long_time_pickup() {
+    let library = lib(vec![breaker(vec![
+        setting_fn("LTPU", 1, &[("0.5", 0.5)], &[]),
+        setting_fn("LTD", 1, &[("3", 3.0)], &[]),
+    ])]);
+    let device = apply_device(&library, &trip_req()).unwrap();
+    let (lt_pickup_a, lt_delay_s, st_pickup_a, st_delay_s, inst_a, inst_s) = thermal(&device);
+    assert_eq!(lt_pickup_a, 200.0);
+    assert_eq!(lt_delay_s, 3.0);
+    assert!(st_pickup_a.is_none() && st_delay_s.is_none() && inst_a.is_none() && inst_s.is_none());
+    assert!(!device.fuse_total_clearing);
+    assert!(device.interrupting.is_none());
+    assert_eq!(device.basis, "assumed");
+    let notes = &device.library.as_ref().unwrap().unsupported_elements;
+    assert!(notes.iter().any(|note| note == "sensor 400 A"), "{notes:?}");
+}
+
+#[test]
+fn long_time_delay_uses_slower_stored_time_at_six_times() {
+    let library = lib(vec![breaker(vec![
+        setting_fn("LTPU", 1, &[("0.5", 0.5)], &[]),
+        setting_fn("LTD", 1, &[("3", 3.0)], &[vec![4.5]]),
+    ])]);
+    let device = apply_device(&library, &trip_req()).unwrap();
+    let (_, lt_delay_s, _, _, _, _) = thermal(&device);
+    assert_eq!(lt_delay_s, 4.5);
+    let notes = &device.library.as_ref().unwrap().unsupported_elements;
+    assert!(notes.iter().any(|note| note == "long-time delay uses the slower stored time 4.5 s (setting 3 s)"), "{notes:?}");
+    assert!(notes.iter().any(|note| note == "long-time delay 4.5 s at 6× converted to 4.5 s at 6×"), "{notes:?}");
+}
+
+#[test]
+fn long_time_delay_converts_a_three_times_time_to_six_times() {
+    let library = lib(vec![breaker(vec![
+        setting_fn("LTPU", 1, &[("0.5", 0.5)], &[]),
+        setting_fn("LTD", 1, &[("3", 3.0)], &[vec![4.5]]),
+    ])]);
+    let mut request = trip_req();
+    request.lt_delay_multiple = Some(3.0);
+    let device = apply_device(&library, &request).unwrap();
+    let (_, lt_delay_s, _, _, _, _) = thermal(&device);
+    assert!((lt_delay_s - 1.125).abs() < 1e-12, "{lt_delay_s}");
+    let notes = &device.library.as_ref().unwrap().unsupported_elements;
+    assert!(notes.iter().any(|note| note == "long-time delay 4.5 s at 3× converted to 1.125 s at 6×"), "{notes:?}");
+}
+
+#[test]
+fn long_time_delay_multiple_is_required() {
+    let library = lib(vec![breaker(vec![
+        setting_fn("LTPU", 1, &[("0.5", 0.5)], &[]),
+        setting_fn("LTD", 1, &[("3", 3.0)], &[]),
+    ])]);
+    let mut request = trip_req();
+    request.lt_delay_multiple = None;
+    let err = apply_device(&library, &request).unwrap_err();
+    assert!(err.contains("the library does not state the current multiple at which the long-time delay applies; pass lt_delay_multiple (6 when that time is at 6 times long-time pickup)"), "{err}");
+}
+
+#[test]
+fn i2t_short_time_is_not_copied() {
+    let library = lib(vec![breaker(vec![
+        setting_fn("LTPU", 1, &[("0.5", 0.5)], &[]),
+        setting_fn("LTD", 1, &[("3", 3.0)], &[]),
+        setting_fn("STD-I2T", 1, &[("0.2", 0.2)], &[]),
+    ])]);
+    let mut request = trip_req();
+    request.st_delay = Some(SettingRef { function: "STD-I2T".into(), label: "0.2".into() });
+    let device = apply_device(&library, &request).unwrap();
+    let (lt_pickup_a, _, st_pickup_a, st_delay_s, _, _) = thermal(&device);
+    assert_eq!(lt_pickup_a, 200.0);
+    assert!(st_pickup_a.is_none());
+    assert!(st_delay_s.is_none());
+    let notes = &device.library.as_ref().unwrap().unsupported_elements;
+    assert!(notes.iter().any(|note| note == "short-time function STD-I2T is I2t; the flat short-time model was not used"), "{notes:?}");
+}
+
+#[test]
+fn header_code_10_pickup_stays_in_amperes() {
+    let library = lib(vec![breaker(vec![
+        setting_fn("LTPU", 10, &[("100", 100.0)], &[]),
+        setting_fn("LTD", 1, &[("3", 3.0)], &[]),
+    ])]);
+    let mut request = trip_req();
+    request.lt_pickup = Some(SettingRef { function: "LTPU".into(), label: "100".into() });
+    let device = apply_device(&library, &request).unwrap();
+    let (lt_pickup_a, _, _, _, _, _) = thermal(&device);
+    assert_eq!(lt_pickup_a, 100.0);
+}
+
+#[test]
+fn pickup_without_a_stated_base_errors() {
+    let library = lib(vec![breaker(vec![
+        setting_fn("LTPU", 1, &[("0.5", 0.5)], &[]),
+        setting_fn("LTD", 1, &[("3", 3.0)], &[]),
+    ])]);
+    let mut request = trip_req();
+    request.pickup_base = None;
+    let err = apply_device(&library, &request).unwrap_err();
+    assert!(err.contains("pickup base is not stated for LTPU; pass pickup_base sensor or long_time"), "{err}");
+}
+
+fn duty_rating(voltage_v: f64, rating_a: f64, interrupting_ka: f64, test_xr: f64) -> Rating {
+    Rating { voltage_v, rating_a, interrupting_ka, test_xr, ..Default::default() }
+}
+
+#[test]
+fn one_matching_interrupting_rating_is_copied() {
+    let mut device = sample_device("LV Fuse", vec![unit(100.0, vec![slow_then_fast()])]);
+    device.ratings = vec![
+        duty_rating(240.0, 100.0, 65.0, 4.9),
+        duty_rating(480.0, 100.0, 42.0, 4.9),
+    ];
+    let mut request = req(7);
+    request.voltage_v = Some(480.0);
+    let applied = apply_device(&lib(vec![device]), &request).unwrap();
+    let rating = applied.interrupting.unwrap();
+    assert_eq!(rating.symmetrical_ka, 42.0);
+    assert_eq!(rating.test_xr, 4.9);
+    assert_eq!(rating.voltage_v, 480.0);
+}
+
+#[test]
+fn disagreeing_interrupting_ratings_are_not_copied() {
+    let mut device = sample_device("LV Fuse", vec![unit(100.0, vec![slow_then_fast()])]);
+    device.ratings = vec![
+        duty_rating(240.0, 100.0, 65.0, 4.9),
+        duty_rating(480.0, 100.0, 42.0, 4.9),
+    ];
+    let applied = apply_device(&lib(vec![device]), &req(7)).unwrap();
+    assert!(applied.interrupting.is_none());
+    let notes = &applied.library.unwrap().unsupported_elements;
+    assert!(notes.iter().any(|note| note.starts_with("interrupting rating not selected:")), "{notes:?}");
 }

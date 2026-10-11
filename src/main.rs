@@ -135,7 +135,7 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
-    /// Copy one library point curve onto a project device (a snapshot).
+    /// Copy a library point curve, relay dial curve, or trip setting onto a project device.
     /// Prints the device JSON, or the whole project when --project is set.
     ApplyLibrary {
         /// Flashmob device-library JSON.
@@ -158,7 +158,7 @@ enum Command {
         /// Recorded on the library link. Does not select a trip unit.
         #[arg(long)]
         voltage_v: Option<f64>,
-        /// Point-curve name when the trip unit has more than one.
+        /// Curve name when the trip unit has more than one usable function.
         #[arg(long)]
         function_name: Option<String>,
         #[arg(long)]
@@ -169,6 +169,47 @@ enum Command {
         /// The governing band already includes total clearing. Off unless set.
         #[arg(long, default_value_t = false)]
         fuse_total_clearing: bool,
+        /// Relay dial to copy from a time_dial_curve_family.
+        #[arg(long)]
+        dial: Option<f64>,
+        /// CT ratio that scales a relay dial curve to primary amperes.
+        #[arg(long)]
+        ct_ratio: Option<f64>,
+        /// Relay tap, secondary amperes.
+        #[arg(long)]
+        tap_a: Option<f64>,
+        /// Frame sensor or plug, amperes.
+        #[arg(long)]
+        sensor_a: Option<f64>,
+        #[arg(long)]
+        lt_pickup_function: Option<String>,
+        #[arg(long)]
+        lt_pickup_label: Option<String>,
+        #[arg(long)]
+        lt_delay_function: Option<String>,
+        #[arg(long)]
+        lt_delay_label: Option<String>,
+        /// Current multiple at which the long-time delay time applies.
+        #[arg(long)]
+        lt_delay_multiple: Option<f64>,
+        #[arg(long)]
+        st_pickup_function: Option<String>,
+        #[arg(long)]
+        st_pickup_label: Option<String>,
+        #[arg(long)]
+        st_delay_function: Option<String>,
+        #[arg(long)]
+        st_delay_label: Option<String>,
+        #[arg(long)]
+        inst_function: Option<String>,
+        #[arg(long)]
+        inst_label: Option<String>,
+        /// Instantaneous operating time, seconds.
+        #[arg(long)]
+        inst_s: Option<f64>,
+        /// sensor or long_time, when a pickup function does not state its base.
+        #[arg(long)]
+        pickup_base: Option<String>,
         /// Project to add the device to. Omit to print the device only.
         #[arg(long)]
         project: Option<PathBuf>,
@@ -282,8 +323,16 @@ fn main() -> ExitCode {
             let found = library.search(&terms);
             emit(&serde_json::json!({"ok": true, "matches": found.len(), "devices": found.into_iter().take(limit).collect::<Vec<_>>()}), false)
         }
-        Command::ApplyLibrary { library, device_id, id, bus, name, rating_a, current_base_a, voltage_v, function_name, protected_branch, library_name, fuse_total_clearing, project, output } => {
+        Command::ApplyLibrary { library, device_id, id, bus, name, rating_a, current_base_a, voltage_v, function_name, protected_branch, library_name, fuse_total_clearing, dial, ct_ratio, tap_a, sensor_a, lt_pickup_function, lt_pickup_label, lt_delay_function, lt_delay_label, lt_delay_multiple, st_pickup_function, st_pickup_label, st_delay_function, st_delay_label, inst_function, inst_label, inst_s, pickup_base, project, output } => {
             let library_path = library.display().to_string();
+            let paired = |function: &Option<String>, label: &Option<String>, name: &str| {
+                flashmob::library_apply::setting_ref(function, label, name)
+            };
+            let lt_pickup = match paired(&lt_pickup_function, &lt_pickup_label, "lt_pickup") { Ok(value) => value, Err(err) => return fail(&err) };
+            let lt_delay = match paired(&lt_delay_function, &lt_delay_label, "lt_delay") { Ok(value) => value, Err(err) => return fail(&err) };
+            let st_pickup = match paired(&st_pickup_function, &st_pickup_label, "st_pickup") { Ok(value) => value, Err(err) => return fail(&err) };
+            let st_delay = match paired(&st_delay_function, &st_delay_label, "st_delay") { Ok(value) => value, Err(err) => return fail(&err) };
+            let inst = match paired(&inst_function, &inst_label, "inst") { Ok(value) => value, Err(err) => return fail(&err) };
             let request = flashmob::library::ApplyDevice {
                 device_id,
                 id,
@@ -296,6 +345,18 @@ fn main() -> ExitCode {
                 function_name,
                 library_name: if library_name.is_empty() { library_path.clone() } else { library_name },
                 fuse_total_clearing,
+                dial,
+                ct_ratio,
+                tap_a,
+                sensor_a,
+                lt_pickup,
+                lt_delay,
+                lt_delay_multiple,
+                st_pickup,
+                st_delay,
+                inst,
+                inst_s,
+                pickup_base,
             };
             match project {
                 Some(project) => apply_library_project(&project, &library_path, &request, output.as_deref()),
@@ -336,6 +397,23 @@ fn apply_library_project(project_path: &std::path::Path, library_path: &str, req
         protected_branch: request.protected_branch.clone(),
         library_name: request.library_name.clone(),
         fuse_total_clearing: request.fuse_total_clearing,
+        dial: request.dial,
+        ct_ratio: request.ct_ratio,
+        tap_a: request.tap_a,
+        sensor_a: request.sensor_a,
+        lt_pickup_function: request.lt_pickup.as_ref().map(|setting| setting.function.clone()),
+        lt_pickup_label: request.lt_pickup.as_ref().map(|setting| setting.label.clone()),
+        lt_delay_function: request.lt_delay.as_ref().map(|setting| setting.function.clone()),
+        lt_delay_label: request.lt_delay.as_ref().map(|setting| setting.label.clone()),
+        lt_delay_multiple: request.lt_delay_multiple,
+        st_pickup_function: request.st_pickup.as_ref().map(|setting| setting.function.clone()),
+        st_pickup_label: request.st_pickup.as_ref().map(|setting| setting.label.clone()),
+        st_delay_function: request.st_delay.as_ref().map(|setting| setting.function.clone()),
+        st_delay_label: request.st_delay.as_ref().map(|setting| setting.label.clone()),
+        inst_function: request.inst.as_ref().map(|setting| setting.function.clone()),
+        inst_label: request.inst.as_ref().map(|setting| setting.label.clone()),
+        inst_s: request.inst_s,
+        pickup_base: request.pickup_base.clone(),
     }]);
     if !response.ok {
         return fail(response.error.as_deref().unwrap_or("could not apply the library device"));
