@@ -1,0 +1,21 @@
+[package]
+name = "flashmob-mcp"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "MCP server for Flashmob load-flow, fault, and arc-flash studies"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "flashmob-mcp"
+path = "src/main.rs"
+
+[dependencies]
+flashmob = { path = "..", default-features = false }
+# rmcp 3.5 names the stdin/stdout transport `transport-io`. There is no feature named `stdio`.
+rmcp = { version = "3.5.1", default-features = false, features = ["server", "macros", "schemars", "transport-io"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }

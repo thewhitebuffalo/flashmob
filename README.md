@@ -49,6 +49,10 @@ flashmob exec <<'EOF'
 EOF
 ```
 
+## MCP server
+
+`flashmob-mcp` is a second program that speaks Model Context Protocol on stdin and stdout. It links this library with the GUI off and calls the same exec commands. `cargo build --release -p flashmob-mcp` produces it. The process keeps one project in memory. `open` loads a file. `save` writes it back only into the opened file's directory, `~/Documents`, or `/tmp`, and only replaces an existing file when asked. A path inside this repository is refused. `apply` takes a list of exec ops and returns one result per op, the validation errors, and the ids that were touched. It does not return the project. `flashmob://schema` serves the exec schema. `run`, `sld`, and `tcc` each say that a warning, `complete: false`, an unresolved clearing path, or an assumption means the number is not label-ready, and that feeder length and cable size must come from the model. `sld` and `tcc` write their files next to the open project. `library_search` and `apply_library` read the JSON file named by `FLASHMOB_LIBRARY`. `fuse_total_clearing` stays off unless that call sets it.
+
 The response contains `project`, `results`, `sld_svg`, `tcc_svg`, and `tcc_csv`, plus `topology` when requested. Intermediate states may be incomplete, but the final project is validated: `validation_errors` lists any errors, and then `ok` is false and the CLI exits 1. Model edits clear results and every derived view; `run`, `topology`, `sld`, `tcc`, and `export_package` do not. `sld` and `tcc` reuse the last full study, even one whose load flow failed. `flashmob schema` includes a sample project and the command list.
 
 The built-in sample has a motor directly on the MCC bus and no modeled motor feeder breaker. Its MCC arc-flash result therefore reports an explicit unresolved motor backfeed path instead of treating the main breaker opening as total arc clearing. The downstream panel's feeder breaker still separates its arc from that motor.

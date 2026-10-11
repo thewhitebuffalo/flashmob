@@ -25,3 +25,7 @@ rfd = { version = "0.15", optional = true }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[workspace]
+members = [".", "flashmob-mcp"]
+resolver = "2"
