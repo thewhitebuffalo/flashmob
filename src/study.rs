@@ -5,7 +5,7 @@ use crate::curves::{self, curve_label};
 use crate::duty;
 use crate::fault::{self, FaultResult};
 use crate::loadflow::{self, LoadflowResult};
-use crate::model::{typical_equipment, ArcEquipment, Project, ASSUMED_ENCLOSURE_ELECTRODES};
+use crate::model::{typical_equipment, ArcEquipment, CurveSpec, Device, Project, ASSUMED_ENCLOSURE_ELECTRODES};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Studies {
@@ -639,47 +639,42 @@ fn decrement_duration(project: &Project, loadflow: Option<&LoadflowResult>, equi
     if equipment.clearing_s.is_some() {
         return duration(project, equipment, fault, i_ka, protection);
     }
-    let fallback = |reason: String| -> Result<Clearing, String> {
-        let Some(seconds) = equipment.fallback_duration_s else { return Err(reason) };
-        let mut clear = finish_clearing(seconds, project.arc_duration_cap_s,
-            &format!("authorized assumed exposure fallback of {seconds:.3} s with source-current decrement"),
-            "This cap is not a field trip setting and is not for an arc-flash label.");
-        clear.assumed = true;
-        clear.note.push_str(&format!(" {reason}. {} No device clearing time is inferred from this assumption.", protection.detail));
-        Ok(clear)
+    let missing = |detail: String| missing_arc_flash(&equipment.bus, &detail);
+    let gap = |detail: String| missing_arc_flash_message(&equipment.bus, &detail);
+    let Some(id) = equipment.upstream_device.as_ref() else {
+        return missing(format!("an upstream device that isolates this bus. {}", protection.detail));
     };
-    let Some(id) = equipment.upstream_device.as_ref() else { return fallback(protection.detail.clone()) };
-    let device = project.device(id).ok_or("upstream device missing")?;
+    let device = project.device(id).ok_or_else(|| gap(format!("the upstream device [{id}] named on this equipment")))?;
     if let Some(branch) = device.protected_branch.as_deref()
         .and_then(|id| project.branches.iter().find(|branch| branch.id == id)) {
         if !project.branch_closed(branch) {
-            return fallback(format!("selected upstream device '{}' is on open branch '{}' in this operating case", device.id, branch.id));
+            return missing(format!("a closed protected branch for upstream device {} [{}]. Branch '{}' is open in this operating case, so that device does not clear this fault", device.name, device.id, branch.id));
         }
     }
     if device.protected_branch.is_none() {
         // Same as the constant-current path: no placement, no device current.
-        return fallback(format!("protected branch terminal current unavailable for upstream device {} [{}]; enter protected_branch and terminal bus", device.name, device.id));
+        return missing(format!("protected_branch on upstream device {} [{}], naming the branch whose terminal current the device interrupts", device.name, device.id));
     }
     if !isolates_sources(project, device, &equipment.bus) {
         return Err("opening the selected device does not isolate all utility/generator paths to the fault; a multi-device clearing study is required".into());
     }
     reject_connected_motors(project, device, &equipment.bus)?;
     if device.fuse_total_clearing {
-        return fallback(format!("upstream device {} [{}] has a fuse total-clearing curve; its melt and arcing history cannot be inferred from a time-varying relay model", device.name, device.id));
+        return missing(format!("a trip-only curve and breaker_interrupting_s for upstream device {} [{}]. Its curve is marked fuse total clearing, and the time-varying model cannot infer melt and arcing from that curve", device.name, device.id));
     }
     if device.curve_is_total_clearing {
-        return fallback(format!("upstream device {} [{}] has a total-clearing curve (curve_is_total_clearing); the time-varying relay model integrates trip-element operating time, not total clearing, so enter a trip-only curve and breaker_interrupting_s", device.name, device.id));
+        return missing(format!("a trip-only curve and breaker_interrupting_s for upstream device {} [{}]. curve_is_total_clearing is set, and the time-varying model integrates trip-element time rather than a total-clearing curve", device.name, device.id));
     }
     let Some(interrupting_s) = device.breaker_interrupting_s else {
-        return fallback(format!("upstream device {} [{}] lacks breaker interruption time", device.name, device.id));
+        return missing(format!("breaker_interrupting_s on upstream device {} [{}]. The time-varying model adds breaker interruption after the trip curve operates", device.name, device.id));
     };
     let mut relay = match curves::DynamicRelay::new(&device.curve) {
         Ok(relay) => relay,
-        Err(error) => return fallback(format!("upstream device {} [{}]: {error}", device.name, device.id)),
+        Err(error) => return missing(format!("a usable trip curve for upstream device {} [{}]. {error}", device.name, device.id)),
     };
-    let bolted = fault.three_phase.as_ref().ok_or("fault current unavailable")?.symmetrical_ka;
+    let bolted = fault.three_phase.as_ref().ok_or_else(|| gap("a three-phase fault current at this bus".into()))?.symmetrical_ka;
     let Some(mut prior_amps) = device_current(project, device, fault, i_ka / bolted) else {
-        return fallback(format!("protected branch terminal current unavailable for upstream device {} [{}]; enter protected_branch and terminal bus", device.name, device.id));
+        return missing(format!("the current through protected branch '{}' of upstream device {} [{}]", device.protected_branch.as_deref().unwrap_or(""), device.name, device.id));
     };
     let current_case = if reduced { "reduced" } else { "full" };
     let not_a_label = "This cap is not a field trip setting and is not for an arc-flash label.";
@@ -706,7 +701,7 @@ fn decrement_duration(project: &Project, loadflow: Option<&LoadflowResult>, equi
         let i_arc_ka = if reduced { arcing.i_arc_min_ka } else { arcing.i_arc_ka };
         device_current_from_terminals(project, device, &sampled.terminal_currents,
             i_arc_ka / sampled.bolted_ka)
-            .ok_or_else(|| format!("protected branch terminal current unavailable for upstream device {} [{}] at {time_s:.3} s", device.name, device.id))
+            .ok_or_else(|| gap(format!("the current through protected branch '{}' of upstream device {} [{}] at {time_s:.3} s", device.protected_branch.as_deref().unwrap_or(""), device.name, device.id)))
     };
     let mut interval_start_s = 0.0;
     let mut prior_sample_s = 0.0;
@@ -721,7 +716,7 @@ fn decrement_duration(project: &Project, loadflow: Option<&LoadflowResult>, equi
         match advance_relay_over_ramp(&mut relay, prior_amps, amps, midpoint_s - prior_sample_s) {
             Ok(Some(within_s)) => return finish_trip(prior_sample_s + within_s, relay.reset_affects_result(), relay.point_note()),
             Ok(None) => {},
-            Err(error) => return fallback(format!("upstream device {} [{}]: {error}", device.name, device.id)),
+            Err(error) => return missing(format!("a trip time for upstream device {} [{}] on the sampled current. {error}", device.name, device.id)),
         }
         prior_sample_s = midpoint_s;
         prior_amps = amps;
@@ -733,7 +728,7 @@ fn decrement_duration(project: &Project, loadflow: Option<&LoadflowResult>, equi
             match advance_relay_over_ramp(&mut relay, prior_amps, amps, end_s - prior_sample_s) {
                 Ok(Some(within_s)) => return finish_trip(prior_sample_s + within_s, relay.reset_affects_result(), relay.point_note()),
                 Ok(None) => {},
-                Err(error) => return fallback(format!("upstream device {} [{}]: {error}", device.name, device.id)),
+                Err(error) => return missing(format!("a trip time for upstream device {} [{}] on the sampled current. {error}", device.name, device.id)),
             }
             prior_sample_s = end_s;
             prior_amps = amps;
@@ -748,7 +743,7 @@ fn decrement_duration(project: &Project, loadflow: Option<&LoadflowResult>, equi
         match advance_relay_over_ramp(&mut relay, prior_amps, amps, project.arc_duration_cap_s - prior_sample_s) {
             Ok(Some(within_s)) => return finish_trip(prior_sample_s + within_s, relay.reset_affects_result(), relay.point_note()),
             Ok(None) => {},
-            Err(error) => return fallback(format!("upstream device {} [{}]: {error}", device.name, device.id)),
+            Err(error) => return missing(format!("a trip time for upstream device {} [{}] on the sampled current. {error}", device.name, device.id)),
         }
         prior_amps = amps;
     }
@@ -773,9 +768,9 @@ fn decrement_duration(project: &Project, loadflow: Option<&LoadflowResult>, equi
             add_point_note(&mut clear, relay.point_note());
             Ok(clear)
         }
-        Ok(false) => fallback(format!("upstream device {} [{}] did not trip within the {:.3} s study cap under the sampled {} arcing-current profile and is below every entered pickup at {prior_amps:.0} A at the cap; total clearing is unresolved",
+        Ok(false) => missing(format!("a trip of upstream device {} [{}] within the {:.3} s study cap. Under the sampled {} arcing-current profile it is below every entered pickup at {prior_amps:.0} A at the cap, so total clearing is unresolved",
             device.name, device.id, project.arc_duration_cap_s, current_case)),
-        Err(error) => fallback(format!("upstream device {} [{}]: {error}", device.name, device.id)),
+        Err(error) => missing(format!("a trip time for upstream device {} [{}]. {error}", device.name, device.id)),
     }
 }
 
@@ -1039,6 +1034,45 @@ struct Clearing {
     assumed: bool,
 }
 
+/// Missing clearing data is a per-bus error. `fallback_duration_s` is not an arc-flash result.
+fn missing_arc_flash_message(bus: &str, missing: &str) -> String {
+    format!("Arc flash cannot be calculated for bus {bus}. Missing: {missing}")
+}
+
+fn missing_arc_flash(bus: &str, missing: &str) -> Result<Clearing, String> {
+    Err(missing_arc_flash_message(bus, missing))
+}
+
+fn clearing_gap(device: &Device, amps: f64, point_note: Option<(bool, String)>) -> String {
+    let name = &device.name;
+    let id = &device.id;
+    let extra = point_note.map(|(_, note)| format!(" {note}")).unwrap_or_default();
+    match &device.curve {
+        CurveSpec::SettingsNotCollected { note } => {
+            let recorded = if note.is_empty() { String::new() } else { format!(" Recorded note: {note}") };
+            format!("a trip curve for {name} [{id}]. No pickup, delay, fuse size, or instantaneous setting is stored.{recorded}")
+        }
+        CurveSpec::Points { .. } => {
+            if curves::trip_time(&device.curve, amps).is_none() {
+                format!("an operating time for {name} [{id}] at {amps:.0} A. The point curve does not produce a time at this current.{extra}")
+            } else if !device.curve_includes_clearing() && device.breaker_interrupting_s.is_none() {
+                format!("total clearing for {name} [{id}] at {amps:.0} A. The curve has an operating time, but it is not marked total clearing and breaker_interrupting_s is absent. For a fuse, set fuse_total_clearing only when the governing band is the published total-clearing curve. For a breaker, enter breaker_interrupting_s.{extra}")
+            } else {
+                format!("a usable total-clearing time for {name} [{id}] at {amps:.0} A.{extra}")
+            }
+        }
+        _ => {
+            if curves::trip_time(&device.curve, amps).is_none() {
+                format!("an operating time for {name} [{id}] at {amps:.0} A. A pickup, delay, or instantaneous time is missing, or the current is below pickup.{extra}")
+            } else if device.breaker_interrupting_s.is_none() && !device.curve_includes_clearing() {
+                format!("breaker_interrupting_s for {name} [{id}]. The trip curve operates at {amps:.0} A, and total clearing is that operating time plus the breaker interrupting time.{extra}")
+            } else {
+                format!("a usable total-clearing time for {name} [{id}] at {amps:.0} A.{extra}")
+            }
+        }
+    }
+}
+
 fn duration(project: &Project, case: &ArcEquipment, fault: &crate::fault::BusFault, i_ka: f64, protection: &crate::protection::Protection) -> Result<Clearing, String> {
     let cap = project.arc_duration_cap_s;
     let not_a_label = "This cap is not a field trip setting and is not for an arc-flash label.";
@@ -1049,24 +1083,21 @@ fn duration(project: &Project, case: &ArcEquipment, fault: &crate::fault::BusFau
         clear.note.push_str(&format!(" {} Manual duration overrides device-based clearing.", protection.detail));
         return Ok(clear);
     }
-    let fallback = |reason: String| -> Result<Clearing, String> {
-        let Some(seconds) = case.fallback_duration_s else { return Err(reason) };
-        let mut clear = finish_clearing(seconds, cap, &format!("authorized assumed exposure fallback of {seconds:.3} s"), not_a_label);
-        clear.assumed = true;
-        clear.note.push_str(&format!(" {reason}. {} No device clearing time is inferred from this assumption.", protection.detail));
-        Ok(clear)
+    let Some(id) = case.upstream_device.as_ref() else {
+        return missing_arc_flash(&case.bus, &format!("an upstream device that isolates this bus. {}", protection.detail));
     };
-    let Some(id) = case.upstream_device.as_ref() else { return fallback(protection.detail.clone()) };
-    let device = project.device(id).ok_or("upstream device missing")?;
+    let device = project.device(id).ok_or_else(|| missing_arc_flash_message(&case.bus, &format!("the upstream device [{id}] named on this equipment")))?;
     if let Some(branch) = device.protected_branch.as_deref()
         .and_then(|id| project.branches.iter().find(|branch| branch.id == id)) {
         if !project.branch_closed(branch) {
-            return fallback(format!("selected upstream device '{}' is on open branch '{}' in this operating case", device.id, branch.id));
+            return missing_arc_flash(&case.bus, &format!("a closed protected branch for upstream device {} [{}]. Branch '{}' is open in this operating case, so that device does not clear this fault", device.name, device.id, branch.id));
         }
     }
-    let bolted = fault.three_phase.as_ref().ok_or("fault current unavailable")?.symmetrical_ka;
+    let bolted = fault.three_phase.as_ref()
+        .ok_or_else(|| missing_arc_flash_message(&case.bus, "a three-phase fault current at this bus"))?
+        .symmetrical_ka;
     let Some(amps) = device_current(project, device, fault, i_ka / bolted) else {
-        return fallback(format!("protected branch terminal current unavailable for upstream device {} [{}]; enter protected_branch and terminal bus", device.name, device.id));
+        return missing_arc_flash(&case.bus, &format!("protected_branch on upstream device {} [{}], naming the branch whose terminal current the device interrupts", device.name, device.id));
     };
     if !isolates_sources(project, device, &case.bus) {
         return Err("opening the selected device does not isolate all utility/generator paths to the fault; a multi-device clearing study is required".into());
@@ -1074,8 +1105,7 @@ fn duration(project: &Project, case: &ArcEquipment, fault: &crate::fault::BusFau
     reject_connected_motors(project, device, &case.bus)?;
     let point_note = curves::point_curve_note(&device.curve, amps);
     let Some(raw) = curves::clearing_time(device, amps) else {
-        let detail = point_note.map(|(_, note)| format!(" {note}")).unwrap_or_default();
-        return fallback(format!("Upstream device {} [{}] identified; total clearing unavailable at {amps:.0} A: enter operating settings and breaker interrupting time, or a fuse total-clearing curve; device may not operate at this current.{detail}", device.name, device.id));
+        return missing_arc_flash(&case.bus, &clearing_gap(device, amps, point_note));
     };
     let mut clear = finish_clearing(raw, cap, &format!("total clearing time of {} at {amps:.0} A through its protected terminal (network terminal current; loadflow prefault includes initial branch flow)", device.name), not_a_label);
     add_point_note(&mut clear, point_note);
@@ -1431,7 +1461,14 @@ pub fn text_report(project: &Project, out: &StudyOutput) -> String {
         if let Some(rows) = &out.arc_flash {
             let mine: Vec<_> = rows.iter().filter(|row| row.bus_id == bus.id).collect();
             if mine.is_empty() {
-                lines.push("    Arc flash  no IEEE 1584-2018 result for this bus.".into());
+                let reasons: Vec<_> = out.arc_flash_failures.iter().filter(|failure| failure.bus_id == bus.id).collect();
+                if reasons.is_empty() {
+                    lines.push("    Arc flash  no IEEE 1584-2018 result for this bus.".into());
+                } else {
+                    for failure in reasons {
+                        lines.push(format!("    Arc flash FAILED: {}", failure.error));
+                    }
+                }
             }
             for row in mine {
                 lines.push(format!("    {}", row.duration_note));
@@ -1601,11 +1638,12 @@ mod audit_regression {
     }
 
     #[test]
-    fn missing_device_terminal_current_uses_authorized_fallback_in_both_paths() {
+    fn missing_device_terminal_current_is_an_error_in_both_paths() {
         let mut p = unplaced_main();
         let out = run(&p, arc_only()).unwrap();
         let failure = out.arc_flash_failures.iter().find(|f| f.equipment_id == "af-mcc").unwrap();
-        assert!(failure.error.contains("terminal current unavailable"), "{}", failure.error);
+        assert!(failure.error.contains("Arc flash cannot be calculated for bus mcc"), "{}", failure.error);
+        assert!(failure.error.contains("Missing: protected_branch"), "{}", failure.error);
 
         p.equipment[0].fallback_duration_s = Some(0.5);
         for decrement in [false, true] {
@@ -1616,13 +1654,54 @@ mod audit_regression {
                 ];
             }
             let out = run(&p, arc_only()).unwrap();
-            let r = row(&out, "af-mcc");
-            assert_eq!(r.time_s, 0.5, "decrement {decrement}");
-            assert_eq!(r.time_min_s, 0.5);
-            assert!(r.assumed);
-            assert!(r.duration_note.contains("assumed exposure fallback") && r.duration_note.contains("terminal current unavailable"), "{}", r.duration_note);
-            assert_eq!(r.decrement_applied, decrement);
+            let failure = out.arc_flash_failures.iter().find(|f| f.equipment_id == "af-mcc").unwrap();
+            assert!(failure.error.contains("Missing: protected_branch"), "decrement {decrement}: {}", failure.error);
+            assert!(out.arc_flash.as_ref().unwrap().iter().all(|row| row.equipment_id != "af-mcc"));
         }
+    }
+
+    #[test]
+    fn every_incomplete_bus_names_its_gap_and_a_complete_bus_still_calculates() {
+        let mut p = Project::sample();
+        p.motors.clear();
+        p.loads.clear();
+        for equipment in &mut p.equipment {
+            equipment.fallback_duration_s = Some(2.0);
+        }
+        let (electrode, gap, distance, height, width, depth, _) = typical_equipment(12.47);
+        let mut utility = p.equipment[0].clone();
+        utility.id = "af-util".into();
+        utility.name = "Utility gear".into();
+        utility.bus = "util".into();
+        utility.electrode = electrode;
+        utility.gap_mm = gap;
+        utility.distance_mm = distance;
+        utility.height_mm = height;
+        utility.width_mm = width;
+        utility.depth_mm = depth;
+        utility.upstream_device = None;
+        utility.clearing_s = None;
+        utility.fallback_duration_s = Some(2.0);
+        p.equipment.push(utility);
+        p.devices[1].curve = CurveSpec::SettingsNotCollected { note: "fuse size not on the sheet".into() };
+        p.devices[1].breaker_interrupting_s = None;
+        let out = run(&p, arc_only()).unwrap();
+        let rows = out.arc_flash.as_ref().unwrap();
+        assert!(rows.iter().any(|row| row.equipment_id == "af-mcc"), "a bus with a trip curve and breaker interrupting time is still calculated");
+        assert!(rows.iter().all(|row| row.time_s != 2.0));
+        assert!(rows.iter().all(|row| row.bus_id != "pnl" && row.bus_id != "util"));
+        let pnl = out.arc_flash_failures.iter().find(|failure| failure.bus_id == "pnl").unwrap();
+        assert!(pnl.error.contains("Arc flash cannot be calculated for bus pnl"), "{}", pnl.error);
+        assert!(pnl.error.contains("Missing: a trip curve"), "{}", pnl.error);
+        assert!(pnl.error.contains("Panel feeder"), "{}", pnl.error);
+        assert!(pnl.error.contains("fuse size not on the sheet"), "{}", pnl.error);
+        let util = out.arc_flash_failures.iter().find(|failure| failure.bus_id == "util").unwrap();
+        assert!(util.error.contains("Arc flash cannot be calculated for bus util"), "{}", util.error);
+        assert!(util.error.contains("Missing: an upstream device"), "{}", util.error);
+        let report = text_report(&p, &out);
+        assert!(report.contains(&pnl.error), "{report}");
+        assert!(report.contains(&util.error), "{report}");
+        assert!(!report.contains("2.000 s"), "stored fallback duration must not be reported as arc time:\n{report}");
     }
 
     #[test]

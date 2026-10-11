@@ -295,7 +295,9 @@ fn curve_is_total_clearing_conflicts_with_breaker_time_and_decrement() {
     ];
     let out = study::run(&p, Studies { loadflow: false, fault: false, arcflash: true, coordination: false }).unwrap();
     let failure = out.arc_flash_failures.iter().find(|f| f.equipment_id == "af-mcc").unwrap();
-    assert!(failure.error.contains("total-clearing curve (curve_is_total_clearing)"), "{}", failure.error);
+    assert!(failure.error.contains("Arc flash cannot be calculated for bus mcc"), "{}", failure.error);
+    assert!(failure.error.contains("Missing: a trip-only curve and breaker_interrupting_s"), "{}", failure.error);
+    assert!(failure.error.contains("curve_is_total_clearing"), "{}", failure.error);
 }
 
 #[test]

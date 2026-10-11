@@ -369,7 +369,7 @@ pub struct EquipmentState {
     /// Case-specific explicit total arc duration.
     #[serde(default)]
     pub clearing_s: Option<f64>,
-    /// Case-specific authorized fallback if device clearing is unavailable.
+    /// Retained so older projects still load. Not used as an arc duration.
     #[serde(default)]
     pub fallback_duration_s: Option<f64>,
 }
@@ -676,8 +676,8 @@ pub struct ArcEquipment {
     /// Explicit total arc duration. Automatic clearing requires a located upstream device and total-clearing data.
     #[serde(default)]
     pub clearing_s: Option<f64>,
-    /// Explicitly authorized assumed exposure duration, used only when automatic
-    /// total clearing is unavailable. A usable device curve takes precedence.
+    /// Retained so older projects still load. The study does not turn this into
+    /// incident energy. Missing clearing data is an arc-flash failure that names the gap.
     #[serde(default)]
     pub fallback_duration_s: Option<f64>,
     /// "collected" or "assumed". Empty means unspecified.

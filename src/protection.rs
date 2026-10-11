@@ -168,7 +168,9 @@ mod tests {
         assert_eq!(protection.clearing_data, "missing_curve");
         let out = study::run(&p, Studies::all()).unwrap();
         let failure = out.arc_flash_failures.iter().find(|f| f.bus_id == "pnl").unwrap();
-        assert!(failure.error.contains("brk-feeder") && failure.error.contains("identified; total clearing unavailable"));
+        assert!(failure.error.contains("Arc flash cannot be calculated for bus pnl"), "{}", failure.error);
+        assert!(failure.error.contains("brk-feeder") && failure.error.contains("Missing: a trip curve"), "{}", failure.error);
+        assert!(failure.error.contains("unknown fuse"), "{}", failure.error);
     }
 
     #[test]
@@ -280,7 +282,7 @@ mod fallback_tests {
     use crate::{model::*, study::{self, Studies}};
 
     #[test]
-    fn device_curve_supersedes_fallback_and_unknown_curve_uses_it() {
+    fn device_curve_supersedes_a_stored_fallback_and_a_missing_curve_is_an_error() {
         let mut p = Project::sample(); p.motors.clear(); p.loads.clear();
         p.equipment[0].upstream_device = None;
         p.equipment[0].basis = "collected".into();
@@ -295,11 +297,12 @@ mod fallback_tests {
         assert!(!known.assumed);
         assert!(!known.duration_note.contains("fallback"));
         p.devices[0].curve = CurveSpec::SettingsNotCollected { note: "curve missing".into() };
-        let unknown = run(&p);
-        assert_eq!(unknown.time_s, 2.0);
-        assert!(unknown.assumed);
-        assert!(unknown.duration_note.contains("assumed exposure fallback"));
-        assert_eq!(unknown.upstream_device.as_deref(), Some("brk-main"));
+        let result = study::run(&p, Studies::all()).unwrap();
+        let failure = result.arc_flash_failures.iter().find(|f| f.equipment_id == "af-mcc").unwrap();
+        assert!(failure.error.contains("Arc flash cannot be calculated for bus mcc"), "{}", failure.error);
+        assert!(failure.error.contains("Missing: a trip curve"), "{}", failure.error);
+        assert!(failure.error.contains("curve missing"), "{}", failure.error);
+        assert!(result.arc_flash.as_ref().unwrap().iter().all(|row| row.equipment_id != "af-mcc"));
         // Fallback does not override an explicit manual duration or suppress bad placement.
         p.equipment[0].clearing_s = Some(0.3);
         assert_eq!(run(&p).time_s, 0.3);

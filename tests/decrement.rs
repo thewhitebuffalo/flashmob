@@ -166,7 +166,8 @@ fn decrement_without_relay_operation_has_explicit_failure() {
     assert!(!output.arc_flash.as_ref().unwrap().iter().any(|row| row.equipment_id == "af-mcc"));
     let failure = output.arc_flash_failures.iter()
         .find(|failure| failure.equipment_id == "af-mcc").expect("missing explicit arc-flash failure");
-    assert!(failure.error.contains("did not trip within"), "{}", failure.error);
+    assert!(failure.error.contains("within the 2.000 s study cap"), "{}", failure.error);
+    assert!(failure.error.contains("below every entered pickup"), "{}", failure.error);
 }
 
 fn assert_same_capped_result(static_row: &ArcRow, profiled: &ArcRow, cap: f64) {
@@ -228,7 +229,7 @@ fn fuse_total_clearing_curve_does_not_masquerade_as_dynamic_relay() {
     let output = run_arc(&project);
     let failure = output.arc_flash_failures.iter()
         .find(|failure| failure.equipment_id == "af-mcc").unwrap();
-    assert!(failure.error.contains("fuse total-clearing curve"), "{}", failure.error);
+    assert!(failure.error.contains("fuse total clearing"), "{}", failure.error);
 }
 
 #[test]
@@ -247,7 +248,8 @@ fn short_initial_pickup_does_not_claim_a_trip_after_current_decays() {
     assert!(!output.arc_flash.as_ref().unwrap().iter().any(|row| row.equipment_id == "af-mcc"));
     let failure = output.arc_flash_failures.iter()
         .find(|failure| failure.equipment_id == "af-mcc").unwrap();
-    assert!(failure.error.contains("did not trip within"), "{}", failure.error);
+    assert!(failure.error.contains("within the 0.500 s study cap"), "{}", failure.error);
+    assert!(failure.error.contains("below every entered pickup"), "{}", failure.error);
 }
 
 // Formerly a hard failure. A constant out-of-range bolted current is computed
