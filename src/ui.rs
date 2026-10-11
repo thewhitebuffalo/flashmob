@@ -930,7 +930,7 @@ impl App {
         }
         let mut choose = None;
         egui::Grid::new("library-matches").striped(true).show(ui, |ui| {
-            for heading in ["Id", "Manufacturer", "Style", "Category"] {
+            for heading in ["Id", "Manufacturer", "Style", "Catalog", "Category"] {
                 ui.label(RichText::new(heading).strong());
             }
             ui.end_row();
@@ -942,6 +942,7 @@ impl App {
                 clicked |= ui.selectable_label(selected, RichText::new(device.id.to_string()).color(ink)).clicked();
                 clicked |= ui.selectable_label(selected, RichText::new(&device.manufacturer).color(ink)).clicked();
                 clicked |= ui.selectable_label(selected, RichText::new(&device.style).color(ink)).clicked();
+                clicked |= ui.selectable_label(selected, RichText::new(&device.catalog).color(ink)).clicked();
                 clicked |= ui.selectable_label(selected, RichText::new(&device.category).color(ink)).clicked();
                 if clicked {
                     choose = Some(device.id);
@@ -959,7 +960,8 @@ impl App {
 
     fn library_form(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("Apply").strong());
-        ui.label(RichText::new("Project id and bus are required. Every other field is optional.").color(color("#94A3B8")));
+        ui.label(RichText::new("Project id and bus are required.").color(color("#94A3B8")));
+        ui.label(RichText::new("rating_a and function_name are required when the device lists more than one. A relay dial needs dial and ct_ratio; tap_a is required unless a dial label ends in A. Trip settings need sensor_a, long-time pickup, long-time delay, and lt_delay_multiple.").color(color("#94A3B8")));
         match self.library_selected {
             Some(id) => ui.label(RichText::new(format!("Library device {id}")).color(color("#00FF66"))),
             None => ui.label(RichText::new("No library device selected.").color(color("#94A3B8"))),
@@ -1333,6 +1335,12 @@ fn edit_curve(ui: &mut egui::Ui, device_id: &str, curve: &mut CurveSpec) -> bool
 fn show_library_device(ui: &mut egui::Ui, device: &flashmob::library::LibraryDevice) {
     ui.separator();
     ui.label(RichText::new(format!("{}  {}  {}", device.id, device.manufacturer, device.style)).strong().color(color("#E2E8F0")));
+    if !device.catalog.is_empty() {
+        ui.label(RichText::new(format!("Catalog {}", device.catalog)).color(color("#E2E8F0")));
+    }
+    if !device.device_type.is_empty() {
+        ui.label(RichText::new(&device.device_type).color(color("#94A3B8")));
+    }
     ui.label(RichText::new(&device.category).color(color("#94A3B8")));
     ui.label(RichText::new("Trip units").strong());
     if device.trip_units.is_empty() {
@@ -1343,6 +1351,11 @@ fn show_library_device(ui: &mut egui::Ui, device: &flashmob::library::LibraryDev
         for function in &unit.functions {
             let name = if function.name.is_empty() { "(unnamed)" } else { function.name.as_str() };
             ui.label(RichText::new(format!("  {name}  {}", function.kind)).color(color("#94A3B8")));
+            show_capped(ui, &function.data.settings.iter().map(|setting| format!("{} = {}", setting.label, format_num(setting.value))).collect::<Vec<_>>(), "settings");
+            if !function.data.dial_curves.is_empty() {
+                let dials = function.data.dial_curves.iter().map(|curve| format_num(curve.dial)).collect::<Vec<_>>().join(", ");
+                ui.label(RichText::new(format!("    dials {dials}")).color(color("#94A3B8")));
+            }
         }
     }
     ui.label(RichText::new("Frames").strong());
@@ -1356,6 +1369,25 @@ fn show_library_device(ui: &mut egui::Ui, device: &flashmob::library::LibraryDev
             frame.sensors_a.iter().map(|amps| format_num(*amps)).collect::<Vec<_>>().join(", ")
         };
         ui.label(format!("Frame {} A  sensors {sensors}", format_num(frame.rating_a)));
+    }
+    ui.label(RichText::new("Interrupting ratings").strong());
+    if device.ratings.is_empty() {
+        ui.label(RichText::new("none").color(color("#94A3B8")));
+    }
+    let rating_lines: Vec<String> = device.ratings.iter().map(|rating| {
+        format!("{}  {} V  {} A  {} kA  test X/R {}", rating.label, format_num(rating.voltage_v), format_num(rating.rating_a), format_num(rating.interrupting_ka), format_num(rating.test_xr))
+    }).collect();
+    show_capped(ui, &rating_lines, "ratings");
+}
+
+/// First rows of a long library list, plus a count of the rest.
+fn show_capped(ui: &mut egui::Ui, lines: &[String], noun: &str) {
+    const LIMIT: usize = 12;
+    for line in lines.iter().take(LIMIT) {
+        ui.label(RichText::new(format!("    {line}")).color(color("#94A3B8")));
+    }
+    if lines.len() > LIMIT {
+        ui.label(RichText::new(format!("    {} more {noun}", lines.len() - LIMIT)).color(color("#94A3B8")));
     }
 }
 

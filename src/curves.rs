@@ -106,7 +106,7 @@ pub fn point_curve_note(curve: &CurveSpec, amps: f64) -> Option<(bool, String)> 
     if *band_interpretation == BandInterpretation::Assumed {
         assumed = true;
         notes.push(if max_points.is_some() {
-            "The point curve's band interpretation is assumed: the slower band is taken as the maximum / total-clearing band.".to_string()
+            "The point curve's band interpretation is assumed. The slower band governs operating time and is not a total-clearing time unless the device is marked total clearing.".to_string()
         } else {
             "The point curve's interpretation (what its single band represents) is assumed.".to_string()
         });

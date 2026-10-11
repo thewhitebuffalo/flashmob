@@ -98,10 +98,15 @@ fn trip_settings_requested(request: &ApplyDevice) -> bool {
 
 fn apply_point_curve(device: &LibraryDevice, request: &ApplyDevice, unit_index: usize, unit: &TripUnit, function_index: usize, function: &Function) -> Result<Device, String> {
     let (scale, scale_note) = current_scale(function, unit, request.current_base_a)?;
-    let (points, max_points) = point_bands(device.id, function, scale)?;
+    let (points, max_points, split_vertical) = point_bands(device.id, function, scale)?;
     let mut unsupported_elements = unsupported(device, unit_index, function_index);
     if let Some(note) = scale_note {
         unsupported_elements.push(note);
+    }
+    // A repeated current with a shorter time is the vertical part of a curve,
+    // usually an instantaneous pickup. It is kept, not rejected.
+    if split_vertical {
+        unsupported_elements.push("a repeated current was split by the smallest step that keeps the band increasing, so a vertical segment stays on the curve".into());
     }
     // Checked 100 A curves (LPJ, LPS-RK, FRS-R, AJT, TRS): three of the five
     // slower bands are the +10% side of one curve (current ratio 1.10/0.90),
@@ -211,7 +216,7 @@ fn current_scale(function: &Function, unit: &TripUnit, current_base_a: Option<f6
     }
 }
 
-fn point_bands(device_id: u32, function: &Function, scale: f64) -> Result<(Vec<[f64; 2]>, Option<Vec<[f64; 2]>>), String> {
+fn point_bands(device_id: u32, function: &Function, scale: f64) -> Result<(Vec<[f64; 2]>, Option<Vec<[f64; 2]>>, bool), String> {
     let curves = &function.data.curves;
     match curves.len() {
         0 => return Err(format!("device {device_id}: point curve has no bands")),
@@ -219,15 +224,18 @@ fn point_bands(device_id: u32, function: &Function, scale: f64) -> Result<(Vec<[
         n => return Err(format!("device {device_id}: point curve has {n} bands")),
     }
     let mut bands = Vec::with_capacity(curves.len());
+    let mut split_vertical = false;
     for curve in curves {
-        let points = band_points(curve, scale)?;
-        // Do not sort. A band whose currents are not strictly increasing, or
-        // whose times increase, is rejected rather than repaired.
+        let (points, split) = band_points(curve, scale)?;
+        split_vertical |= split;
+        // Do not sort. A current that decreases, or a time that increases, is
+        // rejected rather than repaired. A repeated current is handled in
+        // `band_points` before this check.
         curves::check_point_curve(&points, None)?;
         bands.push(points);
     }
     if bands.len() == 1 {
-        return Ok((bands.remove(0), None));
+        return Ok((bands.remove(0), None, split_vertical));
     }
     let slow_first = first_is_slower(&bands[0], &bands[1])?;
     let (fast, slow) = if slow_first {
@@ -238,14 +246,16 @@ fn point_bands(device_id: u32, function: &Function, scale: f64) -> Result<(Vec<[
         (fast, bands.remove(0))
     };
     curves::check_point_curve(&fast, Some(&slow))?;
-    Ok((fast, Some(slow)))
+    Ok((fast, Some(slow), split_vertical))
 }
 
-fn band_points(curve: &PointCurve, scale: f64) -> Result<Vec<[f64; 2]>, String> {
+fn band_points(curve: &PointCurve, scale: f64) -> Result<(Vec<[f64; 2]>, bool), String> {
     if curve.current.len() != curve.time_s.len() {
         return Err(format!("curve has {} currents and {} times", curve.current.len(), curve.time_s.len()));
     }
-    let mut points = Vec::with_capacity(curve.current.len());
+    let mut points: Vec<[f64; 2]> = Vec::with_capacity(curve.current.len());
+    let mut prev_raw = f64::NEG_INFINITY;
+    let mut split_vertical = false;
     for (&current, &time_s) in curve.current.iter().zip(curve.time_s.iter()) {
         if !current.is_finite() || current <= 0.0 || !time_s.is_finite() || time_s <= 0.0 {
             return Err("curve current and time must be positive and finite".into());
@@ -254,9 +264,35 @@ fn band_points(curve: &PointCurve, scale: f64) -> Result<Vec<[f64; 2]>, String> 
         if !amps.is_finite() || amps <= 0.0 {
             return Err("scaled current must be positive and finite".into());
         }
-        points.push([amps, time_s]);
+        // An exact copy of the previous stored point adds nothing.
+        let repeated = amps == prev_raw;
+        if repeated {
+            if let Some(last) = points.last() {
+                if time_s == last[1] {
+                    continue;
+                }
+            }
+        }
+        prev_raw = amps;
+        let mut stored = amps;
+        if let Some(&[last_amps, last_time]) = points.last() {
+            if stored <= last_amps {
+                // Same source current, shorter time: a vertical segment.
+                // One step above the previous point keeps the top of that
+                // segment at the original current. A decrease, or a longer
+                // time, is left for the shape check to reject.
+                if repeated && time_s < last_time {
+                    stored = last_amps.next_up();
+                    if !(stored.is_finite() && stored > last_amps) {
+                        return Err("could not place a repeated current on the curve".into());
+                    }
+                    split_vertical = true;
+                }
+            }
+        }
+        points.push([stored, time_s]);
     }
-    Ok(points)
+    Ok((points, split_vertical))
 }
 
 /// True when band `a` is slower than `b` over their overlap.

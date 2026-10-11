@@ -126,9 +126,10 @@ enum Command {
         #[arg(long = "redact")]
         redact: Vec<String>,
     },
-    /// Search a Flashmob library JSON file. Prints matching devices as JSON.
+    /// Search the device library. Prints matching devices as JSON.
     /// The first argument is a library file when that path exists or ends in .json.
-    /// Otherwise the installed device library is searched.
+    /// Otherwise the library compiled into the program is searched.
+    /// FLASHMOB_LIBRARY names a different file.
     Library {
         /// Terms that must all appear in manufacturer, category, type, style, catalog, or reference.
         terms: Vec<String>,
@@ -139,7 +140,7 @@ enum Command {
     /// Copy a library point curve, relay dial curve, or trip setting onto a project device.
     /// Prints the device JSON, or the whole project when --project is set.
     ApplyLibrary {
-        /// Flashmob device-library JSON. Omit to use the installed library.
+        /// Flashmob device-library JSON. Omit to use the library compiled into the program.
         library: Option<PathBuf>,
         #[arg(long)]
         device_id: u32,

@@ -576,9 +576,9 @@ pub enum BandInterpretation {
     /// Entered from a source that states which band is which.
     #[default]
     Entered,
-    /// Which band is minimum and which is maximum / total clearing was
-    /// inferred (for example from a converted library). Results that use the
-    /// curve are marked assumed.
+    /// Which band is the faster band and which is the slower band was inferred.
+    /// The slower band governs operating time. It is not total clearing unless
+    /// the device is marked that way. Results that use the curve are marked assumed.
     Assumed,
 }
 

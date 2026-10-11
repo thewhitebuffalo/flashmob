@@ -158,7 +158,7 @@ Current on a TCC is referred to the chosen voltage, so a device on another windi
 
 Buses are entered in physical units: kV, ohms, kVA, and percent impedance. The system base defaults to 100 MVA.
 
-This is a study tool for building and checking a model. Manufacturer curves come from the installed device library (see [Device libraries](#device-libraries)). The built-in sample is an example plant, not a device catalog. Tests use small written libraries so each rule can be checked on its own. Flashmob does not ship ANSI C37.010 NACD multipliers, three-winding transformers, or DC systems.
+This is a study tool for building and checking a model. Manufacturer curves come from the device library compiled into the program (see [Device libraries](#device-libraries)). The built-in sample is an example plant, not a device catalog. Tests use small written libraries so each rule can be checked on its own. Flashmob does not ship ANSI C37.010 NACD multipliers, three-winding transformers, or DC systems.
 
 ## Device libraries
 
@@ -214,7 +214,7 @@ Without `--project` the command writes the device JSON only. `--name` overrides 
 
 Point curves:
 
-- `current_unit` `"A"` means the stored currents are already amperes. `current_base_a` with an ampere curve is an error. `current_unit` `"multiple"` is scaled to amperes by `current_base_a` when given, otherwise by the selected trip unit's rating. The scale is noted on the link (`current scale 100 A`). Any other or missing current unit is an error. A non-finite or non-positive current or time is an error; points are not dropped or reordered to make a band valid.
+- `current_unit` `"A"` means the stored currents are already amperes. `current_base_a` with an ampere curve is an error. `current_unit` `"multiple"` is scaled to amperes by `current_base_a` when given, otherwise by the selected trip unit's rating. The scale is noted on the link (`current scale 100 A`). Any other or missing current unit is an error. A non-finite or non-positive current or time is an error. Points are not reordered. A current that decreases, or a time that increases, is an error. An exact duplicate point is dropped. A repeated current with a shorter time is a vertical segment: the later point is moved up by the smallest step that keeps the current increasing, the original current keeps the longer time, and the link notes the split.
 - No point curve, or more than two bands, is an error. The band count is reported; three or more are not guessed.
 - One band is stored as `points` with no `max_points`.
 - Two bands are ordered by time. The faster band is `points` and the slower is `max_points`. Faster means the smaller time at the geometric-mean current of the overlapping range, using the same log(current)–log(time) interpolation as an entered point curve. Ranges that do not overlap, or bands that cross, are an error. Unless `--fuse-total-clearing` is set, the link notes that the slower band is not marked total clearing.

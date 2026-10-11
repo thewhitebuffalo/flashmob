@@ -274,6 +274,46 @@ fn band_order_is_not_repaired() {
 }
 
 #[test]
+fn a_repeated_current_keeps_the_vertical_segment() {
+    let device = apply_one("LV Breaker", curve_fn("TM", "point_curve", "A", &[
+        (&[100.0, 500.0, 500.0, 500.0, 5000.0], &[10.0, 0.5, 0.5, 0.016, 0.016]),
+    ])).unwrap();
+    let (points, max_points, _, _) = points_of(&device);
+    assert!(max_points.is_none());
+    assert_eq!(points.len(), 4, "{points:?}");
+    assert_eq!(points[0], [100.0, 10.0]);
+    assert_eq!(points[1], [500.0, 0.5]);
+    assert!(points[2][0] > 500.0 && points[2][0] < 500.0 + 1e-9, "{points:?}");
+    assert_eq!(points[2][1], 0.016);
+    assert_eq!(points[3], [5000.0, 0.016]);
+    assert_eq!(curves::point_time(points, 500.0), PointTime::Within(0.5));
+    match curves::point_time(points, 501.0) {
+        PointTime::Within(time) => assert!((time - 0.016).abs() < 1e-12, "{time}"),
+        other => panic!("expected a time at 501 A, got {other:?}"),
+    }
+    let note = device.library.unwrap().unsupported_elements.join(" ");
+    assert!(note.contains("vertical segment"), "{note}");
+}
+
+#[test]
+fn a_repeated_current_on_both_bands_still_orders_them() {
+    let device = apply_one("LV Breaker", curve_fn("TM", "point_curve_bands", "A", &[
+        (&[100.0, 500.0, 500.0], &[1.0, 0.2, 0.01]),
+        (&[100.0, 500.0, 500.0], &[8.0, 0.5, 0.02]),
+    ])).unwrap();
+    let (points, max_points, _, interpretation) = points_of(&device);
+    assert_eq!(interpretation, BandInterpretation::Assumed);
+    assert_eq!(points[0], [100.0, 1.0]);
+    assert_eq!(points[1], [500.0, 0.2]);
+    assert_eq!(points[2][1], 0.01);
+    let slow = max_points.as_ref().unwrap();
+    assert_eq!(slow[0], [100.0, 8.0]);
+    assert_eq!(slow[1], [500.0, 0.5]);
+    assert_eq!(slow[2][1], 0.02);
+    assert!(slow[2][0] > 500.0);
+}
+
+#[test]
 fn function_name_selects_the_only_matching_curve() {
     let device = sample_device("LV Fuse", vec![unit(100.0, vec![
         curve_fn("Melt", "point_curve", "A", &[(&[100.0, 1000.0], &[1.0, 0.1])]),
