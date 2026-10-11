@@ -314,6 +314,67 @@ pub fn require_installed_library() -> Result<PathBuf, String> {
     }
 }
 
+/// Name stored on a device when the curve came from the library built into the program.
+pub const BUNDLED_LIBRARY_NAME: &str = "library/device-library.json";
+
+/// Bytes of the device library compiled into this build.
+pub fn bundled_library_bytes() -> Option<&'static [u8]> {
+    #[cfg(feature = "bundle-library")]
+    {
+        Some(include_bytes!("../library/device-library.json"))
+    }
+    #[cfg(not(feature = "bundle-library"))]
+    {
+        None
+    }
+}
+
+pub fn library_from_bytes(bytes: &[u8]) -> Result<Library, String> {
+    let text = std::str::from_utf8(bytes).map_err(|err| format!("device library is not utf-8: {err}"))?;
+    Library::from_json(text)
+}
+
+pub fn library_from_path(path: &Path) -> Result<Library, String> {
+    let text = std::fs::read_to_string(path).map_err(|err| format!("could not read {}: {err}", path.display()))?;
+    Library::from_json(&text)
+}
+
+/// Display name of the library `open_default_library` would open.
+pub fn default_library_name() -> String {
+    if let Some(env) = std::env::var_os("FLASHMOB_LIBRARY") {
+        if !env.is_empty() {
+            return PathBuf::from(env).display().to_string();
+        }
+    }
+    if bundled_library_bytes().is_some() {
+        return BUNDLED_LIBRARY_NAME.to_string();
+    }
+    installed_library_path().map(|path| path.display().to_string()).unwrap_or_default()
+}
+
+/// `FLASHMOB_LIBRARY` when it is set, otherwise the library compiled into the
+/// program, otherwise a device-library file already on disk.
+pub fn open_default_library() -> Result<(Library, String), String> {
+    if let Some(env) = std::env::var_os("FLASHMOB_LIBRARY") {
+        if !env.is_empty() {
+            let path = PathBuf::from(&env);
+            if !path.is_file() {
+                return Err(format!("could not read {}: not a file", path.display()));
+            }
+            let name = path.display().to_string();
+            return Ok((library_from_path(&path)?, name));
+        }
+    }
+    if let Some(bytes) = bundled_library_bytes() {
+        return Ok((library_from_bytes(bytes)?, BUNDLED_LIBRARY_NAME.to_string()));
+    }
+    if let Some(path) = installed_library_path() {
+        let name = path.display().to_string();
+        return Ok((library_from_path(&path)?, name));
+    }
+    Err("no device library. Pass a library JSON path, or set FLASHMOB_LIBRARY.".into())
+}
+
 /// `explicit` when it is a file. Otherwise the installed library.
 pub fn require_library_file(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
     match explicit {

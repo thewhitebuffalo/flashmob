@@ -9,8 +9,10 @@ license = "MIT"
 readme = "README.md"
 
 [features]
-default = ["gui"]
+default = ["gui", "bundle-library"]
 gui = ["dep:eframe", "dep:rfd"]
+# The device library JSON is compiled into the program.
+bundle-library = []
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

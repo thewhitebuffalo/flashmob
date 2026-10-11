@@ -164,7 +164,7 @@ This is a study tool for building and checking a model. Manufacturer curves come
 
 `flashmob import-library` converts a binary manufacturer device library into Flashmob's library JSON (`format: "flashmob-device-library"`, `version: 1`). `flashmob library` searches a library file.
 
-The installed library is `~/Library/Application Support/flashmob/device-library.json` on macOS, and `~/.local/share/flashmob/device-library.json` elsewhere. `FLASHMOB_LIBRARY` overrides that path. `./device-library.json` is used when the installed file is absent. The Library button loads this file. `flashmob library` and `flashmob apply-library` use it when you do not pass a path. The converted file stays on the machine that built it. It is not part of the git repository. A study still stores only the curve copied onto a device.
+The device library ships in `library/device-library.json` and is compiled into the program. Each device keeps its manufacturer, type, style, and catalog number. The Library button loads this library. `flashmob library` and `flashmob apply-library` use it when you do not pass a path. `FLASHMOB_LIBRARY` names a different file. A study still stores only the curve copied onto a device.
 
 ```bash
 flashmob import-library devices.lib -o device-library.json --compact

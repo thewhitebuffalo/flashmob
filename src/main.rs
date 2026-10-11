@@ -316,24 +316,19 @@ fn main() -> ExitCode {
         },
         Command::ImportLibrary { input, output, compact, force, redact } => import_library(&input, &output, compact, force, &redact),
         Command::Library { terms, limit } => {
-            let (path, terms) = match resolve_library_search(terms) {
+            let (library, label, terms) = match resolve_library_search(terms) {
                 Ok(split) => split,
                 Err(err) => return fail(&err),
             };
-            let library = match std::fs::read_to_string(&path).map_err(|err| format!("could not read {}: {err}", path.display()))
-                .and_then(|text| flashmob::library::Library::from_json(&text)) {
-                Ok(library) => library,
-                Err(err) => return fail(&err),
-            };
             let found = library.search(&terms);
-            emit(&serde_json::json!({"ok": true, "library": path.display().to_string(), "matches": found.len(), "devices": found.into_iter().take(limit).collect::<Vec<_>>()}), false)
+            emit(&serde_json::json!({"ok": true, "library": label, "matches": found.len(), "devices": found.into_iter().take(limit).collect::<Vec<_>>()}), false)
         }
         Command::ApplyLibrary { library, device_id, id, bus, name, rating_a, current_base_a, voltage_v, function_name, protected_branch, library_name, fuse_total_clearing, dial, ct_ratio, tap_a, sensor_a, lt_pickup_function, lt_pickup_label, lt_delay_function, lt_delay_label, lt_delay_multiple, st_pickup_function, st_pickup_label, st_delay_function, st_delay_label, inst_function, inst_label, inst_s, pickup_base, project, output } => {
-            let library = match flashmob::library::require_library_file(library) {
-                Ok(path) => path,
-                Err(err) => return fail(&err),
+            let library_path = match &library {
+                Some(path) if path.is_file() => path.display().to_string(),
+                Some(path) => return fail(&format!("could not read {}: not a file", path.display())),
+                None => String::new(),
             };
-            let library_path = library.display().to_string();
             let paired = |function: &Option<String>, label: &Option<String>, name: &str| {
                 flashmob::library_apply::setting_ref(function, label, name)
             };
@@ -352,7 +347,13 @@ fn main() -> ExitCode {
                 current_base_a,
                 voltage_v,
                 function_name,
-                library_name: if library_name.is_empty() { library_path.clone() } else { library_name },
+                library_name: if !library_name.is_empty() {
+                    library_name
+                } else if !library_path.is_empty() {
+                    library_path.clone()
+                } else {
+                    flashmob::library::default_library_name()
+                },
                 fuse_total_clearing,
                 dial,
                 ct_ratio,
@@ -369,29 +370,29 @@ fn main() -> ExitCode {
             };
             match project {
                 Some(project) => apply_library_project(&project, &library_path, &request, output.as_deref()),
-                None => apply_library_device(&library, &request, output.as_deref()),
+                None => apply_library_device(&library_path, &request, output.as_deref()),
             }
         }
     }
 }
 
-fn resolve_library_search(terms: Vec<String>) -> Result<(PathBuf, Vec<String>), String> {
+fn resolve_library_search(terms: Vec<String>) -> Result<(flashmob::library::Library, String, Vec<String>), String> {
     let explicit = terms.first().is_some_and(|first| {
         let path = PathBuf::from(first);
         let looks_like_path = first.ends_with(".json") || first.contains('/') || first.contains('\\');
         path.is_file() || looks_like_path
     });
-    let installed = if explicit {
-        None
-    } else {
-        Some(flashmob::library::require_installed_library()?)
-    };
-    flashmob::library::split_library_search(&terms, installed.as_deref())
+    if explicit {
+        let (path, terms) = flashmob::library::split_library_search(&terms, None)?;
+        let library = flashmob::library::library_from_path(&path)?;
+        return Ok((library, path.display().to_string(), terms));
+    }
+    let (library, name) = flashmob::library::open_default_library()?;
+    Ok((library, name, terms))
 }
 
-fn apply_library_device(library_path: &std::path::Path, request: &flashmob::library::ApplyDevice, output: Option<&std::path::Path>) -> ExitCode {
-    let device = match std::fs::read_to_string(library_path).map_err(|err| format!("could not read {}: {err}", library_path.display()))
-        .and_then(|text| flashmob::library::Library::from_json(&text))
+fn apply_library_device(library_path: &str, request: &flashmob::library::ApplyDevice, output: Option<&std::path::Path>) -> ExitCode {
+    let device = match load_apply_library(library_path)
         .and_then(|library| flashmob::library::apply_device(&library, request)) {
         Ok(device) => device,
         Err(err) => return fail(&err),
@@ -399,6 +400,14 @@ fn apply_library_device(library_path: &std::path::Path, request: &flashmob::libr
     match serde_json::to_value(&device) {
         Ok(value) => write_json(output, &value, false),
         Err(err) => fail(&err.to_string()),
+    }
+}
+
+fn load_apply_library(library_path: &str) -> Result<flashmob::library::Library, String> {
+    if library_path.is_empty() {
+        Ok(flashmob::library::open_default_library()?.0)
+    } else {
+        flashmob::library::library_from_path(std::path::Path::new(library_path))
     }
 }
 

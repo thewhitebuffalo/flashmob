@@ -867,8 +867,8 @@ impl App {
         if self.library.is_some() {
             return;
         }
-        match flashmob::library::require_installed_library() {
-            Ok(path) => self.load_library_file(&path),
+        match flashmob::library::open_default_library() {
+            Ok((library, name)) => self.store_library(library, name),
             Err(err) => self.library_error = err,
         }
     }
@@ -880,19 +880,21 @@ impl App {
 
     fn load_library_file(&mut self, path: &std::path::Path) {
         match std::fs::read_to_string(path).map_err(|err| err.to_string()).and_then(|text| Library::from_json(&text)) {
-            Ok(library) => {
-                let count = library.devices.len();
-                self.library_path = path.display().to_string();
-                self.library = Some(library);
-                self.library_selected = None;
-                self.library_hits.clear();
-                self.library_hits_for = "\u{1}".into();
-                self.library_error.clear();
-                self.status = format!("Opened library, {count} devices. {}", path.display());
-            }
+            Ok(library) => self.store_library(library, path.display().to_string()),
             // A bad file stays in this window. The open project is left as it is.
             Err(err) => self.library_error = format!("Could not open {}: {err}", path.display()),
         }
+    }
+
+    fn store_library(&mut self, library: Library, name: String) {
+        let count = library.devices.len();
+        self.library_path = name;
+        self.library = Some(library);
+        self.library_selected = None;
+        self.library_hits.clear();
+        self.library_hits_for = "\u{1}".into();
+        self.library_error.clear();
+        self.status = format!("Opened library, {count} devices. {}", self.library_path);
     }
 
     fn library_matches(&mut self, ui: &mut egui::Ui) {
