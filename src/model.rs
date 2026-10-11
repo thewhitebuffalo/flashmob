@@ -524,19 +524,23 @@ pub struct Device {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interrupting: Option<InterruptingRating>,
     /// Manufacturer current-limiting let-through. Used only when the device
-    /// terminal current is at or above `threshold_a`. Annex H is not applied.
+    /// terminal current is at or above `threshold_a`. Annex H incident-energy
+    /// equations are not applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_limiting: Option<CurrentLimiting>,
 }
 
-/// Peak let-through threshold and the manufacturer's clearing data above it.
-/// IEEE 1584-2018 Clause 6.9.2.
+/// Peak let-through threshold and the clearing time above it.
+/// IEEE 1584-2018 Clause 6.9.2, or the 60 Hz half-cycle / quarter-cycle table.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CurrentLimiting {
     /// Device terminal current, in amperes, at which the fuse is current limiting.
+    /// For the cycle table this is the current where the total-clearing curve
+    /// crosses 0.01 s, or the manufacturer's stated threshold.
     pub threshold_a: f64,
     /// Manufacturer total clearing time in the current-limiting region.
+    /// Used when `cycle_table` is false. Zero is accepted only with the cycle table.
     pub clearing_s: f64,
     /// Manufacturer effective arc current, in kA. When this fuse is the only
     /// source still feeding the arc, this current replaces the calculated
@@ -544,6 +548,10 @@ pub struct CurrentLimiting {
     /// means the clearing time is used and the calculated arc current is kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_arc_ka: Option<f64>,
+    /// When true, duration at or above `threshold_a` follows the 60 Hz
+    /// half-cycle / quarter-cycle table instead of `clearing_s`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cycle_table: bool,
 }
 
 /// Symmetrical interrupting rating proved at one test X/R and voltage.
@@ -1396,7 +1404,12 @@ impl Project {
                     && rating.voltage_v.is_finite() && rating.voltage_v >= 0.0, &d.id, "interrupting rating");
             }
             if let Some(limit) = &d.current_limiting {
-                check(positive(limit.threshold_a) && positive(limit.clearing_s)
+                let clearing_ok = if limit.cycle_table {
+                    limit.clearing_s == 0.0 || positive(limit.clearing_s)
+                } else {
+                    positive(limit.clearing_s)
+                };
+                check(positive(limit.threshold_a) && clearing_ok
                     && limit.effective_arc_ka.map_or(true, positive), &d.id, "current-limiting let-through");
             }
             if let Some(id) = &d.protected_branch {
@@ -1612,6 +1625,25 @@ mod tests {
         assert!(!active.sources[0].in_service && active.sources[1].in_service);
         project.operating_cases[0].source_states.remove(0);
         assert!(project.validate().iter().any(|error| error.contains("conflicting voltage setpoints")));
+    }
+
+    #[test]
+    fn cycle_table_defaults_off_and_allows_a_zero_manufacturer_time() {
+        let parsed: CurrentLimiting = serde_json::from_str(r#"{"threshold_a":1000,"clearing_s":0.02}"#).unwrap();
+        assert!(!parsed.cycle_table);
+        let mut project = Project::sample();
+        project.devices[0].current_limiting = Some(CurrentLimiting {
+            threshold_a: 1000.0, clearing_s: 0.0, effective_arc_ka: None, cycle_table: false,
+        });
+        assert!(project.validate().iter().any(|error| error.contains("current-limiting let-through")));
+        project.devices[0].current_limiting = Some(CurrentLimiting {
+            threshold_a: 1000.0, clearing_s: 0.0, effective_arc_ka: None, cycle_table: true,
+        });
+        assert!(project.validate().is_empty(), "{:?}", project.validate());
+        let text = serde_json::to_string(&project.devices[0].current_limiting).unwrap();
+        assert!(text.contains("cycle_table"), "{text}");
+        project.devices[0].current_limiting.as_mut().unwrap().clearing_s = -0.01;
+        assert!(project.validate().iter().any(|error| error.contains("current-limiting let-through")));
     }
 }
 

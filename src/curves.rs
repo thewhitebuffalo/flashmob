@@ -140,6 +140,24 @@ pub fn point_curve_note(curve: &CurveSpec, amps: f64) -> Option<(bool, String)> 
     (!notes.is_empty()).then(|| (assumed, notes.join(" ")))
 }
 
+/// Governing-band time when that time is plotted strictly below 0.01 s.
+/// A held tail whose last plotted time is 0.01 s or longer is not included.
+/// An unavailable tail is not a plotted time.
+pub fn time_drawn_below_bottom(curve: &CurveSpec, amps: f64) -> Option<f64> {
+    if !amps.is_finite() || amps <= 0.0 {
+        return None;
+    }
+    let below = |time: f64| (time.is_finite() && time > 0.0 && time < FUSE_CURVE_BOTTOM_S - 1e-12).then_some(time);
+    match curve {
+        CurveSpec::Points { points, max_points, beyond_last, .. } => match point_time(governing_band(points, max_points), amps) {
+            PointTime::Within(time) => below(time),
+            PointTime::Beyond { last_s, .. } if *beyond_last == PointTail::HoldLastTime => below(last_s),
+            _ => None,
+        },
+        other => trip_time(other, amps).and_then(below),
+    }
+}
+
 /// Relay/element operating time, not breaker total clearing. None means unavailable or no operation.
 pub fn trip_time(curve: &CurveSpec, amps: f64) -> Option<f64> {
     if !amps.is_finite() || amps <= 0.0 {
@@ -1085,5 +1103,29 @@ mod point_curve_tests {
         assert!(serde_json::from_str::<CurveSpec>(r#"{"type":"points","points":[[100,1],[200,0.5]],"beyond_last":"hold_last_time","scale":2}"#).is_err());
         let text = serde_json::to_string(&c).unwrap();
         assert!(!text.contains("max_points"), "{text}");
+    }
+
+    #[test]
+    fn time_below_the_fuse_bottom_excludes_a_held_tenth_of_a_second() {
+        let drawn = CurveSpec::Points {
+            points: vec![[100.0, 1.0], [10_000.0, 0.005]],
+            max_points: None,
+            beyond_last: PointTail::Unavailable,
+            band_interpretation: BandInterpretation::Entered,
+        };
+        assert_eq!(time_drawn_below_bottom(&drawn, 10_000.0), Some(0.005));
+        assert_eq!(time_drawn_below_bottom(&drawn, 50.0), None);
+        let bottom = curve(false, PointTail::HoldLastTime);
+        assert_eq!(time_drawn_below_bottom(&bottom, 10_000.0), None);
+        assert_eq!(time_drawn_below_bottom(&bottom, 50_000.0), None);
+        let held_fast = CurveSpec::Points {
+            points: vec![[100.0, 1.0], [1_000.0, 0.004]],
+            max_points: None,
+            beyond_last: PointTail::HoldLastTime,
+            band_interpretation: BandInterpretation::Entered,
+        };
+        assert_eq!(time_drawn_below_bottom(&held_fast, 5_000.0), Some(0.004));
+        assert_eq!(time_drawn_below_bottom(&CurveSpec::Definite { pickup_a: 1.0, time_s: 0.008 }, 100.0), Some(0.008));
+        assert_eq!(time_drawn_below_bottom(&CurveSpec::Definite { pickup_a: 1.0, time_s: 0.01 }, 100.0), None);
     }
 }

@@ -630,7 +630,7 @@ fn evaluate_equipment(project: &Project, loadflow: Option<&LoadflowResult>, faul
     let mut full_clear = full_clear;
     let mut min_clear = min_clear;
     if limiting && !decrement_source_ids.is_empty() {
-        let extra = " Source decrement was not applied because the manufacturer current-limiting time is used.";
+        let extra = " Source decrement was not applied because the current-limiting let-through time is used.";
         full_clear.note.push_str(extra);
         min_clear.note.push_str(extra);
     }
@@ -1291,7 +1291,15 @@ fn device_exposure(device: &Device, amps: f64, sole_feed: bool) -> Result<Device
     let what_at = |kind: &str| format!("{kind} of {} at {amps:.0} A through its protected terminal (network terminal current; loadflow prefault includes initial branch flow)", device.name);
     if let Some(limit) = &device.current_limiting {
         if amps >= limit.threshold_a {
-            let mut extra = format!(" Manufacturer current-limiting clearing time is used at {amps:.0} A, at or above the {:.0} A peak let-through threshold (IEEE 1584-2018 Clause 6.9.2).", limit.threshold_a);
+            let (seconds, assumed, mut extra) = if limit.cycle_table {
+                let_through_table(device, limit, amps)
+            } else {
+                (
+                    limit.clearing_s,
+                    false,
+                    format!(" Manufacturer current-limiting clearing time is used at {amps:.0} A, at or above the {:.0} A peak let-through threshold (IEEE 1584-2018 Clause 6.9.2).", limit.threshold_a),
+                )
+            };
             let effective = if sole_feed {
                 if limit.effective_arc_ka.is_some() {
                     extra.push_str(" Manufacturer effective arc current replaces the calculated arcing current for this sole feed. The variation factor is not applied again.");
@@ -1306,12 +1314,13 @@ fn device_exposure(device: &Device, amps: f64, sole_feed: bool) -> Result<Device
                 extra.push_str(" No manufacturer effective arc current was entered, so the calculated arcing current is kept.");
                 None
             };
+            let kind = if limit.cycle_table { "current-limiting let-through time" } else { "manufacturer current-limiting clearing time" };
             return Ok(DeviceExposure {
-                seconds: limit.clearing_s,
-                assumed: false,
+                seconds,
+                assumed,
                 extra,
                 effective_arc_ka: effective,
-                what: what_at("manufacturer current-limiting clearing time"),
+                what: what_at(kind),
             });
         }
     }
@@ -1354,6 +1363,51 @@ fn device_exposure(device: &Device, amps: f64, sole_feed: bool) -> Result<Device
         effective_arc_ka: None,
         what: what_at("total clearing time"),
     })
+}
+
+/// 60 Hz half-cycle and quarter-cycle durations. The model has no frequency field.
+const HALF_CYCLE_S: f64 = 1.0 / 120.0;
+const QUARTER_CYCLE_S: f64 = 1.0 / 240.0;
+
+/// Duration from the half-cycle / quarter-cycle let-through table.
+///
+/// From `threshold_a` up to twice that current the time is one half-cycle.
+/// At or above twice the threshold the time is one quarter-cycle. A stored
+/// total-clearing time already faster than one half-cycle and drawn below
+/// 0.01 s is kept. A melting time is not kept. Annex H incident-energy
+/// equations are not applied.
+fn let_through_table(device: &Device, limit: &crate::model::CurrentLimiting, amps: f64) -> (f64, bool, String) {
+    let twice = 2.0 * limit.threshold_a;
+    let annex = " Annex H incident-energy equations are not applied. Energy uses the IEEE 1584-2018 model at this duration.";
+    let ignored = if limit.clearing_s > 0.0 {
+        " The entered manufacturer clearing time is not used."
+    } else {
+        ""
+    };
+    if device.curve_includes_clearing() {
+        if let Some(stored) = curves::time_drawn_below_bottom(&device.curve, amps) {
+            if stored < HALF_CYCLE_S {
+                let mut assumed = false;
+                let mut extra = format!(
+                    " Current-limiting let-through at {amps:.0} A is at or above the {:.0} A threshold. The stored total-clearing time {stored:.6} s is already faster than one half-cycle and is drawn below 0.01 s, so that time is kept. The half-cycle and quarter-cycle table is not used.{ignored}{annex}",
+                    limit.threshold_a
+                );
+                if let Some((band_assumed, note)) = curves::point_curve_note(&device.curve, amps) {
+                    assumed |= band_assumed;
+                    extra.push(' ');
+                    extra.push_str(&note);
+                }
+                return (stored, assumed, extra);
+            }
+        }
+    }
+    let (seconds, band) = if amps < twice {
+        (HALF_CYCLE_S, format!("from the {:.0} A threshold up to {twice:.0} A. The 60 Hz half-cycle time {HALF_CYCLE_S:.6} s is used.", limit.threshold_a))
+    } else {
+        (QUARTER_CYCLE_S, format!("at or above {twice:.0} A, twice the {:.0} A threshold. The 60 Hz quarter-cycle time {QUARTER_CYCLE_S:.6} s is used.", limit.threshold_a))
+    };
+    let extra = format!(" Current-limiting let-through at {amps:.0} A is {band} Clause 6.9.2 is not applied in this range.{ignored}{annex}");
+    (seconds, true, extra)
 }
 
 fn device_clearing(project: &Project, device: &Device, amps: f64, sole_feed: bool) -> Result<Clearing, String> {
@@ -2280,7 +2334,7 @@ mod audit_regression {
         p.equipment.truncate(1);
         p.devices[0].curve = CurveSpec::Definite { pickup_a: 1.0, time_s: 0.5 };
         p.devices[0].breaker_interrupting_s = Some(0.05);
-        p.devices[0].current_limiting = Some(CurrentLimiting { threshold_a: 1.0, clearing_s: 0.02, effective_arc_ka: Some(8.0) });
+        p.devices[0].current_limiting = Some(CurrentLimiting { threshold_a: 1.0, clearing_s: 0.02, effective_arc_ka: Some(8.0), cycle_table: false });
         let limited_out = run(&p, arc_only()).unwrap();
         let limited = row(&limited_out, "af-mcc");
         assert!((limited.time_s - 0.02).abs() < 1e-12 && (limited.time_min_s - 0.02).abs() < 1e-12);
@@ -2300,6 +2354,100 @@ mod audit_regression {
         let curve = row(&curve_out, "af-mcc");
         assert!((curve.time_s - 0.55).abs() < 1e-12, "{}", curve.time_s);
         assert!((curve.arcing_ka - 8.0).abs() > 1.0);
+    }
+
+    fn limiting_device(threshold_a: f64, cycle_table: bool) -> crate::model::Device {
+        let mut device = Project::sample().devices.into_iter().next().unwrap();
+        device.curve = CurveSpec::Definite { pickup_a: 1.0, time_s: 0.5 };
+        device.breaker_interrupting_s = Some(0.05);
+        device.curve_is_total_clearing = false;
+        device.fuse_total_clearing = false;
+        device.current_limiting = Some(CurrentLimiting {
+            threshold_a, clearing_s: 0.2, effective_arc_ka: None, cycle_table,
+        });
+        device
+    }
+
+    #[test]
+    fn cycle_table_splits_half_cycle_and_quarter_cycle_at_twice_the_threshold() {
+        let device = limiting_device(10_000.0, true);
+        let half = device_exposure(&device, 10_000.0, true).unwrap();
+        assert!((half.seconds - 1.0 / 120.0).abs() < 1e-12, "{}", half.seconds);
+        assert!(half.assumed);
+        assert!(half.extra.contains("half-cycle") && half.extra.contains("0.008333"), "{}", half.extra);
+        assert!(half.extra.contains("Clause 6.9.2 is not applied") && half.extra.contains("Annex H"), "{}", half.extra);
+        assert!(half.extra.contains("manufacturer clearing time is not used"), "{}", half.extra);
+        let quarter = device_exposure(&device, 20_000.0, true).unwrap();
+        assert!((quarter.seconds - 1.0 / 240.0).abs() < 1e-12, "{}", quarter.seconds);
+        assert!(quarter.extra.contains("quarter-cycle") && quarter.extra.contains("0.004167"), "{}", quarter.extra);
+        let below = device_exposure(&device, 9_999.0, true).unwrap();
+        assert!((below.seconds - 0.55).abs() < 1e-12, "{}", below.seconds);
+        assert!(!below.extra.contains("half-cycle"), "{}", below.extra);
+    }
+
+    #[test]
+    fn stored_total_clearing_faster_than_a_half_cycle_is_kept() {
+        let mut device = limiting_device(10_000.0, true);
+        device.breaker_interrupting_s = None;
+        device.fuse_total_clearing = true;
+        device.curve = CurveSpec::Points {
+            points: vec![[100.0, 0.005], [100_000.0, 0.005]],
+            max_points: None,
+            beyond_last: crate::model::PointTail::Unavailable,
+            band_interpretation: crate::model::BandInterpretation::Entered,
+        };
+        let kept = device_exposure(&device, 25_000.0, true).unwrap();
+        assert!((kept.seconds - 0.005).abs() < 1e-12, "{}", kept.seconds);
+        assert!(kept.extra.contains("stored total-clearing time") && kept.extra.contains("is kept"), "{}", kept.extra);
+        assert!(!kept.extra.contains("quarter-cycle time"), "{}", kept.extra);
+
+        device.fuse_total_clearing = false;
+        device.breaker_interrupting_s = Some(0.05);
+        let table = device_exposure(&device, 25_000.0, true).unwrap();
+        assert!((table.seconds - 1.0 / 240.0).abs() < 1e-12, "{}", table.seconds);
+
+        device.fuse_total_clearing = true;
+        device.breaker_interrupting_s = None;
+        device.curve = CurveSpec::Points {
+            points: vec![[100.0, 1.0], [1_000.0, 0.01]],
+            max_points: None,
+            beyond_last: crate::model::PointTail::HoldLastTime,
+            band_interpretation: crate::model::BandInterpretation::Entered,
+        };
+        let held = device_exposure(&device, 25_000.0, true).unwrap();
+        assert!((held.seconds - 1.0 / 240.0).abs() < 1e-12, "{}", held.seconds);
+        assert!(held.extra.contains("quarter-cycle"), "{}", held.extra);
+    }
+
+    #[test]
+    fn cycle_table_sets_sample_energy_and_skips_source_decrement() {
+        let mut p = Project::sample();
+        p.motors.clear();
+        p.equipment.truncate(1);
+        p.devices[0].curve = CurveSpec::Definite { pickup_a: 1.0, time_s: 0.5 };
+        p.devices[0].breaker_interrupting_s = Some(0.05);
+        p.devices[0].current_limiting = Some(CurrentLimiting {
+            threshold_a: 1.0, clearing_s: 0.2, effective_arc_ka: Some(8.0), cycle_table: true,
+        });
+        p.sources[0].decrement_curve = vec![
+            DecrementPoint { time_s: 0.0, current_ratio: 1.0 },
+            DecrementPoint { time_s: 0.2, current_ratio: 0.5 },
+        ];
+        let out = run(&p, arc_only()).unwrap();
+        let limited = row(&out, "af-mcc");
+        assert!((limited.time_s - 1.0 / 240.0).abs() < 1e-12 && (limited.time_min_s - 1.0 / 240.0).abs() < 1e-12);
+        assert!((limited.arcing_ka - 8.0).abs() < 1e-9 && (limited.arcing_min_ka - 8.0).abs() < 1e-9);
+        assert!(limited.assumed && !limited.decrement_applied);
+        assert!(limited.duration_note.contains("quarter-cycle") && limited.duration_note.contains("Annex H"), "{}", limited.duration_note);
+        assert!(limited.duration_note.contains("was not applied") && limited.duration_note.contains("variation factor"), "{}", limited.duration_note);
+        let expected = arcflash::calculate(&IeeeInput {
+            voc_kv: 0.48, ibf_ka: limited.bolted_ka, gap_mm: p.equipment[0].gap_mm,
+            distance_mm: p.equipment[0].distance_mm, height_mm: p.equipment[0].height_mm,
+            width_mm: p.equipment[0].width_mm, depth_mm: p.equipment[0].depth_mm,
+            electrode: p.equipment[0].electrode, time_s: 1.0 / 240.0, time_min_s: 1.0 / 240.0,
+            arc_ka_override: Some(8.0), arc_min_ka_override: Some(8.0),
+        }).unwrap();
+        assert!((limited.governing_cal_cm2 - expected.governing_cal_cm2).abs() < 1e-9);
     }
 
     #[test]
