@@ -572,6 +572,11 @@ pub struct InterruptingRating {
     /// stay on the half-cycle comparison alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contact_parting_cycles: Option<f64>,
+    /// Voltage range factor K. None means 1. Closing and latching capability
+    /// above 1 kV is 1.6 times K times `symmetrical_ka`. Enter the rated
+    /// short-circuit current in `symmetrical_ka`; do not also premultiply by K.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voltage_range_factor: Option<f64>,
 }
 
 impl Device {
@@ -1415,6 +1420,7 @@ impl Project {
             if let Some(rating) = &d.interrupting {
                 check(positive(rating.symmetrical_ka) && positive(rating.test_xr)
                     && rating.voltage_v.is_finite() && rating.voltage_v >= 0.0, &d.id, "interrupting rating");
+                check(rating.voltage_range_factor.map_or(true, |k| k.is_finite() && k >= 1.0), &d.id, "voltage range factor");
             }
             if let Some(limit) = &d.current_limiting {
                 let clearing_ok = if limit.cycle_table {

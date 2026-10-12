@@ -68,7 +68,8 @@ fn interrupting_duty_csv(project: &Project) -> (String, String) {
     let header = [
         "Id", "Name", "Kind", "Fault", "Bus", "SymmetricalKA", "SystemXR", "HalfCycleRmsKA",
         "RatedSymmetricalKA", "TestXR", "RatedHalfCycleRmsKA", "AdjustedSymmetricalKA", "Status",
-        "ContactPartingCycles", "RemoteMultiplyingFactor", "MultipliedSymmetricalKA", "NACD", "RemoteStatus", "Note",
+        "ContactPartingCycles", "RemoteMultiplyingFactor", "MultipliedSymmetricalKA", "NACD", "RemoteStatus",
+        "CloseLatchKA", "CloseLatchCapabilityKA", "VoltageRangeFactor", "CloseLatchStatus", "Note",
     ];
     let mut body = csv_line(&header);
     let optional = |value: Option<f64>| value.map(fmt).unwrap_or_default();
@@ -94,6 +95,10 @@ fn interrupting_duty_csv(project: &Project) -> (String, String) {
                     &optional(row.multiplied_symmetrical_ka),
                     &optional(row.nacd),
                     row.remote_status.as_deref().unwrap_or(""),
+                    &optional(row.close_latch_ka),
+                    &optional(row.close_latch_capability_ka),
+                    &optional(row.voltage_range_factor),
+                    row.close_latch_status.as_deref().unwrap_or(""),
                     &row.note,
                 ]));
             }
@@ -507,6 +512,7 @@ fn xml(project: &Project, names: &Names) -> String {
                 ("InterruptingTestXR", "", device.interrupting.as_ref().map(|rating| fmt(rating.test_xr)).unwrap_or_default()),
                 ("InterruptingVoltageV", "V", device.interrupting.as_ref().map(|rating| fmt(rating.voltage_v)).unwrap_or_default()),
                 ("ContactPartingCycles", "cycles", device.interrupting.as_ref().and_then(|rating| rating.contact_parting_cycles).map(fmt).unwrap_or_default()),
+                ("VoltageRangeFactor", "", device.interrupting.as_ref().and_then(|rating| rating.voltage_range_factor).map(fmt).unwrap_or_default()),
             ]),
         ));
     }
@@ -778,6 +784,7 @@ fn devices_csv(project: &Project, names: &Names) -> String {
         "InterruptingTestXR",
         "InterruptingVoltageV",
         "ContactPartingCycles",
+        "VoltageRangeFactor",
     ]);
     for device in &project.devices {
         let f = device_fields(&device.curve, device.fuse_total_clearing);
@@ -803,6 +810,7 @@ fn devices_csv(project: &Project, names: &Names) -> String {
             &rating.map(|rating| fmt(rating.test_xr)).unwrap_or_default(),
             &rating.map(|rating| fmt(rating.voltage_v)).unwrap_or_default(),
             &rating.and_then(|rating| rating.contact_parting_cycles).map(fmt).unwrap_or_default(),
+            &rating.and_then(|rating| rating.voltage_range_factor).map(fmt).unwrap_or_default(),
         ]));
     }
     s
@@ -1168,8 +1176,11 @@ Protective devices
   other device entered with curve_is_total_clearing); BreakerInterruptingTime
   is then empty. InterruptingSymmetricalKA, InterruptingTestXR, and
   InterruptingVoltageV are the entered interrupting rating. ContactPartingCycles
-  is the entered contact parting time in cycles. They are blank when none is
-  entered. The same interrupting names are ProtectiveDevice XML attributes.
+  is the entered contact parting time in cycles. VoltageRangeFactor is K.
+  Blank K means 1. They are blank when none is entered. The same interrupting
+  names are ProtectiveDevice XML attributes. Above 1 kV, closing and latching
+  duty is 1.6 times the symmetrical current. Capability is 1.6 times K times
+  the rated symmetrical current. interrupting-duty.csv reports those currents.
 
 Interrupting duty
   interrupting-duty.csv lists each braced bus and each device that has an
@@ -1672,7 +1683,7 @@ mod tests {
         project.buses[1].bracing_ka = Some(65.0);
         project.buses[1].bracing_test_xr = Some(5.0);
         project.devices[0].interrupting = Some(crate::model::InterruptingRating {
-            symmetrical_ka: 65.0, test_xr: 5.0, voltage_v: 480.0, contact_parting_cycles: None,
+            symmetrical_ka: 65.0, test_xr: 5.0, voltage_v: 480.0, contact_parting_cycles: None, voltage_range_factor: None,
         });
         let exported = export(&project);
         let devices = file(&exported, "protective-devices.csv");

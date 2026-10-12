@@ -821,6 +821,7 @@ fn select_interrupting(device: &LibraryDevice, request: &ApplyDevice, unit: &Tri
         test_xr: chosen.test_xr,
         voltage_v: chosen.voltage_v,
         contact_parting_cycles: None,
+        voltage_range_factor: None,
     })
 }
 

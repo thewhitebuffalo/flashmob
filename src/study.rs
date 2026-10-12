@@ -246,6 +246,19 @@ pub struct InterruptingDuty {
     /// True when the stored multiplier blends an entered generator decrement by NACD.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub local_ac_applied: bool,
+    /// 1.6 times the symmetrical current. Set above 1 kV.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_latch_ka: Option<f64>,
+    /// 1.6 times K times the rated symmetrical current.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_latch_capability_ka: Option<f64>,
+    /// Voltage range factor K used for the closing and latching capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voltage_range_factor: Option<f64>,
+    /// within_rating, marginal, or exceeds_rating for closing and latching.
+    /// The half-cycle `status` is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_latch_status: Option<String>,
 }
 
 pub fn run(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
@@ -361,7 +374,7 @@ fn run_one(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
         case_id: "normal".into(),
         methods: Methods {
             load_flow: "Newton-Raphson positive-sequence power flow".into(),
-            short_circuit: "Symmetrical components. Peak current uses the IEC 60909 factor. Half-cycle rms is the first-half-cycle asymmetrical value. Minimum and maximum symmetrical currents apply IEC 60909-0 Table 1 voltage factor c to that current. Impedance correction factors are not applied. A breaker above 1 kV with contact_parting_cycles reports an IEEE C37.010 multiplier: asymmetrical rms at that parting time divided by the breaker asymmetry capability, and not below 1. NACD is reported. When NACD is below 1 and a local source has an entered decrement curve, that multiplier blends the remote DC-decrement factor with the local factor from the curve at 60 Hz. Motor contribution without a decrement curve is not reduced. A source with no decrement curve stays remote.".into(),
+            short_circuit: "Symmetrical components. Peak current uses the IEC 60909 factor. Half-cycle rms is the first-half-cycle asymmetrical value. Minimum and maximum symmetrical currents apply IEC 60909-0 Table 1 voltage factor c to that current. Impedance correction factors are not applied. A breaker above 1 kV with contact_parting_cycles reports an IEEE C37.010 multiplier: asymmetrical rms at that parting time divided by the breaker asymmetry capability, and not below 1. NACD is reported. When NACD is below 1 and a local source has an entered decrement curve, that multiplier blends the remote DC-decrement factor with the local factor from the curve at 60 Hz. Motor contribution without a decrement curve is not reduced. A source with no decrement curve stays remote. Above 1 kV, closing and latching duty is 1.6 times that symmetrical current, and capability is 1.6 times K times the rated symmetrical current. Omitted K is 1. This is not a separate first-cycle reactance network.".into(),
             arc_flash: "IEEE 1584-2018".into(),
             coordination: "IEC 60255, IEEE C37.112, definite time, and a simplified thermal-magnetic breaker".into(),
         },
@@ -2032,6 +2045,7 @@ fn bracing_duty(bus: &crate::model::Bus, fault: &FaultResult) -> Result<Option<I
         &bus.id, &bus.name, "bus_bracing", fault_name, &bus.id,
         point.symmetrical_ka, point.x_over_r, rated, bus.bracing_test_xr, &comparison,
         &RemoteDuty::none(),
+        &CloseLatch::none(),
         "Equipment bracing compared with the greater of the three-phase and line-to-ground bus faults.".into(),
     )))
 }
@@ -2069,10 +2083,11 @@ fn device_duty(project: &Project, device: &crate::model::Device, fault: &FaultRe
         }
     }
     let remote = remote_duty(project, fault, device, rating, &best, &mut note);
+    let close_latch = close_latch_duty(project, device, rating, &best, &mut note);
     Ok(Some(duty_row(
         &device.id, &device.name, "device", best.fault_name, &device.bus,
         best.symmetrical_ka, best.system_xr, rating.symmetrical_ka, Some(rating.test_xr), &best.comparison,
-        &remote, note,
+        &remote, &close_latch, note,
     )))
 }
 
@@ -2261,6 +2276,61 @@ fn applied_multiplier(
     }
 }
 
+struct CloseLatch {
+    close_latch_ka: Option<f64>,
+    close_latch_capability_ka: Option<f64>,
+    voltage_range_factor: Option<f64>,
+    close_latch_status: Option<String>,
+}
+
+impl CloseLatch {
+    fn none() -> Self {
+        Self {
+            close_latch_ka: None,
+            close_latch_capability_ka: None,
+            voltage_range_factor: None,
+            close_latch_status: None,
+        }
+    }
+}
+
+fn close_latch_duty(
+    project: &Project, device: &crate::model::Device, rating: &crate::model::InterruptingRating,
+    best: &DutyPick, note: &mut String,
+) -> CloseLatch {
+    let device_kv = project.bus(&device.bus).map(|bus| bus.kv).unwrap_or(0.0);
+    if device_kv <= 1.0 {
+        note.push_str(" Closing and latching is not applied at or below 1 kV.");
+        return CloseLatch::none();
+    }
+    let k = rating.voltage_range_factor.unwrap_or(1.0);
+    let (duty_ka, capability) = match duty::close_latch_currents(best.symmetrical_ka, rating.symmetrical_ka, k) {
+        Ok(currents) => currents,
+        Err(err) => {
+            note.push_str(&format!(" Closing and latching was not applied: {err}."));
+            return CloseLatch::none();
+        }
+    };
+    let status = match duty::rated_symmetrical_status(duty_ka, capability) {
+        Ok(status) => status,
+        Err(err) => {
+            note.push_str(&format!(" Closing and latching was not applied: {err}."));
+            return CloseLatch::none();
+        }
+    };
+    note.push_str(&format!(
+        " Closing and latching duty is 1.6 times the symmetrical current {sym:.3} kA, which is {duty_ka:.3} kA. Capability is 1.6 times K {k:.3} times the rated symmetrical current {rated:.3} kA, which is {capability:.3} kA. The entered symmetrical rating is the rated short-circuit current. Omitted K is 1. This is not a separate first-cycle reactance network. It does not replace the half-cycle comparison.",
+        sym = best.symmetrical_ka,
+        rated = rating.symmetrical_ka,
+    ));
+    CloseLatch {
+        close_latch_ka: Some(duty_ka),
+        close_latch_capability_ka: Some(capability),
+        voltage_range_factor: Some(k),
+        close_latch_status: Some(status.as_str().into()),
+    }
+}
+
 fn keep_larger(best: &mut Option<DutyPick>, fault_name: &'static str, fault_bus_id: &str, symmetrical_ka: f64, system_xr: Option<f64>, rated_symmetrical_ka: f64, test_xr: Option<f64>) -> Result<(), String> {
     let comparison = duty::compare(&duty::DutyInput {
         symmetrical_ka,
@@ -2277,7 +2347,7 @@ fn keep_larger(best: &mut Option<DutyPick>, fault_name: &'static str, fault_bus_
 fn duty_row(
     id: &str, name: &str, kind: &str, fault_name: &str, bus_id: &str,
     symmetrical_ka: f64, system_xr: Option<f64>, rated: f64, test_xr: Option<f64>,
-    comparison: &duty::DutyComparison, remote: &RemoteDuty, note: String,
+    comparison: &duty::DutyComparison, remote: &RemoteDuty, close_latch: &CloseLatch, note: String,
 ) -> InterruptingDuty {
     InterruptingDuty {
         id: id.into(),
@@ -2300,6 +2370,10 @@ fn duty_row(
         nacd: remote.nacd,
         remote_status: remote.remote_status.clone(),
         local_ac_applied: remote.local_ac_applied,
+        close_latch_ka: close_latch.close_latch_ka,
+        close_latch_capability_ka: close_latch.close_latch_capability_ka,
+        voltage_range_factor: close_latch.voltage_range_factor,
+        close_latch_status: close_latch.close_latch_status.clone(),
     }
 }
 
@@ -2320,8 +2394,28 @@ fn duty_warnings(rows: &[InterruptingDuty]) -> Vec<String> {
         if let Some(warning) = remote_warning(row) {
             warnings.push(warning);
         }
+        if let Some(warning) = close_latch_warning(row) {
+            warnings.push(warning);
+        }
     }
     warnings
+}
+
+fn close_latch_warning(row: &InterruptingDuty) -> Option<String> {
+    let status = row.close_latch_status.as_deref()?;
+    let duty_ka = row.close_latch_ka?;
+    let capability = row.close_latch_capability_ka?;
+    match status {
+        "exceeds_rating" => Some(format!(
+            "{}: close-and-latch duty {:.3} kA exceeds the closing and latching capability {:.3} kA",
+            row.id, duty_ka, capability
+        )),
+        "marginal" => Some(format!(
+            "{}: close-and-latch duty is above 90% of the closing and latching capability and still within it",
+            row.id
+        )),
+        _ => None,
+    }
 }
 
 fn remote_warning(row: &InterruptingDuty) -> Option<String> {
@@ -2483,6 +2577,17 @@ pub fn text_report(project: &Project, out: &StudyOutput) -> String {
                 };
                 lines.push(format!(
                     "    {label}  {factor:.3} at {cycles:.2} cycles contact parting  {multiplied:.3} kA  {status}  NACD {nacd}. {tail}"
+                ));
+            }
+            if let (Some(duty_ka), Some(capability), Some(k), Some(status)) = (
+                row.close_latch_ka,
+                row.close_latch_capability_ka,
+                row.voltage_range_factor,
+                row.close_latch_status.as_deref(),
+            ) {
+                lines.push(format!(
+                    "    Closing and latching  1.6 times {sym:.3} kA is {duty_ka:.3} kA  capability {capability:.3} kA  K {k:.3}  {status}. The symmetrical current is not from a separate first-cycle reactance network.",
+                    sym = row.symmetrical_ka
                 ));
             }
         }

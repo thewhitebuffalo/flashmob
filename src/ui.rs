@@ -1296,12 +1296,17 @@ fn edit_interrupting(ui: &mut egui::Ui, device: &mut Device) -> bool {
     ui.label(format!("Symmetrical {} kA", format_num(symmetrical_ka)));
     ui.label(format!("Test X/R {}", format_num(test_xr)));
     ui.label(format!("Voltage {} V", format_num(voltage_v)));
+    let mut edited = false;
+    if let Some(rating) = device.interrupting.as_mut() {
+        edited |= optional_f64(ui, (device.id.as_str(), "voltage-range-factor"), "Voltage range factor K", &mut rating.voltage_range_factor);
+    }
+    ui.label(RichText::new("Empty K means 1. Above 1 kV, closing and latching capability is 1.6 times K times this symmetrical rating.").color(color("#94A3B8")));
     // Shown only when a rating is already on the device. The editor does not invent one.
     if ui.button("Clear interrupting rating").clicked() {
         device.interrupting = None;
         return true;
     }
-    false
+    edited
 }
 
 fn edit_curve(ui: &mut egui::Ui, device_id: &str, curve: &mut CurveSpec) -> bool {
@@ -1428,13 +1433,16 @@ fn duty_grid(ui: &mut egui::Ui, rows: &[InterruptingDuty]) {
                 Some(ka) => format!("{ka:.3} adjusted"),
                 None => format!("{:.3} rated", row.rated_symmetrical_ka),
             };
-            let status = match row.remote_status.as_deref() {
+            let mut status = match row.remote_status.as_deref() {
                 Some(remote) => {
                     let kind = if row.local_ac_applied { "multiplier" } else { "remote" };
                     format!("{}  {kind} {remote}", row.status)
                 }
                 None => row.status.clone(),
             };
+            if let Some(close) = row.close_latch_status.as_deref() {
+                status.push_str(&format!("  close-latch {close}"));
+            }
             ui.label(RichText::new(&row.id).color(ink)).on_hover_text(&row.note);
             ui.label(RichText::new(&row.name).color(ink)).on_hover_text(&row.note);
             ui.label(RichText::new(&row.bus_id).color(ink)).on_hover_text(&row.note);
@@ -1457,12 +1465,17 @@ fn duty_label(ui: &mut egui::Ui, row: &InterruptingDuty) {
         let kind = if row.local_ac_applied { "multiplier" } else { "remote" };
         text.push_str(&format!("  {kind} {factor:.3} {status}{nacd}"));
     }
+    if let (Some(duty_ka), Some(capability), Some(status)) = (row.close_latch_ka, row.close_latch_capability_ka, row.close_latch_status.as_deref()) {
+        text.push_str(&format!("  close-latch {duty_ka:.3}/{capability:.3} {status}"));
+    }
     ui.label(RichText::new(text).color(duty_ink(row))).on_hover_text(&row.note);
 }
 
 fn duty_ink(row: &InterruptingDuty) -> Color32 {
+    let close_latch = matches!(row.close_latch_status.as_deref(), Some("exceeds_rating" | "marginal"));
     match row.remote_status.as_deref() {
         Some("exceeds_rating" | "marginal") => color("#FFB300"),
+        _ if close_latch => color("#FFB300"),
         _ => duty_color(&row.status),
     }
 }

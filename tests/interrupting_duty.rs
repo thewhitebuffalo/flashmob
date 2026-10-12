@@ -15,7 +15,7 @@ fn fault_only() -> Studies {
 }
 
 fn rating(symmetrical_ka: f64, test_xr: f64, voltage_v: f64) -> InterruptingRating {
-    InterruptingRating { symmetrical_ka, test_xr, voltage_v, contact_parting_cycles: None }
+    InterruptingRating { symmetrical_ka, test_xr, voltage_v, contact_parting_cycles: None, voltage_range_factor: None }
 }
 
 fn one_bus(source_xr: f64, bracing_ka: Option<f64>, bracing_test_xr: Option<f64>, interrupting: InterruptingRating) -> Project {
@@ -339,6 +339,48 @@ fn nacd_blends_a_remote_source_with_an_entered_generator_decrement() {
     let remote = (1.0 + dc).sqrt() / 1.1;
     let local = (0.70 * 0.70 + dc).sqrt() / 1.1;
     close(row.remote_multiplying_factor.expect("factor"), 0.5 * remote + 0.5 * local);
+}
+
+#[test]
+fn close_and_latch_applies_above_one_kilovolt_and_uses_k() {
+    let mut high = rating(0.20, 15.0, 13800.0);
+    high.voltage_range_factor = Some(2.27);
+    let mut project = one_bus(15.0, None, None, high);
+    project.buses[0].kv = 13.8;
+    let out = study::run(&project, fault_only()).unwrap();
+    let row = device_row(&out);
+    let duty_ka = 1.6 * row.symmetrical_ka;
+    let capability = 1.6 * 2.27 * 0.20;
+    close(row.close_latch_ka.expect("close-latch duty"), duty_ka);
+    close(row.close_latch_capability_ka.expect("close-latch capability"), capability);
+    assert_eq!(row.voltage_range_factor, Some(2.27));
+    assert_eq!(row.status, "exceeds_rating");
+    assert_eq!(row.close_latch_status.as_deref(), Some("marginal"));
+    assert!(row.note.contains("not a separate first-cycle reactance network"), "{}", row.note);
+    let warning = out.warnings.iter().find(|line| line.contains("close-and-latch")).expect("close-latch warning");
+    assert!(warning.contains("above 90%"), "{warning}");
+    let report = study::text_report(&project, &out);
+    assert!(report.contains("Closing and latching"));
+    assert!(report.contains("not from a separate first-cycle reactance network"));
+
+    let mut low = rating(0.20, 15.0, 480.0);
+    low.voltage_range_factor = Some(2.27);
+    let low_out = study::run(&one_bus(15.0, None, None, low), fault_only()).unwrap();
+    let low_row = device_row(&low_out);
+    assert!(low_row.close_latch_status.is_none());
+    assert!(low_row.note.contains("not applied at or below 1 kV"), "{}", low_row.note);
+    assert!(!low_out.warnings.iter().any(|line| line.contains("close-and-latch")));
+
+    let mut plain = one_bus(15.0, None, None, rating(0.20, 15.0, 13800.0));
+    plain.buses[0].kv = 13.8;
+    let plain_out = study::run(&plain, fault_only()).unwrap();
+    let plain_row = device_row(&plain_out);
+    assert_eq!(plain_row.voltage_range_factor, Some(1.0));
+    close(plain_row.close_latch_capability_ka.expect("capability"), 1.6 * 0.20);
+
+    let mut bad = one_bus(15.0, None, None, rating(10.0, 15.0, 13800.0));
+    bad.devices[0].interrupting.as_mut().unwrap().voltage_range_factor = Some(0.5);
+    assert!(bad.validate().iter().any(|error| error.contains("voltage range factor")), "{:?}", bad.validate());
 }
 
 #[test]

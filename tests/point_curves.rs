@@ -334,10 +334,10 @@ fn exec_and_package_carry_curve_is_total_clearing() {
     assert!(response.project.devices[0].curve_is_total_clearing && !response.project.devices[0].fuse_total_clearing);
     assert!(response.project.devices.iter().find(|d| d.id == "extra").unwrap().curve_is_total_clearing);
     let csv = std::fs::read_to_string(dir.join("protective-devices.csv")).unwrap();
-    assert!(csv.lines().next().unwrap().ends_with("FuseTotalClearingCurve,CurveIsTotalClearing,InterruptingSymmetricalKA,InterruptingTestXR,InterruptingVoltageV,ContactPartingCycles"), "{csv}");
+    assert!(csv.lines().next().unwrap().ends_with("FuseTotalClearingCurve,CurveIsTotalClearing,InterruptingSymmetricalKA,InterruptingTestXR,InterruptingVoltageV,ContactPartingCycles,VoltageRangeFactor"), "{csv}");
     std::fs::remove_dir_all(&dir).unwrap();
     let main_line = csv.lines().find(|l| l.contains("Point Curve")).unwrap();
-    assert!(main_line.ends_with("false,true,,,,"), "{main_line}");
+    assert!(main_line.ends_with("false,true,,,,,"), "{main_line}");
 
     let unset = exec::exec_request(&serde_json::json!({"project": response.project, "commands": [
         {"op": "set_device", "id": "brk-main", "curve_is_total_clearing": false, "breaker_interrupting_s": 0.08}

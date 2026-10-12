@@ -129,6 +129,29 @@ pub fn local_multiplying_factor(system_xr: Option<f64>, contact_parting_cycles: 
     Ok(factor.max(1.0))
 }
 
+/// Asymmetry factor for closing and latching duty.
+pub const CLOSE_LATCH_FACTOR: f64 = 1.6;
+
+/// Closing and latching rms currents: `(duty, capability)`.
+///
+/// Duty is 1.6 times the symmetrical current. Capability is 1.6 times the
+/// voltage range factor K times the rated symmetrical current. K must be at
+/// least 1.
+pub fn close_latch_currents(symmetrical_ka: f64, rated_symmetrical_ka: f64, voltage_range_factor: f64) -> Result<(f64, f64), String> {
+    if !symmetrical_ka.is_finite() || symmetrical_ka < 0.0 || !rated_symmetrical_ka.is_finite() || rated_symmetrical_ka < 0.0 {
+        return Err("closing and latching currents must be finite and nonnegative".into());
+    }
+    if !voltage_range_factor.is_finite() || voltage_range_factor < 1.0 {
+        return Err("voltage range factor K must be finite and at least 1".into());
+    }
+    let duty = CLOSE_LATCH_FACTOR * symmetrical_ka;
+    let capability = CLOSE_LATCH_FACTOR * voltage_range_factor * rated_symmetrical_ka;
+    if !duty.is_finite() || !capability.is_finite() {
+        return Err("non-finite closing and latching current".into());
+    }
+    Ok((duty, capability))
+}
+
 /// `nacd * remote + (1 - nacd) * local`, with both factors kept at or above 1.
 pub fn nacd_interpolated_factor(remote: f64, local: f64, nacd: f64) -> Result<f64, String> {
     if !remote.is_finite() || !local.is_finite() || !nacd.is_finite() || !(0.0..=1.0).contains(&nacd) {
@@ -260,6 +283,21 @@ mod tests {
         assert!((infinite - (ac * ac + 2.0).sqrt() / 1.1).abs() < 1e-12, "{infinite}");
         assert!(local_multiplying_factor(Some(80.0), cycles, 0.0).is_err());
         assert!(nacd_interpolated_factor(remote, local, 1.1).is_err());
+    }
+
+    #[test]
+    fn close_and_latch_is_1_6_times_symmetrical_and_1_6_times_k_times_rated() {
+        // 1.6 times 13.5 kA is 21.6 kA. Capability is 1.6 times K times the
+        // rated short-circuit current. A printed 34 kA capability is the
+        // rounded product for K = 2.27 and 9.3 kA.
+        let (duty, capability) = close_latch_currents(13.5, 9.3, 2.27).unwrap();
+        assert!((duty - 21.6).abs() < 1e-12, "{duty}");
+        assert!((capability - 1.6 * 2.27 * 9.3).abs() < 1e-12, "{capability}");
+        assert_eq!(rated_symmetrical_status(duty, capability).unwrap(), DutyStatus::WithinRating);
+        let (matched, rated) = close_latch_currents(10.0, 10.0, 1.0).unwrap();
+        assert!((matched - 16.0).abs() < 1e-12 && (rated - 16.0).abs() < 1e-12);
+        assert_eq!(rated_symmetrical_status(matched, rated).unwrap(), DutyStatus::Marginal);
+        assert!(close_latch_currents(10.0, 10.0, 0.9).is_err());
     }
 
     #[test]
