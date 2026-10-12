@@ -567,6 +567,11 @@ pub struct InterruptingRating {
     pub symmetrical_ka: f64,
     pub test_xr: f64,
     pub voltage_v: f64,
+    /// Contact parting time in cycles at the study frequency. Set on a breaker
+    /// above 1 kV to report the remote multiplying factor. Omitted ratings
+    /// stay on the half-cycle comparison alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_parting_cycles: Option<f64>,
 }
 
 impl Device {

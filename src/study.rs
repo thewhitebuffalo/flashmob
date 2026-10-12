@@ -226,6 +226,22 @@ pub struct InterruptingDuty {
     pub adjusted_symmetrical_ka: Option<f64>,
     pub status: String,
     pub note: String,
+    /// Entered contact parting time, in cycles, when the remote multiplier was applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_parting_cycles: Option<f64>,
+    /// IEEE C37.010 remote multiplier. DC decrement only. Not reduced for local generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_multiplying_factor: Option<f64>,
+    /// Symmetrical current times the remote multiplier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multiplied_symmetrical_ka: Option<f64>,
+    /// Three-phase no-AC-decrement ratio at the fault bus used for this row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nacd: Option<f64>,
+    /// within_rating, marginal, or exceeds_rating for the multiplied current.
+    /// The half-cycle `status` is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_status: Option<String>,
 }
 
 pub fn run(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
@@ -341,7 +357,7 @@ fn run_one(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
         case_id: "normal".into(),
         methods: Methods {
             load_flow: "Newton-Raphson positive-sequence power flow".into(),
-            short_circuit: "Symmetrical components. Peak current uses the IEC 60909 factor. Half-cycle rms is the first-half-cycle asymmetrical value. Minimum and maximum symmetrical currents apply IEC 60909-0 Table 1 voltage factor c to that current. Impedance correction factors are not applied.".into(),
+            short_circuit: "Symmetrical components. Peak current uses the IEC 60909 factor. Half-cycle rms is the first-half-cycle asymmetrical value. Minimum and maximum symmetrical currents apply IEC 60909-0 Table 1 voltage factor c to that current. Impedance correction factors are not applied. A breaker above 1 kV with contact_parting_cycles also reports the IEEE C37.010 remote multiplier: asymmetrical rms at that parting time divided by the breaker asymmetry capability, and not below 1. NACD is reported. Local AC-decrement curves are not applied.".into(),
             arc_flash: "IEEE 1584-2018".into(),
             coordination: "IEC 60255, IEEE C37.112, definite time, and a simplified thermal-magnetic breaker".into(),
         },
@@ -1930,9 +1946,30 @@ fn coordination_fault_bus(project: &Project, device: &crate::model::Device, faul
 
 struct DutyPick {
     fault_name: &'static str,
+    fault_bus_id: String,
     symmetrical_ka: f64,
     system_xr: Option<f64>,
     comparison: duty::DutyComparison,
+}
+
+struct RemoteDuty {
+    contact_parting_cycles: Option<f64>,
+    remote_multiplying_factor: Option<f64>,
+    multiplied_symmetrical_ka: Option<f64>,
+    nacd: Option<f64>,
+    remote_status: Option<String>,
+}
+
+impl RemoteDuty {
+    fn none() -> Self {
+        Self {
+            contact_parting_cycles: None,
+            remote_multiplying_factor: None,
+            multiplied_symmetrical_ka: None,
+            nacd: None,
+            remote_status: None,
+        }
+    }
 }
 
 /// Interrupting duty from a fault study of `project`.
@@ -1988,6 +2025,7 @@ fn bracing_duty(bus: &crate::model::Bus, fault: &FaultResult) -> Result<Option<I
     Ok(Some(duty_row(
         &bus.id, &bus.name, "bus_bracing", fault_name, &bus.id,
         point.symmetrical_ka, point.x_over_r, rated, bus.bracing_test_xr, &comparison,
+        &RemoteDuty::none(),
         "Equipment bracing compared with the greater of the three-phase and line-to-ground bus faults.".into(),
     )))
 }
@@ -2002,12 +2040,12 @@ fn device_duty(project: &Project, device: &crate::model::Device, fault: &FaultRe
             let Some(bus_fault) = fault.buses.iter().find(|row| row.id == *terminal) else { continue };
             let Some(point) = bus_fault.three_phase.as_ref() else { continue };
             let Some(amps) = device_current(project, device, bus_fault, 1.0) else { continue };
-            keep_larger(&mut best, "three_phase", amps / 1000.0, point.x_over_r, rating.symmetrical_ka, Some(rating.test_xr))?;
+            keep_larger(&mut best, "three_phase", terminal, amps / 1000.0, point.x_over_r, rating.symmetrical_ka, Some(rating.test_xr))?;
         }
     } else if let Some(bus_fault) = fault.buses.iter().find(|row| row.id == device.bus) {
         for (name, point) in [("three_phase", bus_fault.three_phase.as_ref()), ("line_to_ground", bus_fault.line_to_ground.as_ref())] {
             let Some(point) = point else { continue };
-            keep_larger(&mut best, name, point.symmetrical_ka, point.x_over_r, rating.symmetrical_ka, Some(rating.test_xr))?;
+            keep_larger(&mut best, name, &device.bus, point.symmetrical_ka, point.x_over_r, rating.symmetrical_ka, Some(rating.test_xr))?;
         }
     }
     let Some(best) = best else { return Ok(None) };
@@ -2024,13 +2062,54 @@ fn device_duty(project: &Project, device: &crate::model::Device, fault: &FaultRe
             }
         }
     }
+    let remote = remote_duty(project, fault, device, rating, &best, &mut note);
     Ok(Some(duty_row(
         &device.id, &device.name, "device", best.fault_name, &device.bus,
-        best.symmetrical_ka, best.system_xr, rating.symmetrical_ka, Some(rating.test_xr), &best.comparison, note,
+        best.symmetrical_ka, best.system_xr, rating.symmetrical_ka, Some(rating.test_xr), &best.comparison,
+        &remote, note,
     )))
 }
 
-fn keep_larger(best: &mut Option<DutyPick>, fault_name: &'static str, symmetrical_ka: f64, system_xr: Option<f64>, rated_symmetrical_ka: f64, test_xr: Option<f64>) -> Result<(), String> {
+fn remote_duty(
+    project: &Project, fault: &FaultResult, device: &crate::model::Device,
+    rating: &crate::model::InterruptingRating, best: &DutyPick, note: &mut String,
+) -> RemoteDuty {
+    let Some(cycles) = rating.contact_parting_cycles else { return RemoteDuty::none() };
+    let device_kv = project.bus(&device.bus).map(|bus| bus.kv).unwrap_or(0.0);
+    if device_kv <= 1.0 {
+        note.push_str(" Contact parting time is not used at or below 1 kV. The remote multiplier is for breakers above 1 kV; this row stays on the half-cycle comparison.");
+        return RemoteDuty::none();
+    }
+    let factor = match duty::remote_multiplying_factor(best.system_xr, cycles) {
+        Ok(factor) => factor,
+        Err(err) => {
+            note.push_str(&format!(" Remote multiplier was not applied: {err}."));
+            return RemoteDuty::none();
+        }
+    };
+    let multiplied = best.symmetrical_ka * factor;
+    let status = match duty::rated_symmetrical_status(multiplied, rating.symmetrical_ka) {
+        Ok(status) => status,
+        Err(err) => {
+            note.push_str(&format!(" Remote multiplier was not applied: {err}."));
+            return RemoteDuty::none();
+        }
+    };
+    let nacd = fault.buses.iter().find(|row| row.id == best.fault_bus_id).and_then(|row| row.nacd);
+    note.push_str(" Remote multiplier is the DC-decrement factor at the entered contact parting time, divided by the breaker asymmetry capability, and not taken below 1. It does not replace the half-cycle comparison. Local AC-decrement curves are not applied, so this factor is not reduced when NACD is below 1. A source counts as remote unless it has a decrement curve. Motors are local.");
+    if nacd.is_none() {
+        note.push_str(" NACD was not reported because the infeed split did not match the fault current.");
+    }
+    RemoteDuty {
+        contact_parting_cycles: Some(cycles),
+        remote_multiplying_factor: Some(factor),
+        multiplied_symmetrical_ka: Some(multiplied),
+        nacd,
+        remote_status: Some(status.as_str().into()),
+    }
+}
+
+fn keep_larger(best: &mut Option<DutyPick>, fault_name: &'static str, fault_bus_id: &str, symmetrical_ka: f64, system_xr: Option<f64>, rated_symmetrical_ka: f64, test_xr: Option<f64>) -> Result<(), String> {
     let comparison = duty::compare(&duty::DutyInput {
         symmetrical_ka,
         system_xr,
@@ -2038,7 +2117,7 @@ fn keep_larger(best: &mut Option<DutyPick>, fault_name: &'static str, symmetrica
         test_xr,
     })?;
     if best.as_ref().map_or(true, |prior| comparison.half_cycle_rms_ka > prior.comparison.half_cycle_rms_ka) {
-        *best = Some(DutyPick { fault_name, symmetrical_ka, system_xr, comparison });
+        *best = Some(DutyPick { fault_name, fault_bus_id: fault_bus_id.into(), symmetrical_ka, system_xr, comparison });
     }
     Ok(())
 }
@@ -2046,7 +2125,7 @@ fn keep_larger(best: &mut Option<DutyPick>, fault_name: &'static str, symmetrica
 fn duty_row(
     id: &str, name: &str, kind: &str, fault_name: &str, bus_id: &str,
     symmetrical_ka: f64, system_xr: Option<f64>, rated: f64, test_xr: Option<f64>,
-    comparison: &duty::DutyComparison, note: String,
+    comparison: &duty::DutyComparison, remote: &RemoteDuty, note: String,
 ) -> InterruptingDuty {
     InterruptingDuty {
         id: id.into(),
@@ -2063,11 +2142,16 @@ fn duty_row(
         adjusted_symmetrical_ka: comparison.adjusted_symmetrical_ka,
         status: comparison.status.as_str().into(),
         note,
+        contact_parting_cycles: remote.contact_parting_cycles,
+        remote_multiplying_factor: remote.remote_multiplying_factor,
+        multiplied_symmetrical_ka: remote.multiplied_symmetrical_ka,
+        nacd: remote.nacd,
+        remote_status: remote.remote_status.clone(),
     }
 }
 
 fn duty_warnings(rows: &[InterruptingDuty]) -> Vec<String> {
-    rows.iter().filter_map(|row| match row.status.as_str() {
+    let mut warnings: Vec<String> = rows.iter().filter_map(|row| match row.status.as_str() {
         "exceeds_rating" => Some(exceeds_warning(row)),
         "marginal" => Some(format!(
             "{}: duty is above 90% of the compared rating and still within it",
@@ -2078,7 +2162,31 @@ fn duty_warnings(rows: &[InterruptingDuty]) -> Vec<String> {
             row.id
         )),
         _ => None,
-    }).collect()
+    }).collect();
+    for row in rows {
+        if let Some(warning) = remote_warning(row) {
+            warnings.push(warning);
+        }
+    }
+    warnings
+}
+
+fn remote_warning(row: &InterruptingDuty) -> Option<String> {
+    let status = row.remote_status.as_deref()?;
+    let factor = row.remote_multiplying_factor?;
+    let cycles = row.contact_parting_cycles?;
+    let multiplied = row.multiplied_symmetrical_ka?;
+    match status {
+        "exceeds_rating" => Some(format!(
+            "{}: {:.3} kA times remote multiplier {:.3} is {:.3} kA, which exceeds the rated symmetrical current {:.3} kA at {:.2} cycles contact parting. Local AC decrement is not applied.",
+            row.id, row.symmetrical_ka, factor, multiplied, row.rated_symmetrical_ka, cycles
+        )),
+        "marginal" => Some(format!(
+            "{}: remote multiplier duty is above 90% of the rated symmetrical current and still within it",
+            row.id
+        )),
+        _ => None,
+    }
 }
 
 fn exceeds_warning(row: &InterruptingDuty) -> String {
@@ -2199,6 +2307,17 @@ pub fn text_report(project: &Project, out: &StudyOutput) -> String {
                 "    Interrupting duty  {} ({}) {}  {:.3} kA symmetrical  X/R {}  half-cycle {:.3} kA  {}  {}  {}",
                 row.id, row.kind, row.fault, row.symmetrical_ka, xr, row.half_cycle_rms_ka, limit, row.status, row.note
             ));
+            if let (Some(factor), Some(cycles), Some(multiplied), Some(status)) = (
+                row.remote_multiplying_factor,
+                row.contact_parting_cycles,
+                row.multiplied_symmetrical_ka,
+                row.remote_status.as_deref(),
+            ) {
+                let nacd = row.nacd.map(|value| format!("{value:.3}")).unwrap_or_else(|| "not reported".into());
+                lines.push(format!(
+                    "    Remote multiplier  {factor:.3} at {cycles:.2} cycles contact parting  {multiplied:.3} kA  {status}  NACD {nacd}. DC decrement only. Local AC-decrement curves are not applied."
+                ));
+            }
         }
         if let Some(rows) = &out.arc_flash {
             let mine: Vec<_> = rows.iter().filter(|row| row.bus_id == bus.id).collect();

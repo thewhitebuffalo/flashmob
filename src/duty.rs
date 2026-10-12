@@ -56,6 +56,55 @@ fn band(duty: f64, rating: f64, below: DutyStatus) -> DutyStatus {
     }
 }
 
+/// Breaker asymmetrical-to-symmetrical capability at a contact parting time.
+///
+/// The stated ratios are 1.4, 1.2, 1.1, and 1.0 at 1, 2, 3, and 4 cycles.
+/// Times between those points are linear. A 1.5-cycle parting time, the
+/// minimum for a 2-cycle breaker, falls on 1.3. At and beyond 4 cycles the
+/// ratio stays 1. Parting faster than 1 cycle is not this interrupting check.
+pub fn asymmetry_capability(contact_parting_cycles: f64) -> Result<f64, String> {
+    if !contact_parting_cycles.is_finite() || contact_parting_cycles < 1.0 {
+        return Err("contact parting time must be at least 1 cycle".into());
+    }
+    const KNOTS: [(f64, f64); 4] = [(1.0, 1.4), (2.0, 1.2), (3.0, 1.1), (4.0, 1.0)];
+    if contact_parting_cycles >= 4.0 {
+        return Ok(1.0);
+    }
+    for pair in KNOTS.windows(2) {
+        let [(t0, s0), (t1, s1)] = [pair[0], pair[1]];
+        if contact_parting_cycles <= t1 {
+            let fraction = (contact_parting_cycles - t0) / (t1 - t0);
+            return Ok(s0 + fraction * (s1 - s0));
+        }
+    }
+    Ok(1.0)
+}
+
+/// Remote E/X multiplier: DC decrement only, divided by the breaker capability.
+///
+/// The asymmetrical rms factor at the contact parting time is divided by
+/// `asymmetry_capability`. The result is not taken below 1, so a low X/R does
+/// not credit the breaker with more than its symmetrical rating. This is the
+/// remote factor. It is not the local factor that also includes AC decrement,
+/// and it is not reduced by a no-AC-decrement ratio.
+pub fn remote_multiplying_factor(system_xr: Option<f64>, contact_parting_cycles: f64) -> Result<f64, String> {
+    let asymmetrical = crate::fault::asymmetrical_rms_factor(system_xr, contact_parting_cycles)?;
+    let capability = asymmetry_capability(contact_parting_cycles)?;
+    let factor = asymmetrical / capability;
+    if !factor.is_finite() {
+        return Err("non-finite remote multiplying factor".into());
+    }
+    Ok(factor.max(1.0))
+}
+
+/// Symmetrical duty against a symmetrical rating. The bottom band is within rating.
+pub fn rated_symmetrical_status(duty_ka: f64, rated_ka: f64) -> Result<DutyStatus, String> {
+    if !duty_ka.is_finite() || duty_ka < 0.0 || !rated_ka.is_finite() || rated_ka < 0.0 {
+        return Err("remote duty and rating must be finite and nonnegative".into());
+    }
+    Ok(band(duty_ka, rated_ka, DutyStatus::WithinRating))
+}
+
 /// Compare a symmetrical duty current with a rating.
 ///
 /// With a test X/R, capability is the rated symmetrical current times the
@@ -125,5 +174,31 @@ mod tests {
         assert_eq!(compare(&input(8.9, None)).unwrap().status, DutyStatus::NotAdjusted);
         assert_eq!(compare(&input(9.5, None)).unwrap().status, DutyStatus::Marginal);
         assert_eq!(compare(&input(10.1, None)).unwrap().status, DutyStatus::ExceedsRating);
+    }
+
+    #[test]
+    fn remote_factor_at_eighty_and_three_cycles_is_the_dc_only_ratio() {
+        // At X/R 80 and 3 cycles the DC-only ratio is 1.5. Dividing by the
+        // 1.1 capability gives the remote multiplier. The local-curve example
+        // of 1.21 already includes AC decrement and is a different number.
+        let cycles = 3.0;
+        let asymmetrical = (1.0 + 2.0 * (-4.0 * std::f64::consts::PI * cycles / 80.0).exp()).sqrt();
+        assert!((asymmetrical - 1.5).abs() < 1e-3, "{asymmetrical}");
+        let remote = remote_multiplying_factor(Some(80.0), cycles).unwrap();
+        assert!((remote - asymmetrical / 1.1).abs() < 1e-12);
+        assert!((remote - 1.21).abs() > 0.1, "local-curve example must stay distinct, got {remote}");
+        assert!((asymmetry_capability(1.5).unwrap() - 1.3).abs() < 1e-12);
+        assert!((asymmetry_capability(4.0).unwrap() - 1.0).abs() < 1e-12);
+        assert!((asymmetry_capability(5.0).unwrap() - 1.0).abs() < 1e-12);
+        assert!(asymmetry_capability(0.5).is_err());
+    }
+
+    #[test]
+    fn remote_factor_stays_at_one_when_the_x_over_r_is_fifteen_at_three_cycles() {
+        let factor = remote_multiplying_factor(Some(15.0), 3.0).unwrap();
+        assert!((factor - 1.0).abs() < 1e-12, "{factor}");
+        assert_eq!(rated_symmetrical_status(9.0, 10.0).unwrap(), DutyStatus::WithinRating);
+        assert_eq!(rated_symmetrical_status(9.5, 10.0).unwrap(), DutyStatus::Marginal);
+        assert_eq!(rated_symmetrical_status(10.1, 10.0).unwrap(), DutyStatus::ExceedsRating);
     }
 }

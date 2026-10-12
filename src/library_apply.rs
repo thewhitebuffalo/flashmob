@@ -820,6 +820,7 @@ fn select_interrupting(device: &LibraryDevice, request: &ApplyDevice, unit: &Tri
         symmetrical_ka: chosen.interrupting_ka,
         test_xr: chosen.test_xr,
         voltage_v: chosen.voltage_v,
+        contact_parting_cycles: None,
     })
 }
 

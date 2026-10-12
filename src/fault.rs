@@ -31,6 +31,13 @@ pub struct BusFault {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub terminal_currents: Vec<TerminalCurrent>,
+    /// Three-phase no-AC-decrement ratio. Symmetrical current from sources
+    /// that have no decrement curve, divided by the total three-phase fault
+    /// current. Motors and sources with a decrement curve are the local part.
+    /// Absent when that split does not account for the fault current.
+    /// Line-to-ground ratio is not calculated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nacd: Option<f64>,
 }
 
 /// Positive-sequence branch-terminal current for a bolted three-phase fault,
@@ -124,6 +131,7 @@ pub(crate) fn solve_with_model(project: &Project, loadflow: Option<&LoadflowResu
                 terminal_currents: Vec::new(),
                 note: Some(error.clone().unwrap_or_else(|| "unenergized island: no utility/generator source".into())),
                 error: None,
+                nacd: None,
             });
             continue;
         }
@@ -142,6 +150,7 @@ pub(crate) fn solve_with_model(project: &Project, loadflow: Option<&LoadflowResu
                 terminal_currents: Vec::new(),
                 note: Some(format!("fault calculation failed at this bus: {err}")),
                 error: Some(err),
+                nacd: None,
             },
         };
         buses.push(bus);
@@ -197,10 +206,12 @@ fn bus_fault(
     // Solve the voltage decrement caused by the fault current injection.
     // LF prefault includes initial branch flow; flat prefault neglects initial load flow.
     let mut terminal_currents = Vec::new();
+    let mut nacd = None;
     if let (Some(mut drop), Some(z)) = (column1, zz1) {
         // Y^-1 (e_k * I_fault) = (Y^-1 e_k) * I_fault is the voltage drop.
         let current = v / z;
         for value in &mut drop { *value = *value * current; }
+        nacd = three_phase_nacd(model, map1, &drop, current);
         if drop.iter().any(|v| !v.re.is_finite() || !v.im.is_finite()) {
             return Err("non-finite linear solution".into());
         }
@@ -237,7 +248,37 @@ fn bus_fault(
         note,
         error: None,
         terminal_currents,
+        nacd,
     })
+}
+
+/// Remote symmetrical current over the total three-phase fault current.
+///
+/// Each infeed current is its admittance times the fault voltage drop. A
+/// source with no decrement curve is remote. A motor, or a source that has a
+/// decrement curve, is local. The ratio is omitted when those infeeds do not
+/// add up to the fault current, which happens when another shunt is present.
+fn three_phase_nacd(model: &network::SystemModel, map1: &[Option<usize>], drop: &[Cplx], i_fault: Cplx) -> Option<f64> {
+    let total = i_fault.abs();
+    if model.infeeds.is_empty() || total < 1e-12 {
+        return None;
+    }
+    let mut remote = Cplx::ZERO;
+    let mut accounted = Cplx::ZERO;
+    for infeed in &model.infeeds {
+        let Some(index) = map1.get(infeed.bus).copied().flatten() else { continue };
+        let current = infeed.y * drop[index];
+        accounted += current;
+        if infeed.remote {
+            remote += current;
+        }
+    }
+    let mismatch = (accounted - i_fault).abs() / total;
+    if !mismatch.is_finite() || mismatch > 0.02 {
+        return None;
+    }
+    let ratio = remote.abs() / total;
+    ratio.is_finite().then_some(ratio)
 }
 
 fn reduced(net: &Net, energized: &[bool]) -> Result<(crate::network::SparseY, Vec<Option<usize>>), String> {
@@ -339,10 +380,15 @@ pub fn iec_kappa(r_over_x: f64, kv: f64) -> f64 {
     kappa_b.max((1.15 * kappa_b).min(cap))
 }
 
-/// First-half-cycle asymmetrical rms / symmetrical rms.
-/// None means infinite X/R (purely inductive): factor is sqrt(3).
-/// Some(0.0) is purely resistive: factor is 1.
-pub fn half_cycle_factor(x_over_r: Option<f64>) -> Result<f64, String> {
+/// Asymmetrical rms / symmetrical rms at a contact parting time, with no AC decrement.
+///
+/// `sqrt(1 + 2 * exp(-4 * pi * cycles / (X/R)))`. Cycles are at the system
+/// frequency, so the frequency cancels. None means infinite X/R: the factor
+/// is sqrt(3) at every parting time. Some(0.0) is purely resistive: factor 1.
+pub fn asymmetrical_rms_factor(x_over_r: Option<f64>, contact_parting_cycles: f64) -> Result<f64, String> {
+    if !contact_parting_cycles.is_finite() || contact_parting_cycles <= 0.0 {
+        return Err("contact parting time must be a positive finite number of cycles".into());
+    }
     let Some(xr) = x_over_r else {
         return Ok(3.0_f64.sqrt());
     };
@@ -352,12 +398,18 @@ pub fn half_cycle_factor(x_over_r: Option<f64>) -> Result<f64, String> {
     if xr == 0.0 {
         return Ok(1.0);
     }
-    // sqrt(1 + 2 * exp(-2 * pi / (X/R)))
-    let factor = (1.0 + 2.0 * (-2.0 * std::f64::consts::PI / xr).exp()).sqrt();
+    let factor = (1.0 + 2.0 * (-4.0 * std::f64::consts::PI * contact_parting_cycles / xr).exp()).sqrt();
     if !factor.is_finite() {
-        return Err("non-finite half-cycle factor".into());
+        return Err("non-finite asymmetrical factor".into());
     }
     Ok(factor)
+}
+
+/// First-half-cycle asymmetrical rms / symmetrical rms.
+/// None means infinite X/R (purely inductive): factor is sqrt(3).
+/// Some(0.0) is purely resistive: factor is 1.
+pub fn half_cycle_factor(x_over_r: Option<f64>) -> Result<f64, String> {
+    asymmetrical_rms_factor(x_over_r, 0.5)
 }
 
 /// Peak and half-cycle asymmetrical currents from the Thevenin impedance.
@@ -423,6 +475,36 @@ mod tests {
         assert!((point.c_max - 1.10).abs() < 1e-12);
         assert!((point.symmetrical_min_ka - expect).abs() / expect < 1e-6);
         assert!((point.symmetrical_max_ka - 1.10 * expect).abs() / expect < 1e-6);
+        let nacd = fault.buses[0].nacd.expect("utility-only fault reports NACD");
+        assert!((nacd - 1.0).abs() < 1e-6, "utility-only NACD {nacd}");
+    }
+
+    #[test]
+    fn nacd_drops_when_a_motor_or_a_decrement_curve_is_local() {
+        let mut project = Project {
+            buses: vec![Bus { id: "a".into(), name: "A".into(), kv: 13.8, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None }],
+            sources: vec![Source {
+                id: "s".into(), name: "grid".into(), bus: "a".into(), in_service: true,
+                decrement_curve: Vec::new(), v_pu: 1.0, angle_deg: 0.0, mva_sc: 500.0, xr: 15.0,
+                x0_over_x1: 1.0, r0_over_r1: 1.0, is_slack: true, p_mw: 0.0,
+                qmin_mvar: None, qmax_mvar: None, defaulted: Vec::new(),
+            }],
+            motors: vec![Motor {
+                id: "m".into(), name: "M".into(), bus: "a".into(), hp: 1000.0, kv: 13.8,
+                pf: 0.85, efficiency: 0.94, x_subtransient_pu: 0.17, xr: 6.0, defaulted: Vec::new(),
+            }],
+            ..Project::default()
+        };
+        let with_motor = solve(&project, None).unwrap().buses[0].nacd.expect("motor fault reports NACD");
+        assert!(with_motor < 0.99 && with_motor > 0.5, "motor NACD {with_motor}");
+
+        project.motors.clear();
+        project.sources[0].decrement_curve = vec![
+            DecrementPoint { time_s: 0.0, current_ratio: 1.0 },
+            DecrementPoint { time_s: 0.1, current_ratio: 0.7 },
+        ];
+        let local = solve(&project, None).unwrap().buses[0].nacd.expect("local source reports NACD");
+        assert!(local < 1e-6, "decrement-curve source NACD {local}");
     }
 
     #[test]

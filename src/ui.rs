@@ -1423,17 +1423,21 @@ fn duty_grid(ui: &mut egui::Ui, rows: &[InterruptingDuty]) {
         }
         ui.end_row();
         for row in rows {
-            let ink = duty_color(&row.status);
+            let ink = duty_ink(row);
             let rating = match row.adjusted_symmetrical_ka {
                 Some(ka) => format!("{ka:.3} adjusted"),
                 None => format!("{:.3} rated", row.rated_symmetrical_ka),
+            };
+            let status = match row.remote_status.as_deref() {
+                Some(remote) => format!("{}  remote {remote}", row.status),
+                None => row.status.clone(),
             };
             ui.label(RichText::new(&row.id).color(ink)).on_hover_text(&row.note);
             ui.label(RichText::new(&row.name).color(ink)).on_hover_text(&row.note);
             ui.label(RichText::new(&row.bus_id).color(ink)).on_hover_text(&row.note);
             ui.label(RichText::new(format!("{:.3}", row.symmetrical_ka)).color(ink)).on_hover_text(&row.note);
             ui.label(RichText::new(rating).color(ink)).on_hover_text(&row.note);
-            ui.label(RichText::new(&row.status).color(ink)).on_hover_text(&row.note);
+            ui.label(RichText::new(status).color(ink)).on_hover_text(&row.note);
             ui.end_row();
         }
     });
@@ -1444,8 +1448,19 @@ fn duty_label(ui: &mut egui::Ui, row: &InterruptingDuty) {
         Some(ka) => format!("{ka:.3} kA adjusted"),
         None => format!("{:.3} kA rated", row.rated_symmetrical_ka),
     };
-    let text = format!("{}  {:.3} kA symmetrical  {rating}  {}", row.id, row.symmetrical_ka, row.status);
-    ui.label(RichText::new(text).color(duty_color(&row.status))).on_hover_text(&row.note);
+    let mut text = format!("{}  {:.3} kA symmetrical  {rating}  {}", row.id, row.symmetrical_ka, row.status);
+    if let (Some(factor), Some(status)) = (row.remote_multiplying_factor, row.remote_status.as_deref()) {
+        let nacd = row.nacd.map(|value| format!("  NACD {value:.2}")).unwrap_or_default();
+        text.push_str(&format!("  remote {factor:.3} {status}{nacd}"));
+    }
+    ui.label(RichText::new(text).color(duty_ink(row))).on_hover_text(&row.note);
+}
+
+fn duty_ink(row: &InterruptingDuty) -> Color32 {
+    match row.remote_status.as_deref() {
+        Some("exceeds_rating" | "marginal") => color("#FFB300"),
+        _ => duty_color(&row.status),
+    }
 }
 
 fn duty_color(status: &str) -> Color32 {

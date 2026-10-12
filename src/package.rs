@@ -67,7 +67,8 @@ pub fn export(project: &Project) -> PackageExport {
 fn interrupting_duty_csv(project: &Project) -> (String, String) {
     let header = [
         "Id", "Name", "Kind", "Fault", "Bus", "SymmetricalKA", "SystemXR", "HalfCycleRmsKA",
-        "RatedSymmetricalKA", "TestXR", "RatedHalfCycleRmsKA", "AdjustedSymmetricalKA", "Status", "Note",
+        "RatedSymmetricalKA", "TestXR", "RatedHalfCycleRmsKA", "AdjustedSymmetricalKA", "Status",
+        "ContactPartingCycles", "RemoteMultiplyingFactor", "MultipliedSymmetricalKA", "NACD", "RemoteStatus", "Note",
     ];
     let mut body = csv_line(&header);
     let optional = |value: Option<f64>| value.map(fmt).unwrap_or_default();
@@ -88,6 +89,11 @@ fn interrupting_duty_csv(project: &Project) -> (String, String) {
                     &optional(row.rated_half_cycle_rms_ka),
                     &optional(row.adjusted_symmetrical_ka),
                     &row.status,
+                    &optional(row.contact_parting_cycles),
+                    &optional(row.remote_multiplying_factor),
+                    &optional(row.multiplied_symmetrical_ka),
+                    &optional(row.nacd),
+                    row.remote_status.as_deref().unwrap_or(""),
                     &row.note,
                 ]));
             }
@@ -500,6 +506,7 @@ fn xml(project: &Project, names: &Names) -> String {
                 ("InterruptingSymmetricalKA", "kA", device.interrupting.as_ref().map(|rating| fmt(rating.symmetrical_ka)).unwrap_or_default()),
                 ("InterruptingTestXR", "", device.interrupting.as_ref().map(|rating| fmt(rating.test_xr)).unwrap_or_default()),
                 ("InterruptingVoltageV", "V", device.interrupting.as_ref().map(|rating| fmt(rating.voltage_v)).unwrap_or_default()),
+                ("ContactPartingCycles", "cycles", device.interrupting.as_ref().and_then(|rating| rating.contact_parting_cycles).map(fmt).unwrap_or_default()),
             ]),
         ));
     }
@@ -770,6 +777,7 @@ fn devices_csv(project: &Project, names: &Names) -> String {
         "InterruptingSymmetricalKA",
         "InterruptingTestXR",
         "InterruptingVoltageV",
+        "ContactPartingCycles",
     ]);
     for device in &project.devices {
         let f = device_fields(&device.curve, device.fuse_total_clearing);
@@ -794,6 +802,7 @@ fn devices_csv(project: &Project, names: &Names) -> String {
             &rating.map(|rating| fmt(rating.symmetrical_ka)).unwrap_or_default(),
             &rating.map(|rating| fmt(rating.test_xr)).unwrap_or_default(),
             &rating.map(|rating| fmt(rating.voltage_v)).unwrap_or_default(),
+            &rating.and_then(|rating| rating.contact_parting_cycles).map(fmt).unwrap_or_default(),
         ]));
     }
     s
@@ -1158,9 +1167,9 @@ Protective devices
   already includes total clearing (every fuse total-clearing curve, and any
   other device entered with curve_is_total_clearing); BreakerInterruptingTime
   is then empty. InterruptingSymmetricalKA, InterruptingTestXR, and
-  InterruptingVoltageV are the entered interrupting rating. They are blank
-  when none is entered. The same three names are ProtectiveDevice XML
-  attributes.
+  InterruptingVoltageV are the entered interrupting rating. ContactPartingCycles
+  is the entered contact parting time in cycles. They are blank when none is
+  entered. The same interrupting names are ProtectiveDevice XML attributes.
 
 Interrupting duty
   interrupting-duty.csv lists each braced bus and each device that has an
@@ -1663,7 +1672,7 @@ mod tests {
         project.buses[1].bracing_ka = Some(65.0);
         project.buses[1].bracing_test_xr = Some(5.0);
         project.devices[0].interrupting = Some(crate::model::InterruptingRating {
-            symmetrical_ka: 65.0, test_xr: 5.0, voltage_v: 480.0,
+            symmetrical_ka: 65.0, test_xr: 5.0, voltage_v: 480.0, contact_parting_cycles: None,
         });
         let exported = export(&project);
         let devices = file(&exported, "protective-devices.csv");

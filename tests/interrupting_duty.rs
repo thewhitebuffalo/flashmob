@@ -15,7 +15,7 @@ fn fault_only() -> Studies {
 }
 
 fn rating(symmetrical_ka: f64, test_xr: f64, voltage_v: f64) -> InterruptingRating {
-    InterruptingRating { symmetrical_ka, test_xr, voltage_v }
+    InterruptingRating { symmetrical_ka, test_xr, voltage_v, contact_parting_cycles: None }
 }
 
 fn one_bus(source_xr: f64, bracing_ka: Option<f64>, bracing_test_xr: Option<f64>, interrupting: InterruptingRating) -> Project {
@@ -226,6 +226,46 @@ fn protected_branch_uses_the_terminal_current() {
     let local = fault.buses.iter().find(|bus| bus.id == "bus").unwrap().three_phase.as_ref().unwrap().symmetrical_ka;
     assert!(row.symmetrical_ka < local * 0.5, "device {} vs bus {}", row.symmetrical_ka, local);
     assert_eq!(row.bus_id, "bus");
+}
+
+#[test]
+fn remote_multiplier_applies_above_one_kilovolt_and_stays_off_below_it() {
+    let mut high = rating(0.50, 80.0, 13800.0);
+    high.contact_parting_cycles = Some(3.0);
+    let mut project = one_bus(80.0, None, None, high);
+    project.buses[0].kv = 13.8;
+    let out = study::run(&project, fault_only()).unwrap();
+    let row = device_row(&out);
+    assert_eq!(row.status, "within_rating");
+    let factor = row.remote_multiplying_factor.expect("remote factor");
+    let asymmetrical = (1.0 + 2.0 * (-4.0 * std::f64::consts::PI * 3.0 / 80.0).exp()).sqrt();
+    close(factor, asymmetrical / 1.1);
+    close(row.multiplied_symmetrical_ka.unwrap(), row.symmetrical_ka * factor);
+    assert_eq!(row.remote_status.as_deref(), Some("exceeds_rating"));
+    let nacd = row.nacd.expect("nacd");
+    assert!((nacd - 1.0).abs() < 1e-6, "{nacd}");
+    let warning = out.warnings.iter().find(|line| line.contains("remote multiplier")).expect("remote warning");
+    assert!(warning.contains("Local AC decrement is not applied"), "{warning}");
+    let report = study::text_report(&project, &out);
+    assert!(report.contains("Remote multiplier"));
+    assert!(report.contains("Local AC-decrement curves are not applied"));
+
+    let mut low = rating(0.50, 80.0, 480.0);
+    low.contact_parting_cycles = Some(3.0);
+    let low_out = study::run(&one_bus(80.0, None, None, low), fault_only()).unwrap();
+    let low_row = device_row(&low_out);
+    assert!(low_row.remote_status.is_none());
+    assert!(low_row.note.contains("not used at or below 1 kV"), "{}", low_row.note);
+    assert!(!low_out.warnings.iter().any(|line| line.contains("remote multiplier")));
+
+    let mut early = rating(100.0, 15.0, 13800.0);
+    early.contact_parting_cycles = Some(0.5);
+    let mut early_project = one_bus(15.0, None, None, early);
+    early_project.buses[0].kv = 13.8;
+    let early_out = study::run(&early_project, fault_only()).unwrap();
+    let early_row = device_row(&early_out);
+    assert!(early_row.remote_status.is_none());
+    assert!(early_row.note.contains("at least 1 cycle"), "{}", early_row.note);
 }
 
 #[test]

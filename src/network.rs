@@ -133,6 +133,17 @@ pub struct SystemModel {
     pub branches: Vec<BranchStamp>,
     pub warnings: Vec<String>,
     pub energized: Vec<bool>,
+    /// Sources and motors stamped on the positive-sequence network.
+    /// A source with an empty decrement curve is remote.
+    pub(crate) infeeds: Vec<Infeed>,
+}
+
+/// Machine admittance used for the three-phase no-AC-decrement split.
+#[derive(Clone, Debug)]
+pub(crate) struct Infeed {
+    pub bus: usize,
+    pub y: Cplx,
+    pub remote: bool,
 }
 
 pub fn build(project: &Project) -> Result<SystemModel, String> {
@@ -150,6 +161,7 @@ pub(crate) fn build_validated(project: &Project) -> Result<SystemModel, String> 
     let mut neg = Net::new(n);
     let mut zero = Net::new(n);
     let mut warnings = input_warnings(project);
+    let mut infeeds = Vec::new();
     let mut branches = Vec::new();
 
     for branch in &project.branches {
@@ -204,6 +216,7 @@ pub(crate) fn build_validated(project: &Project) -> Result<SystemModel, String> 
         let i = index.of(&source.bus)?;
         let z1 = Cplx::from_mag_xr(project.s_base_mva / source.mva_sc, source.xr);
         let y1 = z1.inv().ok_or_else(|| format!("source '{}' has zero impedance", source.id))?;
+        infeeds.push(Infeed { bus: i, y: y1, remote: source.decrement_curve.is_empty() });
         pos.shunt(i, y1);
         neg.shunt(i, y1);
         if let Neutral::Grounded(zn) = neutral(project, &source.id, None, index.kv[i]) {
@@ -229,6 +242,7 @@ pub(crate) fn build_validated(project: &Project) -> Result<SystemModel, String> 
         let x = motor.x_subtransient_pu * (project.s_base_mva / (kva / 1000.0)) * (motor.kv / index.kv[i]).powi(2);
         let r = x / motor.xr;
         let y = Cplx::new(r, x).inv().ok_or_else(|| format!("motor '{}' has zero impedance", motor.id))?;
+        infeeds.push(Infeed { bus: i, y, remote: false });
         pos.shunt(i, y);
         neg.shunt(i, y);
     }
@@ -238,7 +252,7 @@ pub(crate) fn build_validated(project: &Project) -> Result<SystemModel, String> 
             return Err("non-finite network admittance (check impedances and voltage bases)".into());
         }
     }
-    Ok(SystemModel { index, loadflow, pos, neg, zero, branches, warnings, energized })
+    Ok(SystemModel { index, loadflow, pos, neg, zero, branches, warnings, energized, infeeds })
 }
 
 /// Model-level assumptions and unusual entries reported with the study
