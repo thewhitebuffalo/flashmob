@@ -229,10 +229,11 @@ pub struct InterruptingDuty {
     /// Entered contact parting time, in cycles, when the remote multiplier was applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contact_parting_cycles: Option<f64>,
-    /// IEEE C37.010 remote multiplier. DC decrement only. Not reduced for local generation.
+    /// Applied interrupting multiplier. This is the remote DC-decrement factor
+    /// unless `local_ac_applied` says an entered generator decrement was blended in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_multiplying_factor: Option<f64>,
-    /// Symmetrical current times the remote multiplier.
+    /// Symmetrical current times the applied multiplier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multiplied_symmetrical_ka: Option<f64>,
     /// Three-phase no-AC-decrement ratio at the fault bus used for this row.
@@ -242,6 +243,9 @@ pub struct InterruptingDuty {
     /// The half-cycle `status` is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_status: Option<String>,
+    /// True when the stored multiplier blends an entered generator decrement by NACD.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local_ac_applied: bool,
 }
 
 pub fn run(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
@@ -357,7 +361,7 @@ fn run_one(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
         case_id: "normal".into(),
         methods: Methods {
             load_flow: "Newton-Raphson positive-sequence power flow".into(),
-            short_circuit: "Symmetrical components. Peak current uses the IEC 60909 factor. Half-cycle rms is the first-half-cycle asymmetrical value. Minimum and maximum symmetrical currents apply IEC 60909-0 Table 1 voltage factor c to that current. Impedance correction factors are not applied. A breaker above 1 kV with contact_parting_cycles also reports the IEEE C37.010 remote multiplier: asymmetrical rms at that parting time divided by the breaker asymmetry capability, and not below 1. NACD is reported. Local AC-decrement curves are not applied.".into(),
+            short_circuit: "Symmetrical components. Peak current uses the IEC 60909 factor. Half-cycle rms is the first-half-cycle asymmetrical value. Minimum and maximum symmetrical currents apply IEC 60909-0 Table 1 voltage factor c to that current. Impedance correction factors are not applied. A breaker above 1 kV with contact_parting_cycles reports an IEEE C37.010 multiplier: asymmetrical rms at that parting time divided by the breaker asymmetry capability, and not below 1. NACD is reported. When NACD is below 1 and a local source has an entered decrement curve, that multiplier blends the remote DC-decrement factor with the local factor from the curve at 60 Hz. Motor contribution without a decrement curve is not reduced. A source with no decrement curve stays remote.".into(),
             arc_flash: "IEEE 1584-2018".into(),
             coordination: "IEC 60255, IEEE C37.112, definite time, and a simplified thermal-magnetic breaker".into(),
         },
@@ -1958,6 +1962,7 @@ struct RemoteDuty {
     multiplied_symmetrical_ka: Option<f64>,
     nacd: Option<f64>,
     remote_status: Option<String>,
+    local_ac_applied: bool,
 }
 
 impl RemoteDuty {
@@ -1968,6 +1973,7 @@ impl RemoteDuty {
             multiplied_symmetrical_ka: None,
             nacd: None,
             remote_status: None,
+            local_ac_applied: false,
         }
     }
 }
@@ -2080,14 +2086,23 @@ fn remote_duty(
         note.push_str(" Contact parting time is not used at or below 1 kV. The remote multiplier is for breakers above 1 kV; this row stays on the half-cycle comparison.");
         return RemoteDuty::none();
     }
-    let factor = match duty::remote_multiplying_factor(best.system_xr, cycles) {
+    let remote_factor = match duty::remote_multiplying_factor(best.system_xr, cycles) {
         Ok(factor) => factor,
         Err(err) => {
             note.push_str(&format!(" Remote multiplier was not applied: {err}."));
             return RemoteDuty::none();
         }
     };
-    let multiplied = best.symmetrical_ka * factor;
+    let bus = fault.buses.iter().find(|row| row.id == best.fault_bus_id);
+    let applied = applied_multiplier(
+        project,
+        bus.map(|row| row.infeeds.as_slice()).unwrap_or(&[]),
+        bus.and_then(|row| row.nacd),
+        best.system_xr,
+        cycles,
+        remote_factor,
+    );
+    let multiplied = best.symmetrical_ka * applied.factor;
     let status = match duty::rated_symmetrical_status(multiplied, rating.symmetrical_ka) {
         Ok(status) => status,
         Err(err) => {
@@ -2095,17 +2110,154 @@ fn remote_duty(
             return RemoteDuty::none();
         }
     };
-    let nacd = fault.buses.iter().find(|row| row.id == best.fault_bus_id).and_then(|row| row.nacd);
-    note.push_str(" Remote multiplier is the DC-decrement factor at the entered contact parting time, divided by the breaker asymmetry capability, and not taken below 1. It does not replace the half-cycle comparison. Local AC-decrement curves are not applied, so this factor is not reduced when NACD is below 1. A source counts as remote unless it has a decrement curve. Motors are local.");
-    if nacd.is_none() {
-        note.push_str(" NACD was not reported because the infeed split did not match the fault current.");
-    }
+    note.push_str(&applied.note);
     RemoteDuty {
         contact_parting_cycles: Some(cycles),
-        remote_multiplying_factor: Some(factor),
+        remote_multiplying_factor: Some(applied.factor),
         multiplied_symmetrical_ka: Some(multiplied),
-        nacd,
+        nacd: applied.nacd,
         remote_status: Some(status.as_str().into()),
+        local_ac_applied: applied.local_ac_applied,
+    }
+}
+
+/// Contact parting is stored in cycles. Decrement curves are stored in seconds.
+/// The half-cycle let-through table is 60 Hz, and this conversion uses the same frequency.
+const PARTING_HZ: f64 = 60.0;
+
+struct AppliedMultiplier {
+    factor: f64,
+    nacd: Option<f64>,
+    local_ac_applied: bool,
+    note: String,
+}
+
+fn remote_only_note(extra: &str) -> String {
+    let mut note = " Remote multiplier is the DC-decrement factor at the entered contact parting time, divided by the breaker asymmetry capability, and not taken below 1. It does not replace the half-cycle comparison. Local AC-decrement curves are not applied. A source counts as remote unless it has a decrement curve. Motors are local and do not reduce the factor.".to_string();
+    if !extra.is_empty() {
+        note.push(' ');
+        note.push_str(extra);
+    }
+    note
+}
+
+fn applied_multiplier(
+    project: &Project,
+    infeeds: &[crate::fault::ThreePhaseInfeed],
+    nacd: Option<f64>,
+    system_xr: Option<f64>,
+    cycles: f64,
+    remote_factor: f64,
+) -> AppliedMultiplier {
+    let Some(raw_nacd) = nacd else {
+        return AppliedMultiplier {
+            factor: remote_factor,
+            nacd: None,
+            local_ac_applied: false,
+            note: remote_only_note("NACD was not reported because the infeed split did not match the fault current."),
+        };
+    };
+    if !raw_nacd.is_finite() || raw_nacd < -1e-6 || raw_nacd > 1.0 + 1e-6 {
+        return AppliedMultiplier {
+            factor: remote_factor,
+            nacd: None,
+            local_ac_applied: false,
+            note: remote_only_note("NACD was outside 0 to 1, so the remote multiplier was kept."),
+        };
+    }
+    let nacd = raw_nacd.clamp(0.0, 1.0);
+    if nacd >= 1.0 - 1e-9 {
+        return AppliedMultiplier {
+            factor: remote_factor,
+            nacd: Some(nacd),
+            local_ac_applied: false,
+            note: remote_only_note(""),
+        };
+    }
+    let time_s = cycles / PARTING_HZ;
+    let mut weight = 0.0;
+    let mut weighted = 0.0;
+    let mut used_curve = false;
+    for infeed in infeeds.iter().filter(|row| !row.remote) {
+        if !infeed.current_pu.is_finite() || infeed.current_pu < 0.0 {
+            return AppliedMultiplier {
+                factor: remote_factor,
+                nacd: Some(nacd),
+                local_ac_applied: false,
+                note: remote_only_note("A local infeed current was not finite, so the remote multiplier was kept."),
+            };
+        }
+        if infeed.current_pu <= 1e-15 {
+            continue;
+        }
+        let ac = if let Some(id) = &infeed.source_id {
+            let Some(source) = project.sources.iter().find(|source| source.id == *id) else {
+                return AppliedMultiplier {
+                    factor: remote_factor,
+                    nacd: Some(nacd),
+                    local_ac_applied: false,
+                    note: remote_only_note("A local source was missing from the project, so the remote multiplier was kept."),
+                };
+            };
+            if source.decrement_curve.is_empty() {
+                1.0
+            } else {
+                let ratio = source.decrement_ratio_at(time_s);
+                if !ratio.is_finite() || ratio <= 0.0 {
+                    return AppliedMultiplier {
+                        factor: remote_factor,
+                        nacd: Some(nacd),
+                        local_ac_applied: false,
+                        note: remote_only_note("An entered decrement was not a positive finite ratio at the contact parting time, so the remote multiplier was kept."),
+                    };
+                }
+                used_curve = true;
+                ratio
+            }
+        } else {
+            1.0
+        };
+        weight += infeed.current_pu;
+        weighted += infeed.current_pu * ac;
+    }
+    if !used_curve || weight <= 1e-15 {
+        return AppliedMultiplier {
+            factor: remote_factor,
+            nacd: Some(nacd),
+            local_ac_applied: false,
+            note: remote_only_note("Generator AC decrement was not entered, so the local share does not reduce the factor."),
+        };
+    }
+    let ac = weighted / weight;
+    let local = match duty::local_multiplying_factor(system_xr, cycles, ac) {
+        Ok(factor) => factor,
+        Err(err) => {
+            return AppliedMultiplier {
+                factor: remote_factor,
+                nacd: Some(nacd),
+                local_ac_applied: false,
+                note: remote_only_note(&format!("The local factor was not applied: {err}.")),
+            };
+        }
+    };
+    let factor = match duty::nacd_interpolated_factor(remote_factor, local, nacd) {
+        Ok(factor) => factor,
+        Err(err) => {
+            return AppliedMultiplier {
+                factor: remote_factor,
+                nacd: Some(nacd),
+                local_ac_applied: false,
+                note: remote_only_note(&format!("The local factor was not applied: {err}.")),
+            };
+        }
+    };
+    AppliedMultiplier {
+        factor,
+        nacd: Some(nacd),
+        local_ac_applied: true,
+        note: format!(
+            " Interrupting multiplier {factor:.3} blends the remote DC-decrement factor {remote_factor:.3} with the local factor {local:.3} by NACD {nacd:.3}. The local symmetrical-current ratio is {ac:.3}, weighted from entered generator decrement curves at {time_s:.4} s ({cycles:.2} cycles at 60 Hz). That ratio is combined with the DC term, divided by the breaker asymmetry capability, and not taken below 1. Motor contribution without a decrement curve stays at its initial symmetrical current and is not reduced. This is not a lookup of the published local application curves. It does not replace the half-cycle comparison. A source counts as remote unless it has a decrement curve."
+        ),
     }
 }
 
@@ -2147,6 +2299,7 @@ fn duty_row(
         multiplied_symmetrical_ka: remote.multiplied_symmetrical_ka,
         nacd: remote.nacd,
         remote_status: remote.remote_status.clone(),
+        local_ac_applied: remote.local_ac_applied,
     }
 }
 
@@ -2176,13 +2329,19 @@ fn remote_warning(row: &InterruptingDuty) -> Option<String> {
     let factor = row.remote_multiplying_factor?;
     let cycles = row.contact_parting_cycles?;
     let multiplied = row.multiplied_symmetrical_ka?;
+    let name = if row.local_ac_applied { "interrupting multiplier" } else { "remote multiplier" };
+    let ac = if row.local_ac_applied {
+        "Entered generator AC decrement is included. Motor contribution without a decrement curve is not reduced."
+    } else {
+        "Local AC decrement is not applied."
+    };
     match status {
         "exceeds_rating" => Some(format!(
-            "{}: {:.3} kA times remote multiplier {:.3} is {:.3} kA, which exceeds the rated symmetrical current {:.3} kA at {:.2} cycles contact parting. Local AC decrement is not applied.",
+            "{}: {:.3} kA times {name} {:.3} is {:.3} kA, which exceeds the rated symmetrical current {:.3} kA at {:.2} cycles contact parting. {ac}",
             row.id, row.symmetrical_ka, factor, multiplied, row.rated_symmetrical_ka, cycles
         )),
         "marginal" => Some(format!(
-            "{}: remote multiplier duty is above 90% of the rated symmetrical current and still within it",
+            "{}: {name} duty is above 90% of the rated symmetrical current and still within it",
             row.id
         )),
         _ => None,
@@ -2314,8 +2473,16 @@ pub fn text_report(project: &Project, out: &StudyOutput) -> String {
                 row.remote_status.as_deref(),
             ) {
                 let nacd = row.nacd.map(|value| format!("{value:.3}")).unwrap_or_else(|| "not reported".into());
+                let (label, tail) = if row.local_ac_applied {
+                    (
+                        "Interrupting multiplier",
+                        "NACD blends the remote factor with the entered generator decrement at 60 Hz. Motor contribution without a decrement curve is not reduced.",
+                    )
+                } else {
+                    ("Remote multiplier", "DC decrement only. Local AC-decrement curves are not applied.")
+                };
                 lines.push(format!(
-                    "    Remote multiplier  {factor:.3} at {cycles:.2} cycles contact parting  {multiplied:.3} kA  {status}  NACD {nacd}. DC decrement only. Local AC-decrement curves are not applied."
+                    "    {label}  {factor:.3} at {cycles:.2} cycles contact parting  {multiplied:.3} kA  {status}  NACD {nacd}. {tail}"
                 ));
             }
         }

@@ -144,6 +144,8 @@ pub(crate) struct Infeed {
     pub bus: usize,
     pub y: Cplx,
     pub remote: bool,
+    /// Set for a source. Absent for a motor.
+    pub source_id: Option<String>,
 }
 
 pub fn build(project: &Project) -> Result<SystemModel, String> {
@@ -216,7 +218,12 @@ pub(crate) fn build_validated(project: &Project) -> Result<SystemModel, String> 
         let i = index.of(&source.bus)?;
         let z1 = Cplx::from_mag_xr(project.s_base_mva / source.mva_sc, source.xr);
         let y1 = z1.inv().ok_or_else(|| format!("source '{}' has zero impedance", source.id))?;
-        infeeds.push(Infeed { bus: i, y: y1, remote: source.decrement_curve.is_empty() });
+        infeeds.push(Infeed {
+            bus: i,
+            y: y1,
+            remote: source.decrement_curve.is_empty(),
+            source_id: Some(source.id.clone()),
+        });
         pos.shunt(i, y1);
         neg.shunt(i, y1);
         if let Neutral::Grounded(zn) = neutral(project, &source.id, None, index.kv[i]) {
@@ -242,7 +249,7 @@ pub(crate) fn build_validated(project: &Project) -> Result<SystemModel, String> 
         let x = motor.x_subtransient_pu * (project.s_base_mva / (kva / 1000.0)) * (motor.kv / index.kv[i]).powi(2);
         let r = x / motor.xr;
         let y = Cplx::new(r, x).inv().ok_or_else(|| format!("motor '{}' has zero impedance", motor.id))?;
-        infeeds.push(Infeed { bus: i, y, remote: false });
+        infeeds.push(Infeed { bus: i, y, remote: false, source_id: None });
         pos.shunt(i, y);
         neg.shunt(i, y);
     }

@@ -97,6 +97,50 @@ pub fn remote_multiplying_factor(system_xr: Option<f64>, contact_parting_cycles:
     Ok(factor.max(1.0))
 }
 
+/// Local E/X multiplier from an entered symmetrical-current ratio.
+///
+/// `ac_ratio` is the symmetrical current remaining divided by the initial
+/// symmetrical current. The rms ratio is
+/// `sqrt(ac_ratio^2 + 2*exp(-4*pi*cycles/(X/R)))`. Infinite X/R uses
+/// `sqrt(ac_ratio^2 + 2)`. A purely resistive circuit has no DC term, so the
+/// rms ratio is `ac_ratio`. The result is that rms ratio divided by
+/// `asymmetry_capability`, and not taken below 1. An `ac_ratio` of 1 matches
+/// `remote_multiplying_factor`.
+pub fn local_multiplying_factor(system_xr: Option<f64>, contact_parting_cycles: f64, ac_ratio: f64) -> Result<f64, String> {
+    if !ac_ratio.is_finite() || ac_ratio <= 0.0 {
+        return Err("local AC ratio must be finite and positive".into());
+    }
+    let capability = asymmetry_capability(contact_parting_cycles)?;
+    let dc = match system_xr {
+        None => 2.0,
+        Some(xr) if xr == 0.0 => 0.0,
+        Some(xr) => {
+            if !xr.is_finite() || xr < 0.0 {
+                return Err("X/R must be finite and nonnegative".into());
+            }
+            2.0 * (-4.0 * std::f64::consts::PI * contact_parting_cycles / xr).exp()
+        }
+    };
+    let rms = (ac_ratio * ac_ratio + dc).sqrt();
+    let factor = rms / capability;
+    if !rms.is_finite() || !factor.is_finite() {
+        return Err("non-finite local multiplying factor".into());
+    }
+    Ok(factor.max(1.0))
+}
+
+/// `nacd * remote + (1 - nacd) * local`, with both factors kept at or above 1.
+pub fn nacd_interpolated_factor(remote: f64, local: f64, nacd: f64) -> Result<f64, String> {
+    if !remote.is_finite() || !local.is_finite() || !nacd.is_finite() || !(0.0..=1.0).contains(&nacd) {
+        return Err("NACD interpolation needs finite factors and a NACD from 0 to 1".into());
+    }
+    let factor = nacd * remote.max(1.0) + (1.0 - nacd) * local.max(1.0);
+    if !factor.is_finite() {
+        return Err("non-finite interpolated multiplying factor".into());
+    }
+    Ok(factor)
+}
+
 /// Symmetrical duty against a symmetrical rating. The bottom band is within rating.
 pub fn rated_symmetrical_status(duty_ka: f64, rated_ka: f64) -> Result<DutyStatus, String> {
     if !duty_ka.is_finite() || duty_ka < 0.0 || !rated_ka.is_finite() || rated_ka < 0.0 {
@@ -191,6 +235,31 @@ mod tests {
         assert!((asymmetry_capability(4.0).unwrap() - 1.0).abs() < 1e-12);
         assert!((asymmetry_capability(5.0).unwrap() - 1.0).abs() < 1e-12);
         assert!(asymmetry_capability(0.5).is_err());
+    }
+
+    #[test]
+    fn local_factor_uses_the_entered_ac_ratio_and_blends_by_nacd() {
+        let cycles = 3.0;
+        let ac = 0.70;
+        let dc = 2.0 * (-4.0 * std::f64::consts::PI * cycles / 80.0).exp();
+        let rms = (ac * ac + dc).sqrt();
+        let local = local_multiplying_factor(Some(80.0), cycles, ac).unwrap();
+        assert!((local - rms / 1.1).abs() < 1e-12, "{local}");
+        // The closed form is about 1.20. A rounded reading of the same point is 1.21.
+        assert!((local - 1.20).abs() < 0.01, "{local}");
+        assert!((local - 1.21).abs() > 0.005, "{local}");
+        let remote = remote_multiplying_factor(Some(80.0), cycles).unwrap();
+        assert!((local_multiplying_factor(Some(80.0), cycles, 1.0).unwrap() - remote).abs() < 1e-12);
+        assert!((nacd_interpolated_factor(remote, local, 1.0).unwrap() - remote).abs() < 1e-12);
+        assert!((nacd_interpolated_factor(remote, local, 0.0).unwrap() - local).abs() < 1e-12);
+        let mid = nacd_interpolated_factor(remote, local, 0.5).unwrap();
+        assert!((mid - 0.5 * (remote + local)).abs() < 1e-12, "{mid}");
+        let resistive = local_multiplying_factor(Some(0.0), cycles, ac).unwrap();
+        assert!((resistive - 1.0).abs() < 1e-12, "{resistive}");
+        let infinite = local_multiplying_factor(None, cycles, ac).unwrap();
+        assert!((infinite - (ac * ac + 2.0).sqrt() / 1.1).abs() < 1e-12, "{infinite}");
+        assert!(local_multiplying_factor(Some(80.0), cycles, 0.0).is_err());
+        assert!(nacd_interpolated_factor(remote, local, 1.1).is_err());
     }
 
     #[test]

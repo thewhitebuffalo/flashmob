@@ -1429,7 +1429,10 @@ fn duty_grid(ui: &mut egui::Ui, rows: &[InterruptingDuty]) {
                 None => format!("{:.3} rated", row.rated_symmetrical_ka),
             };
             let status = match row.remote_status.as_deref() {
-                Some(remote) => format!("{}  remote {remote}", row.status),
+                Some(remote) => {
+                    let kind = if row.local_ac_applied { "multiplier" } else { "remote" };
+                    format!("{}  {kind} {remote}", row.status)
+                }
                 None => row.status.clone(),
             };
             ui.label(RichText::new(&row.id).color(ink)).on_hover_text(&row.note);
@@ -1451,7 +1454,8 @@ fn duty_label(ui: &mut egui::Ui, row: &InterruptingDuty) {
     let mut text = format!("{}  {:.3} kA symmetrical  {rating}  {}", row.id, row.symmetrical_ka, row.status);
     if let (Some(factor), Some(status)) = (row.remote_multiplying_factor, row.remote_status.as_deref()) {
         let nacd = row.nacd.map(|value| format!("  NACD {value:.2}")).unwrap_or_default();
-        text.push_str(&format!("  remote {factor:.3} {status}{nacd}"));
+        let kind = if row.local_ac_applied { "multiplier" } else { "remote" };
+        text.push_str(&format!("  {kind} {factor:.3} {status}{nacd}"));
     }
     ui.label(RichText::new(text).color(duty_ink(row))).on_hover_text(&row.note);
 }

@@ -38,6 +38,21 @@ pub struct BusFault {
     /// Line-to-ground ratio is not calculated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nacd: Option<f64>,
+    /// Machines that make up `nacd`. Empty when the ratio is omitted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub infeeds: Vec<ThreePhaseInfeed>,
+}
+
+/// One machine's symmetrical contribution to the three-phase fault.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ThreePhaseInfeed {
+    /// Source id. Absent for a motor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    /// Magnitude of this machine's current, per unit on the study base.
+    pub current_pu: f64,
+    /// True when the machine has no decrement curve.
+    pub remote: bool,
 }
 
 /// Positive-sequence branch-terminal current for a bolted three-phase fault,
@@ -132,6 +147,7 @@ pub(crate) fn solve_with_model(project: &Project, loadflow: Option<&LoadflowResu
                 note: Some(error.clone().unwrap_or_else(|| "unenergized island: no utility/generator source".into())),
                 error: None,
                 nacd: None,
+                infeeds: Vec::new(),
             });
             continue;
         }
@@ -151,6 +167,7 @@ pub(crate) fn solve_with_model(project: &Project, loadflow: Option<&LoadflowResu
                 note: Some(format!("fault calculation failed at this bus: {err}")),
                 error: Some(err),
                 nacd: None,
+                infeeds: Vec::new(),
             },
         };
         buses.push(bus);
@@ -207,11 +224,12 @@ fn bus_fault(
     // LF prefault includes initial branch flow; flat prefault neglects initial load flow.
     let mut terminal_currents = Vec::new();
     let mut nacd = None;
+    let mut infeeds = Vec::new();
     if let (Some(mut drop), Some(z)) = (column1, zz1) {
         // Y^-1 (e_k * I_fault) = (Y^-1 e_k) * I_fault is the voltage drop.
         let current = v / z;
         for value in &mut drop { *value = *value * current; }
-        nacd = three_phase_nacd(model, map1, &drop, current);
+        (nacd, infeeds) = three_phase_split(model, map1, &drop, current);
         if drop.iter().any(|v| !v.re.is_finite() || !v.im.is_finite()) {
             return Err("non-finite linear solution".into());
         }
@@ -249,36 +267,51 @@ fn bus_fault(
         error: None,
         terminal_currents,
         nacd,
+        infeeds,
     })
 }
 
-/// Remote symmetrical current over the total three-phase fault current.
+/// Remote symmetrical current over the total three-phase fault current, and
+/// the machine currents behind that ratio.
 ///
 /// Each infeed current is its admittance times the fault voltage drop. A
 /// source with no decrement curve is remote. A motor, or a source that has a
-/// decrement curve, is local. The ratio is omitted when those infeeds do not
-/// add up to the fault current, which happens when another shunt is present.
-fn three_phase_nacd(model: &network::SystemModel, map1: &[Option<usize>], drop: &[Cplx], i_fault: Cplx) -> Option<f64> {
+/// decrement curve, is local. Both results are omitted when those infeeds do
+/// not add up to the fault current, which happens when another shunt is present.
+fn three_phase_split(model: &network::SystemModel, map1: &[Option<usize>], drop: &[Cplx], i_fault: Cplx) -> (Option<f64>, Vec<ThreePhaseInfeed>) {
     let total = i_fault.abs();
     if model.infeeds.is_empty() || total < 1e-12 {
-        return None;
+        return (None, Vec::new());
     }
     let mut remote = Cplx::ZERO;
     let mut accounted = Cplx::ZERO;
+    let mut rows = Vec::with_capacity(model.infeeds.len());
     for infeed in &model.infeeds {
         let Some(index) = map1.get(infeed.bus).copied().flatten() else { continue };
         let current = infeed.y * drop[index];
+        let magnitude = current.abs();
+        if !magnitude.is_finite() {
+            return (None, Vec::new());
+        }
         accounted += current;
         if infeed.remote {
             remote += current;
         }
+        rows.push(ThreePhaseInfeed {
+            source_id: infeed.source_id.clone(),
+            current_pu: magnitude,
+            remote: infeed.remote,
+        });
     }
     let mismatch = (accounted - i_fault).abs() / total;
     if !mismatch.is_finite() || mismatch > 0.02 {
-        return None;
+        return (None, Vec::new());
     }
     let ratio = remote.abs() / total;
-    ratio.is_finite().then_some(ratio)
+    if !ratio.is_finite() {
+        return (None, Vec::new());
+    }
+    (Some(ratio), rows)
 }
 
 fn reduced(net: &Net, energized: &[bool]) -> Result<(crate::network::SparseY, Vec<Option<usize>>), String> {
@@ -477,6 +510,9 @@ mod tests {
         assert!((point.symmetrical_max_ka - 1.10 * expect).abs() / expect < 1e-6);
         let nacd = fault.buses[0].nacd.expect("utility-only fault reports NACD");
         assert!((nacd - 1.0).abs() < 1e-6, "utility-only NACD {nacd}");
+        assert_eq!(fault.buses[0].infeeds.len(), 1);
+        assert!(fault.buses[0].infeeds[0].remote);
+        assert_eq!(fault.buses[0].infeeds[0].source_id.as_deref(), Some("s"));
     }
 
     #[test]
@@ -495,16 +531,23 @@ mod tests {
             }],
             ..Project::default()
         };
-        let with_motor = solve(&project, None).unwrap().buses[0].nacd.expect("motor fault reports NACD");
-        assert!(with_motor < 0.99 && with_motor > 0.5, "motor NACD {with_motor}");
+        let with_motor = solve(&project, None).unwrap();
+        let motor_bus = &with_motor.buses[0];
+        let motor_nacd = motor_bus.nacd.expect("motor fault reports NACD");
+        assert!(motor_nacd < 0.99 && motor_nacd > 0.5, "motor NACD {motor_nacd}");
+        assert!(motor_bus.infeeds.iter().any(|row| row.source_id.as_deref() == Some("s") && row.remote));
+        assert!(motor_bus.infeeds.iter().any(|row| row.source_id.is_none() && !row.remote));
 
         project.motors.clear();
         project.sources[0].decrement_curve = vec![
             DecrementPoint { time_s: 0.0, current_ratio: 1.0 },
             DecrementPoint { time_s: 0.1, current_ratio: 0.7 },
         ];
-        let local = solve(&project, None).unwrap().buses[0].nacd.expect("local source reports NACD");
+        let local_fault = solve(&project, None).unwrap();
+        let local_bus = &local_fault.buses[0];
+        let local = local_bus.nacd.expect("local source reports NACD");
         assert!(local < 1e-6, "decrement-curve source NACD {local}");
+        assert!(local_bus.infeeds.iter().any(|row| row.source_id.as_deref() == Some("s") && !row.remote));
     }
 
     #[test]

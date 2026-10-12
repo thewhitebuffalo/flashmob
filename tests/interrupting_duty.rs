@@ -266,6 +266,109 @@ fn remote_multiplier_applies_above_one_kilovolt_and_stays_off_below_it() {
     let early_row = device_row(&early_out);
     assert!(early_row.remote_status.is_none());
     assert!(early_row.note.contains("at least 1 cycle"), "{}", early_row.note);
+    assert!(!early_row.local_ac_applied);
+}
+
+#[test]
+fn entered_generator_decrement_replaces_the_remote_multiplier_when_nacd_is_zero() {
+    let mut high = rating(0.50, 80.0, 13800.0);
+    high.contact_parting_cycles = Some(3.0);
+    let mut project = one_bus(80.0, None, None, high);
+    project.buses[0].kv = 13.8;
+    project.sources[0].decrement_curve = vec![
+        DecrementPoint { time_s: 0.0, current_ratio: 1.0 },
+        DecrementPoint { time_s: 0.05, current_ratio: 0.70 },
+    ];
+    let out = study::run(&project, fault_only()).unwrap();
+    let row = device_row(&out);
+    assert!(row.local_ac_applied);
+    let nacd = row.nacd.expect("nacd");
+    assert!(nacd < 1e-6, "{nacd}");
+    let ac = 0.70;
+    let dc = 2.0 * (-4.0 * std::f64::consts::PI * 3.0 / 80.0).exp();
+    let local = (ac * ac + dc).sqrt() / 1.1;
+    let remote = (1.0 + dc).sqrt() / 1.1;
+    close(row.remote_multiplying_factor.expect("factor"), local);
+    assert!(local < remote - 0.1, "local {local} remote {remote}");
+    assert!(row.note.contains("60 Hz"), "{}", row.note);
+    assert!(row.note.contains("entered generator"), "{}", row.note);
+    assert!(row.note.contains("not a lookup"), "{}", row.note);
+    let warning = out.warnings.iter().find(|line| line.contains("interrupting multiplier")).expect("blended warning");
+    assert!(warning.contains("Entered generator AC decrement is included"), "{warning}");
+    let report = study::text_report(&project, &out);
+    assert!(report.contains("Interrupting multiplier"));
+    assert!(report.contains("entered generator decrement at 60 Hz"));
+}
+
+#[test]
+fn nacd_blends_a_remote_source_with_an_entered_generator_decrement() {
+    let mut high = rating(0.50, 80.0, 13800.0);
+    high.contact_parting_cycles = Some(3.0);
+    let mut project = one_bus(80.0, None, None, high);
+    project.buses[0].kv = 13.8;
+    project.sources.push(Source {
+        id: "gen".into(),
+        name: "Generator".into(),
+        bus: "bus".into(),
+        in_service: true,
+        v_pu: 1.0,
+        angle_deg: 0.0,
+        mva_sc: 10.0,
+        decrement_curve: vec![
+            DecrementPoint { time_s: 0.0, current_ratio: 1.0 },
+            DecrementPoint { time_s: 0.05, current_ratio: 0.70 },
+        ],
+        xr: 80.0,
+        x0_over_x1: 1.0,
+        r0_over_r1: 1.0,
+        is_slack: false,
+        p_mw: 0.0,
+        qmin_mvar: None,
+        qmax_mvar: None,
+        defaulted: Vec::new(),
+    });
+    assert!(project.validate().is_empty(), "{:?}", project.validate());
+    let out = study::run(&project, fault_only()).unwrap();
+    let row = device_row(&out);
+    assert!(row.local_ac_applied);
+    let nacd = row.nacd.expect("nacd");
+    assert!((nacd - 0.5).abs() < 1e-6, "{nacd}");
+    let xr = row.system_xr.expect("system X/R");
+    assert!((xr - 80.0).abs() < 1e-6, "{xr}");
+    let dc = 2.0 * (-4.0 * std::f64::consts::PI * 3.0 / xr).exp();
+    let remote = (1.0 + dc).sqrt() / 1.1;
+    let local = (0.70 * 0.70 + dc).sqrt() / 1.1;
+    close(row.remote_multiplying_factor.expect("factor"), 0.5 * remote + 0.5 * local);
+}
+
+#[test]
+fn motor_contribution_does_not_reduce_the_remote_multiplier() {
+    let mut high = rating(0.50, 80.0, 13800.0);
+    high.contact_parting_cycles = Some(3.0);
+    let mut project = one_bus(80.0, None, None, high);
+    project.buses[0].kv = 13.8;
+    project.motors.push(Motor {
+        id: "m".into(),
+        name: "M".into(),
+        bus: "bus".into(),
+        hp: 1000.0,
+        kv: 13.8,
+        pf: 0.85,
+        efficiency: 0.94,
+        x_subtransient_pu: 0.17,
+        xr: 6.0,
+        defaulted: Vec::new(),
+    });
+    assert!(project.validate().is_empty(), "{:?}", project.validate());
+    let out = study::run(&project, fault_only()).unwrap();
+    let row = device_row(&out);
+    assert!(!row.local_ac_applied);
+    let nacd = row.nacd.expect("nacd");
+    assert!(nacd < 0.99 && nacd > 0.5, "{nacd}");
+    let factor = duty::remote_multiplying_factor(row.system_xr, 3.0).unwrap();
+    close(row.remote_multiplying_factor.expect("factor"), factor);
+    assert!(row.note.contains("Generator AC decrement was not entered"), "{}", row.note);
+    assert!(row.note.contains("Local AC-decrement curves are not applied"), "{}", row.note);
 }
 
 #[test]
