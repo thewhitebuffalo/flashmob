@@ -63,6 +63,17 @@ pub struct FaultPoint {
     pub x_over_r: Option<f64>,
     pub iec_peak_ka: f64,
     pub half_cycle_rms_ka: f64,
+    /// IEC 60909-0 Table 1 voltage factor c at this bus nominal voltage.
+    /// Minimum and maximum symmetrical currents are this fault current times
+    /// c / |prefault|. Impedance correction factors are not applied.
+    #[serde(default)]
+    pub c_min: f64,
+    #[serde(default)]
+    pub c_max: f64,
+    #[serde(default)]
+    pub symmetrical_min_ka: f64,
+    #[serde(default)]
+    pub symmetrical_max_ka: f64,
 }
 
 pub fn solve(project: &Project, loadflow: Option<&LoadflowResult>) -> Result<FaultResult, String> {
@@ -148,14 +159,14 @@ fn bus_fault(
     let zz1 = map1[i].zip(column1.as_ref()).map(|(k, col)| col[k]);
     let mut note = None;
     let three = match zz1 {
-        Some(z) => { checked_impedance(z)?; Some(point(v / z, Cplx::ZERO, Cplx::ZERO, z, ibase, kv)?) },
+        Some(z) => { checked_impedance(z)?; Some(point(v / z, Cplx::ZERO, Cplx::ZERO, z, ibase, kv, v.abs(), project.low_voltage_tolerance_plus_10)?) },
         None => None,
     };
     let line_line = match (zz1, zz2) {
         (Some(a), Some(b)) => {
             checked_impedance(a + b)?;
             let i1 = v / (a + b);
-            Some(point(i1, -i1, Cplx::ZERO, a + b, ibase, kv)?)
+            Some(point(i1, -i1, Cplx::ZERO, a + b, ibase, kv, v.abs(), project.low_voltage_tolerance_plus_10)?)
         }
         _ => None,
     };
@@ -164,19 +175,19 @@ fn bus_fault(
             checked_impedance(a + b + c)?;
             checked_impedance(b + c)?;
             let i1 = v / (a + b + c);
-            let lg = point(i1, i1, i1, a + b + c, ibase, kv)?;
+            let lg = point(i1, i1, i1, a + b + c, ibase, kv, v.abs(), project.low_voltage_tolerance_plus_10)?;
             let zpar = (b * c) / (b + c);
             checked_impedance(a + zpar)?;
             let i1g = v / (a + zpar);
             let i2 = -i1g * c / (b + c);
             let i0 = -i1g * b / (b + c);
-            (Some(lg), Some(point(i1g, i2, i0, a + zpar, ibase, kv)?))
+            (Some(lg), Some(point(i1g, i2, i0, a + zpar, ibase, kv, v.abs(), project.low_voltage_tolerance_plus_10)?))
         }
         (Some(a), Some(b), None) => {
             note = Some("no zero-sequence path (ungrounded or delta-isolated); ground fault current is zero".into());
             checked_impedance(a + b)?;
             let i1 = v / (a + b);
-            (Some(zero_point()), Some(point(i1, -i1, Cplx::ZERO, a + b, ibase, kv)?))
+            (Some(zero_point(kv, project.low_voltage_tolerance_plus_10)?), Some(point(i1, -i1, Cplx::ZERO, a + b, ibase, kv, v.abs(), project.low_voltage_tolerance_plus_10)?))
         }
         _ => (None, None),
     };
@@ -234,11 +245,12 @@ fn reduced(net: &Net, energized: &[bool]) -> Result<(crate::network::SparseY, Ve
     Ok(network::reduce(&net.y, &mask))
 }
 
-fn point(i1: Cplx, i2: Cplx, i0: Cplx, zth: Cplx, ibase: f64, kv: f64) -> Result<FaultPoint, String> {
+fn point(i1: Cplx, i2: Cplx, i0: Cplx, zth: Cplx, ibase: f64, kv: f64, prefault_pu: f64, low_voltage_tolerance_plus_10: bool) -> Result<FaultPoint, String> {
     let (ia, ib, ic) = phases(i0, i1, i2);
     let ig = i0 * 3.0;
     let sym = ia.abs().max(ib.abs()).max(ic.abs()) * ibase;
     let (xr, peak, asym) = asymmetry(sym, zth, kv)?;
+    let (c_min, c_max, symmetrical_min_ka, symmetrical_max_ka) = scaled_symmetrical(sym, kv, prefault_pu, low_voltage_tolerance_plus_10)?;
     Ok(FaultPoint {
         symmetrical_ka: sym,
         ia_ka: ia.abs() * ibase,
@@ -248,11 +260,16 @@ fn point(i1: Cplx, i2: Cplx, i0: Cplx, zth: Cplx, ibase: f64, kv: f64) -> Result
         x_over_r: xr,
         iec_peak_ka: peak,
         half_cycle_rms_ka: asym,
+        c_min,
+        c_max,
+        symmetrical_min_ka,
+        symmetrical_max_ka,
     })
 }
 
-fn zero_point() -> FaultPoint {
-    FaultPoint {
+fn zero_point(kv: f64, low_voltage_tolerance_plus_10: bool) -> Result<FaultPoint, String> {
+    let (c_min, c_max, _, _) = scaled_symmetrical(0.0, kv, 0.0, low_voltage_tolerance_plus_10)?;
+    Ok(FaultPoint {
         symmetrical_ka: 0.0,
         ia_ka: 0.0,
         ib_ka: 0.0,
@@ -261,6 +278,40 @@ fn zero_point() -> FaultPoint {
         x_over_r: Some(0.0),
         iec_peak_ka: 0.0,
         half_cycle_rms_ka: 0.0,
+        c_min,
+        c_max,
+        symmetrical_min_ka: 0.0,
+        symmetrical_max_ka: 0.0,
+    })
+}
+
+fn scaled_symmetrical(sym: f64, kv: f64, prefault_pu: f64, low_voltage_tolerance_plus_10: bool) -> Result<(f64, f64, f64, f64), String> {
+    let (c_min, c_max) = iec_voltage_factor(kv, low_voltage_tolerance_plus_10)?;
+    let (symmetrical_min_ka, symmetrical_max_ka) = if prefault_pu > 1e-12 {
+        (sym * c_min / prefault_pu, sym * c_max / prefault_pu)
+    } else {
+        (0.0, 0.0)
+    };
+    if !symmetrical_min_ka.is_finite() || !symmetrical_max_ka.is_finite() {
+        return Err("non-finite voltage-factor current".into());
+    }
+    Ok((c_min, c_max, symmetrical_min_ka, symmetrical_max_ka))
+}
+
+/// IEC 60909-0 Table 1 voltage factor c. Returns `(cmin, cmax)`.
+///
+/// At or below 1 kV, cmin is 0.95. cmax is 1.05 when the low-voltage tolerance
+/// flag is false (+6%) and 1.10 when it is true (+10%). Above 1 kV, cmin is
+/// 1.00 and cmax is 1.10 through medium and high voltage. The 35 kV boundary
+/// in the table does not change c.
+pub fn iec_voltage_factor(kv: f64, low_voltage_tolerance_plus_10: bool) -> Result<(f64, f64), String> {
+    if !kv.is_finite() || kv <= 0.0 {
+        return Err("voltage factor requires a positive finite nominal voltage".into());
+    }
+    if kv <= 1.0 {
+        Ok((0.95, if low_voltage_tolerance_plus_10 { 1.10 } else { 1.05 }))
+    } else {
+        Ok((1.00, 1.10))
     }
 }
 
@@ -363,8 +414,26 @@ mod tests {
         };
         let fault = solve(&project, None).unwrap();
         let expect = 500.0 / (3.0_f64.sqrt() * 13.8);
-        let got = fault.buses[0].three_phase.as_ref().unwrap().symmetrical_ka;
+        let point = fault.buses[0].three_phase.as_ref().unwrap();
+        let got = point.symmetrical_ka;
         assert!((got - expect).abs() / expect < 1e-6, "got {got}, expected {expect}");
+        // 13.8 kV is above 1 kV: IEC 60909-0 cmin = 1.00, cmax = 1.10.
+        // Flat prefault is 1.0 pu, so the factor multiplies the symmetrical current.
+        assert!((point.c_min - 1.00).abs() < 1e-12);
+        assert!((point.c_max - 1.10).abs() < 1e-12);
+        assert!((point.symmetrical_min_ka - expect).abs() / expect < 1e-6);
+        assert!((point.symmetrical_max_ka - 1.10 * expect).abs() / expect < 1e-6);
+    }
+
+    #[test]
+    fn voltage_factor_follows_the_one_kilovolt_boundary() {
+        assert_eq!(iec_voltage_factor(0.48, false).unwrap(), (0.95, 1.05));
+        assert_eq!(iec_voltage_factor(1.0, false).unwrap(), (0.95, 1.05));
+        assert_eq!(iec_voltage_factor(0.48, true).unwrap(), (0.95, 1.10));
+        assert_eq!(iec_voltage_factor(1.001, false).unwrap(), (1.00, 1.10));
+        assert_eq!(iec_voltage_factor(35.0, true).unwrap(), (1.00, 1.10));
+        assert_eq!(iec_voltage_factor(230.0, false).unwrap(), (1.00, 1.10));
+        assert!(iec_voltage_factor(0.0, false).is_err());
     }
 
     #[test]

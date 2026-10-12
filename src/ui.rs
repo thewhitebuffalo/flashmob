@@ -574,6 +574,12 @@ impl App {
                 ui.label(RichText::new("Short circuit").strong());
                 if let Some(p) = &fault.three_phase {
                     ui.label(format!("3P  {:.2} kA   X/R {}   peak {:.2} kA", p.symmetrical_ka, p.x_over_r.map(|v| format!("{v:.1}")).unwrap_or_else(|| "∞".into()), p.iec_peak_ka));
+                    if p.c_max > 0.0 {
+                        ui.label(format!(
+                            "Voltage factor c {:.2}–{:.2}   3P {:.2}–{:.2} kA",
+                            p.c_min, p.c_max, p.symmetrical_min_ka, p.symmetrical_max_ka
+                        ));
+                    }
                 }
                 if let Some(p) = &fault.line_to_ground {
                     ui.label(format!("LG  {:.2} kA", p.symmetrical_ka));
@@ -1444,7 +1450,7 @@ fn duty_label(ui: &mut egui::Ui, row: &InterruptingDuty) {
 
 fn duty_color(status: &str) -> Color32 {
     match status {
-        "exceeds_rating" | "not_adjusted" => color("#FFB300"),
+        "exceeds_rating" | "marginal" | "not_adjusted" => color("#FFB300"),
         _ => color("#E2E8F0"),
     }
 }

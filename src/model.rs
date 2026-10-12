@@ -48,6 +48,12 @@ pub struct Project {
     pub motor_contribution_s: f64,
     #[serde(default)]
     pub prefault: Prefault,
+    /// Low-voltage IEC 60909-0 voltage factor. False uses cmax = 1.05
+    /// (nominal-voltage tolerance of +6%). True uses cmax = 1.10 (+10%).
+    /// cmin stays 0.95 at or below 1 kV. Above 1 kV the factor is 1.10 / 1.00
+    /// either way.
+    #[serde(default)]
+    pub low_voltage_tolerance_plus_10: bool,
     /// Inputs that were not on the source document. The text report prints every entry.
     #[serde(default)]
     pub assumptions: Vec<Assumption>,
@@ -810,6 +816,7 @@ impl Default for Project {
             escape_possible: default_true(),
             motor_contribution_s: default_motor_contribution(),
             prefault: Prefault::Flat,
+            low_voltage_tolerance_plus_10: false,
             assumptions: Vec::new(),
             neutral_grounding: Vec::new(),
         }
@@ -825,6 +832,7 @@ impl Project {
             escape_possible: true,
             motor_contribution_s: default_motor_contribution(),
             prefault: Prefault::Flat,
+            low_voltage_tolerance_plus_10: false,
             assumptions: Vec::new(),
             switches: Vec::new(),
             switch_groups: Vec::new(),

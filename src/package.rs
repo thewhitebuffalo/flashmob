@@ -1676,7 +1676,7 @@ mod tests {
         let duty = file(&exported, "interrupting-duty.csv");
         assert!(duty.contains("brk-main") && duty.contains("MCC main"), "{duty}");
         assert!(duty.contains("bus_bracing") && duty.contains("device"), "{duty}");
-        assert!(duty.contains("within_rating") || duty.contains("exceeds_rating") || duty.contains("not_adjusted"), "{duty}");
+        assert!(duty.contains("within_rating") || duty.contains("marginal") || duty.contains("exceeds_rating") || duty.contains("not_adjusted"), "{duty}");
         assert!(file(&exported, "IMPORT.txt").contains("interrupting-duty.csv"));
         assert!(file(&exported, "IMPORT.txt").contains("InterruptingSymmetricalKA"));
     }

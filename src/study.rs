@@ -293,6 +293,9 @@ fn run_one(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
                 if let Some(msg) = &result.message {
                     warnings.push(msg.clone());
                 }
+                if result.converged {
+                    warnings.extend(voltage_screens(project, &result));
+                }
                 Some(result)
             }
             Err(err) => {
@@ -338,7 +341,7 @@ fn run_one(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
         case_id: "normal".into(),
         methods: Methods {
             load_flow: "Newton-Raphson positive-sequence power flow".into(),
-            short_circuit: "Symmetrical components. Peak current uses the IEC 60909 factor; half-cycle rms is the first-half-cycle asymmetrical value.".into(),
+            short_circuit: "Symmetrical components. Peak current uses the IEC 60909 factor. Half-cycle rms is the first-half-cycle asymmetrical value. Minimum and maximum symmetrical currents apply IEC 60909-0 Table 1 voltage factor c to that current. Impedance correction factors are not applied.".into(),
             arc_flash: "IEEE 1584-2018".into(),
             coordination: "IEC 60255, IEEE C37.112, definite time, and a simplified thermal-magnetic breaker".into(),
         },
@@ -2066,6 +2069,10 @@ fn duty_row(
 fn duty_warnings(rows: &[InterruptingDuty]) -> Vec<String> {
     rows.iter().filter_map(|row| match row.status.as_str() {
         "exceeds_rating" => Some(exceeds_warning(row)),
+        "marginal" => Some(format!(
+            "{}: duty is above 90% of the compared rating and still within it",
+            row.id
+        )),
         "not_adjusted" => Some(format!(
             "{}: rating was compared without a test X/R, so asymmetrical duty was not checked",
             row.id
@@ -2089,6 +2096,44 @@ fn exceeds_warning(row: &InterruptingDuty) -> String {
             row.id, row.symmetrical_ka, ka
         ),
     }
+}
+
+/// Bus voltage outside ±5% of nominal, and line phasor drop above 3% of nominal.
+/// A transformer is not screened as a line. An unenergized bus is not screened.
+fn voltage_screens(project: &Project, lf: &crate::loadflow::LoadflowResult) -> Vec<String> {
+    let mut out = Vec::new();
+    for bus in &lf.buses {
+        if bus.v_pu > 1e-6 && (bus.v_pu - 1.0).abs() > 0.05 + 1e-9 {
+            out.push(format!(
+                "{}: voltage {:.3} pu is outside the ±5% band around nominal. This is a study screen, not a code calculation.",
+                bus.id, bus.v_pu
+            ));
+        }
+    }
+    for branch in &project.branches {
+        let crate::model::BranchKind::Line { .. } = branch.kind else { continue };
+        let Some(from) = lf.buses.iter().find(|row| row.id == branch.from) else { continue };
+        let Some(to) = lf.buses.iter().find(|row| row.id == branch.to) else { continue };
+        if from.v_pu <= 1e-6 || to.v_pu <= 1e-6 { continue; }
+        let base = from.kv_nominal.max(to.kv_nominal).max(1e-6);
+        if (from.kv_nominal - to.kv_nominal).abs() > 1e-6 * base { continue; }
+        let drop = phasor_separation(from.v_pu, from.angle_deg, to.v_pu, to.angle_deg);
+        if drop > 0.03 + 1e-9 {
+            out.push(format!(
+                "{}: line voltage drop {:.2}% of nominal is above 3%. This is a study screen, not a code calculation.",
+                branch.id, drop * 100.0
+            ));
+        }
+    }
+    out
+}
+
+fn phasor_separation(v1: f64, angle1_deg: f64, v2: f64, angle2_deg: f64) -> f64 {
+    let a1 = angle1_deg.to_radians();
+    let a2 = angle2_deg.to_radians();
+    let re = v1 * a1.cos() - v2 * a2.cos();
+    let im = v1 * a1.sin() - v2 * a2.sin();
+    (re * re + im * im).sqrt()
 }
 
 pub fn text_report(project: &Project, out: &StudyOutput) -> String {
@@ -2129,6 +2174,12 @@ pub fn text_report(project: &Project, out: &StudyOutput) -> String {
             let three = fault.three_phase.as_ref().map(|p| format!("{:.2} kA", p.symmetrical_ka)).unwrap_or_else(|| "—".into());
             let lg = fault.line_to_ground.as_ref().map(|p| format!("{:.2} kA", p.symmetrical_ka)).unwrap_or_else(|| "—".into());
             lines.push(format!("    Short circuit  3P {three}  LG {lg}  (calculated, prefault {})", out.fault.as_ref().map(|f| f.prefault.as_str()).unwrap_or("")));
+            if let Some(point) = fault.three_phase.as_ref().filter(|point| point.c_max > 0.0) {
+                lines.push(format!(
+                    "    Voltage factor  cmin {:.2}  cmax {:.2}  3P minimum {:.2} kA  3P maximum {:.2} kA. IEC 60909-0 Table 1 applied to this symmetrical current. Impedance correction factors are not applied.",
+                    point.c_min, point.c_max, point.symmetrical_min_ka, point.symmetrical_max_ka
+                ));
+            }
         }
         if let Some(bracing) = bus.bracing_ka {
             lines.push(format!(
@@ -2785,5 +2836,42 @@ mod operating_case_regression {
         // A break-before-make interlock rejects a case with both throws closed.
         project.operating_cases.push(states("both_closed", &[("gen_contact", true)]));
         assert!(run(&project, Studies::all()).is_err());
+    }
+
+    #[test]
+    fn voltage_screens_flag_a_bus_outside_five_percent_and_a_line_above_three_percent() {
+        use crate::loadflow::{BranchResult, BusResult, LoadflowResult};
+        let project = Project {
+            branches: vec![Branch {
+                id: "feeder".into(),
+                name: "Feeder".into(),
+                from: "a".into(),
+                to: "b".into(),
+                kind: BranchKind::Line { r_ohm: 0.1, x_ohm: 0.1, b_siemens: 0.0, r0_ohm: 0.0, x0_ohm: 0.0, ampacity_a: None },
+            }],
+            ..Project::default()
+        };
+        let bus = |id: &str, v: f64| BusResult {
+            id: id.into(), name: id.into(), kv_nominal: 0.48, v_pu: v, angle_deg: 0.0,
+            p_mw: 0.0, q_mvar: 0.0, kind: "pq".into(),
+        };
+        let lf = LoadflowResult {
+            converged: true,
+            iterations: 1,
+            max_mismatch_pu: 0.0,
+            buses: vec![bus("a", 1.0), bus("b", 0.94)],
+            branches: vec![BranchResult {
+                id: "feeder".into(), name: "Feeder".into(), from: "a".into(), to: "b".into(),
+                p_from_mw: 0.0, q_from_mvar: 0.0, p_to_mw: 0.0, q_to_mvar: 0.0,
+                i_from_a: 0.0, loading_pct: None, p_loss_mw: 0.0,
+            }],
+            message: None,
+        };
+        let notes = voltage_screens(&project, &lf);
+        assert!(notes.iter().any(|note| note.contains("b:") && note.contains("0.940 pu")), "{notes:?}");
+        assert!(notes.iter().any(|note| note.contains("feeder:") && note.contains("6.00%")), "{notes:?}");
+        assert!(notes.iter().all(|note| note.contains("not a code calculation")), "{notes:?}");
+        let quiet = LoadflowResult { buses: vec![bus("a", 1.0), bus("b", 0.98)], ..lf };
+        assert!(voltage_screens(&project, &quiet).is_empty(), "{:?}", voltage_screens(&project, &quiet));
     }
 }

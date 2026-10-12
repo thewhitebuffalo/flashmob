@@ -25,6 +25,8 @@ pub struct DutyComparison {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DutyStatus {
     WithinRating,
+    /// Above 90% of the compared rating and still within it.
+    Marginal,
     ExceedsRating,
     NotAdjusted,
 }
@@ -33,9 +35,24 @@ impl DutyStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::WithinRating => "within_rating",
+            Self::Marginal => "marginal",
             Self::ExceedsRating => "exceeds_rating",
             Self::NotAdjusted => "not_adjusted",
         }
+    }
+}
+
+/// Share of the compared rating at which duty becomes marginal.
+const MARGINAL_FRACTION: f64 = 0.90;
+
+fn band(duty: f64, rating: f64, below: DutyStatus) -> DutyStatus {
+    let tol = 1.0 + 1e-9;
+    if duty > rating * tol {
+        DutyStatus::ExceedsRating
+    } else if duty > rating * MARGINAL_FRACTION * tol {
+        DutyStatus::Marginal
+    } else {
+        below
     }
 }
 
@@ -67,11 +84,7 @@ pub fn compare(input: &DutyInput) -> Result<DutyComparison, String> {
         if !capability.is_finite() || !adjusted.is_finite() {
             return Err("non-finite adjusted rating".into());
         }
-        let status = if half_cycle_rms_ka <= capability * (1.0 + 1e-9) {
-            DutyStatus::WithinRating
-        } else {
-            DutyStatus::ExceedsRating
-        };
+        let status = band(half_cycle_rms_ka, capability, DutyStatus::WithinRating);
         Ok(DutyComparison {
             half_cycle_rms_ka,
             rated_half_cycle_rms_ka: Some(capability),
@@ -79,16 +92,38 @@ pub fn compare(input: &DutyInput) -> Result<DutyComparison, String> {
             status,
         })
     } else {
-        let status = if input.symmetrical_ka > input.rated_symmetrical_ka * (1.0 + 1e-9) {
-            DutyStatus::ExceedsRating
-        } else {
-            DutyStatus::NotAdjusted
-        };
+        let status = band(input.symmetrical_ka, input.rated_symmetrical_ka, DutyStatus::NotAdjusted);
         Ok(DutyComparison {
             half_cycle_rms_ka,
             rated_half_cycle_rms_ka: None,
             adjusted_symmetrical_ka: None,
             status,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input(symmetrical_ka: f64, test_xr: Option<f64>) -> DutyInput {
+        DutyInput { symmetrical_ka, system_xr: Some(5.0), rated_symmetrical_ka: 10.0, test_xr }
+    }
+
+    #[test]
+    fn ninety_percent_band_is_marginal_when_the_test_x_over_r_matches() {
+        // Equal X/R makes the half-cycle ratio equal the symmetrical ratio.
+        assert_eq!(compare(&input(8.9, Some(5.0))).unwrap().status, DutyStatus::WithinRating);
+        assert_eq!(compare(&input(9.0, Some(5.0))).unwrap().status, DutyStatus::WithinRating);
+        assert_eq!(compare(&input(9.5, Some(5.0))).unwrap().status, DutyStatus::Marginal);
+        assert_eq!(compare(&input(10.0, Some(5.0))).unwrap().status, DutyStatus::Marginal);
+        assert_eq!(compare(&input(10.1, Some(5.0))).unwrap().status, DutyStatus::ExceedsRating);
+    }
+
+    #[test]
+    fn symmetrical_only_comparison_stays_not_adjusted_below_ninety_percent() {
+        assert_eq!(compare(&input(8.9, None)).unwrap().status, DutyStatus::NotAdjusted);
+        assert_eq!(compare(&input(9.5, None)).unwrap().status, DutyStatus::Marginal);
+        assert_eq!(compare(&input(10.1, None)).unwrap().status, DutyStatus::ExceedsRating);
     }
 }
