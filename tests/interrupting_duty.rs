@@ -31,7 +31,7 @@ fn one_bus(source_xr: f64, bracing_ka: Option<f64>, bracing_test_xr: Option<f64>
         bracing_test_xr,
         equipment_class: None,
     });
-    project.sources.push(Source {
+    project.sources.push(Source { machine_kind: None, transient_mva_sc: None,
         id: "src".into(),
         name: "Source".into(),
         bus: "bus".into(),
@@ -306,7 +306,7 @@ fn nacd_blends_a_remote_source_with_an_entered_generator_decrement() {
     high.contact_parting_cycles = Some(3.0);
     let mut project = one_bus(80.0, None, None, high);
     project.buses[0].kv = 13.8;
-    project.sources.push(Source {
+    project.sources.push(Source { machine_kind: None, transient_mva_sc: None,
         id: "gen".into(),
         name: "Generator".into(),
         bus: "bus".into(),
@@ -356,12 +356,12 @@ fn close_and_latch_applies_above_one_kilovolt_and_uses_k() {
     assert_eq!(row.voltage_range_factor, Some(2.27));
     assert_eq!(row.status, "exceeds_rating");
     assert_eq!(row.close_latch_status.as_deref(), Some("marginal"));
-    assert!(row.note.contains("not a separate first-cycle reactance network"), "{}", row.note);
+    assert!(row.note.contains("does not replace the half-cycle comparison"), "{}", row.note);
     let warning = out.warnings.iter().find(|line| line.contains("close-and-latch")).expect("close-latch warning");
     assert!(warning.contains("above 90%"), "{warning}");
     let report = study::text_report(&project, &out);
     assert!(report.contains("Closing and latching"));
-    assert!(report.contains("not from a separate first-cycle reactance network"));
+    assert!(report.contains("first-cycle machine reactances"));
 
     let mut low = rating(0.20, 15.0, 480.0);
     low.voltage_range_factor = Some(2.27);
@@ -389,7 +389,7 @@ fn motor_contribution_does_not_reduce_the_remote_multiplier() {
     high.contact_parting_cycles = Some(3.0);
     let mut project = one_bus(80.0, None, None, high);
     project.buses[0].kv = 13.8;
-    project.motors.push(Motor {
+    project.motors.push(Motor { machine_kind: None, synchronous_rpm: None, phases: None,
         id: "m".into(),
         name: "M".into(),
         bus: "bus".into(),
@@ -488,4 +488,126 @@ fn bad_ratings_fail_validation_and_exec_can_set_them() {
     let duty = schema["interrupting_duty"].as_str().expect("schema key");
     assert!(duty.contains("test X/R") && duty.contains("not_adjusted") && duty.contains("sqrt"));
     assert!(schema["apply_library_device"].as_str().unwrap().starts_with("Copies a library point curve"));
+}
+
+fn medium_voltage_motor_bus(kind: Option<MotorKind>, hp: f64, rpm: Option<f64>, phases: Option<u8>) -> Project {
+    let mut high = rating(0.50, 15.0, 13800.0);
+    high.contact_parting_cycles = Some(3.0);
+    let mut project = one_bus(15.0, Some(1.0), Some(15.0), high);
+    project.buses[0].kv = 13.8;
+    project.motors.push(Motor {
+        id: "m".into(),
+        name: "M".into(),
+        bus: "bus".into(),
+        hp,
+        kv: 13.8,
+        pf: 0.85,
+        efficiency: 0.94,
+        x_subtransient_pu: 0.17,
+        xr: 15.0,
+        machine_kind: kind,
+        synchronous_rpm: rpm,
+        phases,
+        defaulted: Vec::new(),
+    });
+    assert!(project.validate().is_empty(), "{:?}", project.validate());
+    project
+}
+
+/// Interrupting-network symmetrical current behind the reported multiplier.
+fn interrupting_ka(row: &study::InterruptingDuty) -> f64 {
+    row.multiplied_symmetrical_ka.expect("multiplied") / row.remote_multiplying_factor.expect("factor")
+}
+
+#[test]
+fn classified_motor_duties_use_separate_first_cycle_and_interrupting_reactance() {
+    let base = study::run(&medium_voltage_motor_bus(None, 400.0, None, None), fault_only()).unwrap();
+    let base_row = device_row(&base);
+    // Unclassified: same current for both duties, reported as unscaled.
+    close(interrupting_ka(base_row), base_row.symmetrical_ka);
+    assert!(base.warnings.iter().any(|w| w.contains("machine_kind is absent")), "{:?}", base.warnings);
+    let source_only = {
+        let mut p = medium_voltage_motor_bus(None, 400.0, None, None);
+        p.motors.clear();
+        device_row(&study::run(&p, fault_only()).unwrap()).symmetrical_ka
+    };
+    let motor_ka = base_row.symmetrical_ka - source_only;
+    assert!(motor_ka > 0.0);
+
+    for (kind, hp, rpm, first, interrupting) in [
+        (MotorKind::Synchronous, 400.0, None, 1.0, 1.5),
+        (MotorKind::Induction, 400.0, Some(1800.0), 1.2, 3.0),
+        (MotorKind::Induction, 400.0, Some(3600.0), 1.0, 1.5),
+    ] {
+        let out = study::run(&medium_voltage_motor_bus(Some(kind), hp, rpm, Some(3)), fault_only()).unwrap();
+        let row = device_row(&out);
+        let first_ka = row.symmetrical_ka;
+        let int_ka = interrupting_ka(row);
+        assert!(int_ka < first_ka - 1e-6, "{kind:?} {rpm:?}: {int_ka} vs {first_ka}");
+        // A purely reactive-ratio-preserving scale on a same-X/R machine adds
+        // its contribution divided by the multiplier (same X/R as the source).
+        close(first_ka - source_only, motor_ka / first);
+        close(int_ka - source_only, motor_ka / interrupting);
+        close(row.close_latch_ka.unwrap(), 1.6 * first_ka);
+        let bracing = bracing_row(&out);
+        close(bracing.symmetrical_ka, first_ka);
+        assert!(row.note.contains("interrupting machine reactances"), "{}", row.note);
+        assert!(!out.warnings.iter().any(|w| w.contains("machine_kind is absent")));
+    }
+}
+
+#[test]
+fn small_and_single_phase_motors_drop_out_of_both_duty_networks() {
+    let mut p = medium_voltage_motor_bus(None, 400.0, None, None);
+    p.motors.clear();
+    let source_only = device_row(&study::run(&p, fault_only()).unwrap()).symmetrical_ka;
+    for project in [
+        medium_voltage_motor_bus(Some(MotorKind::Induction), 40.0, Some(1800.0), Some(3)),
+        medium_voltage_motor_bus(Some(MotorKind::Induction), 400.0, Some(1800.0), Some(1)),
+    ] {
+        let out = study::run(&project, fault_only()).unwrap();
+        let row = device_row(&out);
+        close(row.symmetrical_ka, source_only);
+        close(interrupting_ka(row), source_only);
+        // The main fault study still carries the motor.
+        let bus = &out.fault.as_ref().unwrap().buses[0];
+        assert!(bus.three_phase.as_ref().unwrap().symmetrical_ka > source_only + 1e-6);
+    }
+}
+
+#[test]
+fn induction_motor_without_speed_takes_the_larger_class_and_warns() {
+    let out = study::run(&medium_voltage_motor_bus(Some(MotorKind::Induction), 600.0, None, None), fault_only()).unwrap();
+    let with_speed = study::run(&medium_voltage_motor_bus(Some(MotorKind::Induction), 600.0, Some(3600.0), None), fault_only()).unwrap();
+    close(device_row(&out).symmetrical_ka, device_row(&with_speed).symmetrical_ka);
+    assert!(out.warnings.iter().any(|w| w.contains("synchronous_rpm is absent")), "{:?}", out.warnings);
+    assert!(!with_speed.warnings.iter().any(|w| w.contains("synchronous_rpm is absent")));
+}
+
+#[test]
+fn machine_fields_load_from_json_and_exec() {
+    let response = flashmob::exec::exec_request(r#"{
+        "commands": [
+            {"op": "add_bus", "id": "b", "kv": 13.8},
+            {"op": "add_source", "id": "s", "bus": "b", "mva_sc": 100.0, "xr": 15.0, "is_slack": true, "machine_kind": "utility"},
+            {"op": "add_source", "id": "g", "bus": "b", "mva_sc": 60.0, "xr": 30.0, "machine_kind": "hydro_without_amortisseur"},
+            {"op": "set_source", "id": "g", "transient_mva_sc": 40.0},
+            {"op": "add_motor", "id": "m", "bus": "b", "hp": 2000, "kv": 13.2, "machine_kind": "induction", "synchronous_rpm": 1200, "phases": 3}
+        ]
+    }"#);
+    assert!(response.ok, "{:?}", response.error);
+    let loaded = response.project;
+    assert_eq!(loaded.motors[0].machine_kind, Some(MotorKind::Induction));
+    assert_eq!(loaded.motors[0].synchronous_rpm, Some(1200.0));
+    assert_eq!(loaded.sources[1].machine_kind, Some(GeneratorKind::HydroWithoutAmortisseur));
+    assert_eq!(loaded.sources[1].transient_mva_sc, Some(40.0));
+    let text = serde_json::to_string(&loaded).unwrap();
+    let loaded: Project = serde_json::from_str(&text).unwrap();
+    assert_eq!(loaded.motors[0].phases, Some(3));
+    let mut bad = loaded.clone();
+    bad.motors[0].phases = Some(2);
+    assert!(bad.validate().iter().any(|e| e.contains("phases")));
+    // Omitted fields are not written back out.
+    let plain = serde_json::to_string(&Project::sample()).unwrap();
+    assert!(!plain.contains("machine_kind") && !plain.contains("synchronous_rpm") && !plain.contains("transient_mva_sc"));
 }

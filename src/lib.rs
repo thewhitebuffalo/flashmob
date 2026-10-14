@@ -9,6 +9,7 @@ pub mod duty;
 pub mod exec;
 pub mod fault;
 pub mod library;
+pub mod machine;
 pub mod library_apply;
 pub mod library_import;
 pub mod loadflow;

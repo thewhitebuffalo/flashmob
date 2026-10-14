@@ -477,7 +477,7 @@ mod tests {
     fn utility_fault_matches_short_circuit_mva() {
         let project = Project {
             buses: vec![Bus { id: "a".into(), name: "A".into(), kv: 13.8, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None }],
-            sources: vec![Source {
+            sources: vec![Source { machine_kind: None, transient_mva_sc: None,
                 id: "s".into(),
                 name: "grid".into(),
                 bus: "a".into(),
@@ -519,13 +519,13 @@ mod tests {
     fn nacd_drops_when_a_motor_or_a_decrement_curve_is_local() {
         let mut project = Project {
             buses: vec![Bus { id: "a".into(), name: "A".into(), kv: 13.8, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None }],
-            sources: vec![Source {
+            sources: vec![Source { machine_kind: None, transient_mva_sc: None,
                 id: "s".into(), name: "grid".into(), bus: "a".into(), in_service: true,
                 decrement_curve: Vec::new(), v_pu: 1.0, angle_deg: 0.0, mva_sc: 500.0, xr: 15.0,
                 x0_over_x1: 1.0, r0_over_r1: 1.0, is_slack: true, p_mw: 0.0,
                 qmin_mvar: None, qmax_mvar: None, defaulted: Vec::new(),
             }],
-            motors: vec![Motor {
+            motors: vec![Motor { machine_kind: None, synchronous_rpm: None, phases: None,
                 id: "m".into(), name: "M".into(), bus: "a".into(), hp: 1000.0, kv: 13.8,
                 pf: 0.85, efficiency: 0.94, x_subtransient_pu: 0.17, xr: 6.0, defaulted: Vec::new(),
             }],
@@ -586,7 +586,7 @@ mod tests {
                     r0_over_r1: 1.0,
                 },
             }],
-            sources: vec![Source {
+            sources: vec![Source { machine_kind: None, transient_mva_sc: None,
                 id: "s".into(),
                 name: "grid".into(),
                 bus: "hv".into(),

@@ -447,7 +447,7 @@ mod tests {
                 },
             }],
             loads: vec![Load { id: "ld".into(), name: "load".into(), bus: "b".into(), kw: 50_000.0, kvar: 0.0, basis: String::new() }],
-            sources: vec![Source {
+            sources: vec![Source { machine_kind: None, transient_mva_sc: None,
                 id: "s".into(),
                 name: "slack".into(),
                 bus: "a".into(),

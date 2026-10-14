@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::connectivity::{self, Topology};
-use crate::model::{ArcEquipment, Branch, BranchKind, Bus, CurrentLimiting, CurveSpec, DecrementPoint, Device, Electrode, EquipmentClass, EquipmentState, InterruptingRating, LibraryLink, Load, Motor, OperatingCase, Project, Source, SourceState, Switch, SwitchGroup, SwitchKind, SwitchState, XfmrConn};
+use crate::model::{ArcEquipment, GeneratorKind, MotorKind, Branch, BranchKind, Bus, CurrentLimiting, CurveSpec, DecrementPoint, Device, Electrode, EquipmentClass, EquipmentState, InterruptingRating, LibraryLink, Load, Motor, OperatingCase, Project, Source, SourceState, Switch, SwitchGroup, SwitchKind, SwitchState, XfmrConn};
 use crate::sld;
 use crate::study::{self, Studies, StudyOutput};
 use crate::tcc;
@@ -79,6 +79,8 @@ pub enum Command {
         #[serde(default)] is_slack: bool,
         #[serde(default = "default_true")] in_service: bool,
         #[serde(default)] p_mw: f64,
+        #[serde(default)] machine_kind: Option<GeneratorKind>,
+        #[serde(default)] transient_mva_sc: Option<f64>,
     },
     AddMotor {
         id: String,
@@ -90,6 +92,9 @@ pub enum Command {
         #[serde(default)] efficiency: Option<f64>,
         #[serde(default)] x_subtransient_pu: Option<f64>,
         #[serde(default)] xr: Option<f64>,
+        #[serde(default)] machine_kind: Option<MotorKind>,
+        #[serde(default)] synchronous_rpm: Option<f64>,
+        #[serde(default)] phases: Option<u8>,
     },
     AddDevice { id: String, #[serde(default)] name: String, bus: String, curve: CurveSpec, #[serde(default)] basis: String, #[serde(default)] protected_branch: Option<String>, #[serde(default)] breaker_interrupting_s: Option<f64>, #[serde(default)] fuse_total_clearing: bool, #[serde(default)] curve_is_total_clearing: bool, #[serde(default)] library: Option<LibraryLink>, #[serde(default)] current_limiting: Option<CurrentLimiting> },
     /// Copy a library point curve, dial curve, or trip setting onto a new device. The result is a snapshot.
@@ -171,6 +176,8 @@ pub enum Command {
         #[serde(default)] r0_over_r1: Option<f64>,
         #[serde(default)] is_slack: Option<bool>,
         #[serde(default)] in_service: Option<bool>,
+        #[serde(default)] machine_kind: Option<GeneratorKind>,
+        #[serde(default)] transient_mva_sc: Option<f64>,
     },
     /// Change fields of an existing protective device. Omitted fields are kept;
     /// `clear` lists optional fields to remove (protected_branch,
@@ -378,7 +385,7 @@ fn apply_one(project: &mut Project, command: &Command, out: &mut Outputs) -> Res
             fresh(id, project)?;
             project.loads.push(Load { id: id.clone(), name: named(name, id), bus: bus.clone(), kw: *kw, kvar: *kvar, basis: basis.clone() });
         }
-        Command::AddSource { id, name, bus, v_pu, angle_deg, mva_sc, decrement_curve, xr, x0_over_x1, r0_over_r1, is_slack, in_service, p_mw } => {
+        Command::AddSource { id, name, bus, v_pu, angle_deg, mva_sc, decrement_curve, xr, x0_over_x1, r0_over_r1, is_slack, in_service, p_mw, machine_kind, transient_mva_sc } => {
             fresh(id, project)?;
             let mut defaulted = Vec::new();
             let mut entered = |value: &Option<f64>, field: &str| value.unwrap_or_else(|| { defaulted.push(field.to_string()); Source::default_value(field).unwrap() });
@@ -399,10 +406,12 @@ fn apply_one(project: &mut Project, command: &Command, out: &mut Outputs) -> Res
                 p_mw: *p_mw,
                 qmin_mvar: None,
                 qmax_mvar: None,
+                machine_kind: *machine_kind,
+                transient_mva_sc: *transient_mva_sc,
                 defaulted,
             });
         }
-        Command::AddMotor { id, name, bus, hp, kv, pf, efficiency, x_subtransient_pu, xr } => {
+        Command::AddMotor { id, name, bus, hp, kv, pf, efficiency, x_subtransient_pu, xr, machine_kind, synchronous_rpm, phases } => {
             fresh(id, project)?;
             let mut defaulted = Vec::new();
             let mut entered = |value: &Option<f64>, field: &str| value.unwrap_or_else(|| { defaulted.push(field.to_string()); Motor::default_value(field).unwrap() });
@@ -417,6 +426,9 @@ fn apply_one(project: &mut Project, command: &Command, out: &mut Outputs) -> Res
                 efficiency,
                 x_subtransient_pu,
                 xr,
+                machine_kind: *machine_kind,
+                synchronous_rpm: *synchronous_rpm,
+                phases: *phases,
                 defaulted,
             });
         }
@@ -545,7 +557,7 @@ fn apply_one(project: &mut Project, command: &Command, out: &mut Outputs) -> Res
             if let Some(xr) = bracing_test_xr { bus.bracing_test_xr = Some(*xr); }
             if let Some(class) = equipment_class { bus.equipment_class = Some(*class); }
         }
-        Command::SetSource { id, mva_sc, decrement_curve, xr, v_pu, x0_over_x1, r0_over_r1, is_slack, in_service } => {
+        Command::SetSource { id, mva_sc, decrement_curve, xr, v_pu, x0_over_x1, r0_over_r1, is_slack, in_service, machine_kind, transient_mva_sc } => {
             let source = project.sources.iter_mut().find(|s| s.id == *id).ok_or_else(|| format!("no source '{id}'"))?;
             if let Some(v) = mva_sc { source.mva_sc = *v; }
             if let Some(v) = decrement_curve { source.decrement_curve = v.clone(); }
@@ -555,6 +567,8 @@ fn apply_one(project: &mut Project, command: &Command, out: &mut Outputs) -> Res
             if let Some(v) = r0_over_r1 { source.r0_over_r1 = *v; source.defaulted.retain(|f| f != "r0_over_r1"); }
             if let Some(v) = is_slack { source.is_slack = *v; }
             if let Some(v) = in_service { source.in_service = *v; }
+            if let Some(v) = machine_kind { source.machine_kind = Some(*v); }
+            if let Some(v) = transient_mva_sc { source.transient_mva_sc = Some(*v); }
         }
         Command::Run { studies } => {
             // A successful run does not change the model, so sld/tcc/package views
@@ -766,7 +780,8 @@ pub fn schema() -> serde_json::Value {
         "apply_library_device": "Copies a library point curve onto a new project device. The curve is a snapshot (studies do not read the library file). Multiples are scaled to amperes. Two bands are ordered faster then slower and marked assumed. fuse_total_clearing stays false unless set: a slower library band is often a current-tolerance side, not total clearing. For a fuse category, arc flash may still estimate clearing from that melting curve by IEEE 1584-2018 Clause 6.9.2 (10% of the melting time plus 0.004 s, and 0.01 s when that total is shorter). The estimate is assumed and is not the published total-clearing curve. A time_dial_curve_family is scaled by dial, tap_a (secondary amperes), and ct_ratio to one primary-ampere band. Trip settings named by function and label (lt_pickup, lt_delay, optional st_pickup, st_delay, and inst) build a thermal-magnetic curve from sensor_a; lt_delay_multiple says the current multiple of the long-time delay. library_path is the library JSON; an empty library_name stores that path. One agreeing symmetrical interrupting rating is copied onto the device; several different duties are left unset and named. An empty library_path uses the device library built into the program. A missing file or an invalid library does not change the project.",
         "device_library_link": "Optional device.library records which device-library entry a device came from: device_id (required), library, manufacturer, type, style, category, size, rating_a, voltage_v, modified, unsupported_elements. Studies use the curve and the device fields. The category is also read to recognize a library fuse for the IEEE 1584-2018 Clause 6.9.2 melting-time adjustment. add_device accepts it; set_device changes it, and set_device clear [\"library\"] removes it.",
         "voltage_factor": "Each fault current also reports c_min, c_max, symmetrical_min_ka, and symmetrical_max_ka from IEC 60909-0 Table 1. The symmetrical current is multiplied by c / |prefault pu|. At or below 1 kV, cmin is 0.95 and cmax is 1.05 unless low_voltage_tolerance_plus_10 is true, which selects cmax 1.10. Above 1 kV, cmin is 1.00 and cmax is 1.10. Impedance correction factors are not applied. Peak and half-cycle values stay on the unscaled symmetrical current.",
-        "interrupting_duty": "After a fault study is solved, including when that fault result is kept only for arc flash and then omitted from the output, each braced bus and each device with an interrupting rating is checked. The half-cycle factor is sqrt(1 + 2*exp(-2*pi/(X/R))); no resistance (infinite X/R) uses sqrt(3), and X/R of 0 uses 1. A bus with bracing_ka uses the three-phase or line-to-ground fault with the greater half-cycle rms. A device with protected_branch uses the bolted three-phase current through that branch at each terminal and keeps the larger one. Line-to-ground current through the branch is not stored, so it is not compared. Without protected_branch the greater of the device bus three-phase and line-to-ground faults is used. System X/R is the faulted bus Thevenin X/R, not a separate-network calculation. With a test X/R, adjusted symmetrical kA is rated symmetrical kA times factor(test X/R) / factor(system X/R). Half-cycle rms at or below 90% of the rated half-cycle rms is within_rating, above 90% and at or below that capability is marginal, and above it is exceeds_rating. Bracing without a test X/R is not an asymmetrical pass: symmetrical current above the bracing is exceeds_rating, above 90% and at or below the bracing is marginal, otherwise not_adjusted. exceeds_rating, marginal, and not_adjusted each add one warning; within_rating does not. If interrupting voltage_v is positive and the device bus nominal kV differs by more than 10 percent, the row notes the mismatch and the current comparison still stands. An invalid fault result produces no rows. set_bus accepts bracing_test_xr. set_device accepts interrupting (symmetrical_ka, test_xr, voltage_v, optional contact_parting_cycles) and can clear interrupting. Above 1 kV, contact_parting_cycles reports a remote multiplier: asymmetrical rms at that parting time, sqrt(1 + 2*exp(-4*pi*cycles/(X/R))), divided by the breaker asymmetry capability (1.4, 1.2, 1.1, and 1.0 at 1, 2, 3, and 4 cycles, linear between those times, and 1 after 4 cycles), and not below 1. The half-cycle status is unchanged. The remote check adds its own warning. NACD is the three-phase current from sources with no decrement curve divided by the total fault current. Motors and sources with a decrement curve are local. When NACD is below 1 and a local source has an entered decrement curve, the reported multiplier blends the remote factor with the local factor. The local symmetrical-current ratio is taken from that curve at the contact parting time converted to seconds at 60 Hz, combined with the DC term, divided by the breaker asymmetry capability, and not taken below 1. Motor contribution without a decrement curve is not reduced. NACD of 1, a missing NACD, or local contribution that is only motors keeps the remote factor. At or below 1 kV the parting time is ignored. Above 1 kV, closing and latching duty is 1.6 times the symmetrical current already used for the device. Capability is 1.6 times the voltage range factor K times the rated symmetrical current. Omitted K is 1. interrupting.voltage_range_factor stores K, and it must be at least 1 when set. The entered symmetrical rating is the rated short-circuit current. This is not a separate first-cycle reactance network, and it does not replace the half-cycle comparison. At or below 1 kV closing and latching is not applied.",
+        "interrupting_duty": "After a fault study is solved, including when that fault result is kept only for arc flash and then omitted from the output, each braced bus and each device with an interrupting rating is checked. The half-cycle factor is sqrt(1 + 2*exp(-2*pi/(X/R))); no resistance (infinite X/R) uses sqrt(3), and X/R of 0 uses 1. A bus with bracing_ka uses the three-phase or line-to-ground fault with the greater half-cycle rms. A device with protected_branch uses the bolted three-phase current through that branch at each terminal and keeps the larger one. Line-to-ground current through the branch is not stored, so it is not compared. Without protected_branch the greater of the device bus three-phase and line-to-ground faults is used. System X/R is the faulted bus Thevenin X/R; resistance and reactance are not separate networks. With a test X/R, adjusted symmetrical kA is rated symmetrical kA times factor(test X/R) / factor(system X/R). Half-cycle rms at or below 90% of the rated half-cycle rms is within_rating, above 90% and at or below that capability is marginal, and above it is exceeds_rating. Bracing without a test X/R is not an asymmetrical pass: symmetrical current above the bracing is exceeds_rating, above 90% and at or below the bracing is marginal, otherwise not_adjusted. exceeds_rating, marginal, and not_adjusted each add one warning; within_rating does not. If interrupting voltage_v is positive and the device bus nominal kV differs by more than 10 percent, the row notes the mismatch and the current comparison still stands. An invalid fault result produces no rows. set_bus accepts bracing_test_xr. set_device accepts interrupting (symmetrical_ka, test_xr, voltage_v, optional contact_parting_cycles) and can clear interrupting. Above 1 kV, contact_parting_cycles reports a remote multiplier: asymmetrical rms at that parting time, sqrt(1 + 2*exp(-4*pi*cycles/(X/R))), divided by the breaker asymmetry capability (1.4, 1.2, 1.1, and 1.0 at 1, 2, 3, and 4 cycles, linear between those times, and 1 after 4 cycles), and not below 1. The half-cycle status is unchanged. The remote check adds its own warning. NACD is the three-phase current from sources with no decrement curve divided by the total fault current. Motors and sources with a decrement curve are local. When NACD is below 1 and a local source has an entered decrement curve, the reported multiplier blends the remote factor with the local factor. The local symmetrical-current ratio is taken from that curve at the contact parting time converted to seconds at 60 Hz, combined with the DC term, divided by the breaker asymmetry capability, and not taken below 1. Motor contribution without a decrement curve is not reduced. NACD of 1, a missing NACD, or local contribution that is only motors keeps the remote factor. At or below 1 kV the parting time is ignored. Above 1 kV, closing and latching duty is 1.6 times the symmetrical current already used for the device. Capability is 1.6 times the voltage range factor K times the rated symmetrical current. Omitted K is 1. interrupting.voltage_range_factor stores K, and it must be at least 1 when set. The entered symmetrical rating is the rated short-circuit current. It does not replace the half-cycle comparison. At or below 1 kV closing and latching is not applied.",
+        "machine_duty_reactance": "IEEE C37.010-1979 5.4.1 per-duty machine reactance. Duty rows solve a first-cycle network (half-cycle comparison, bus bracing, closing and latching) and an interrupting network (remote or blended interrupting multiplier). Each scales a classified machine's whole impedance, so its X/R is kept; resistance and reactance are not separate networks. add_motor accepts machine_kind (induction or synchronous), synchronous_rpm, and phases (1 or 3). Synchronous motor: 1.0 first-cycle, 1.5 interrupting. Three-phase induction motor above 1000 hp, or above 250 hp at a synchronous speed above 1800 r/min (3600 r/min at 60 Hz): 1.0 and 1.5. Induction motor from 50 hp to those limits: 1.2 and 3.0. Three-phase induction motors below 50 hp and every single-phase motor are left out of both duty networks. An induction motor above 250 hp and up to 1000 hp with no synchronous_rpm takes 1.0 and 1.5 and is reported. A motor with no machine_kind keeps x_subtransient_pu for both duties and is reported. Omitted phases means three-phase. add_source and set_source accept machine_kind (utility, turbogenerator, hydro_with_amortisseur, hydro_without_amortisseur, synchronous_condenser) and transient_mva_sc. All of them keep mva_sc for both duties except hydro_without_amortisseur, which uses 0.75 times the transient reactance behind transient_mva_sc; without transient_mva_sc it keeps mva_sc and is reported. Load flow, the main fault study, and arc flash keep the entered reactances. When no machine is scaled or omitted, duty rows use the main fault study.",
         "motor_backfeed": "The arc continues until the last connected utility, generator, or motor clears (IEEE 1584-2018 Clause 6.9). A single device that isolates every in-service source and leaves no motor uses that device's time. Otherwise each located device is timed at the initial arcing current through its own protected terminal, branches open at those times, and the bolted current is recalculated between openings. A motor with a feeder device clears when that device clears. A motor with no feeder device contributes for motor_contribution_s (default five 60 Hz cycles) and is then removed; that window is assumed because the guide does not publish a decay time. A source with no isolating device still fails. The built-in sample MCC has no motor feeder breaker, so its arc-flash row is calculated and marked assumed. When a source decrement reaches the bus, energy between openings follows that curve. Trip times stay at the initial arcing current. An explicit equipment clearing_s overrides staging only when it represents total exposure from all paths. Do not invent feeder length or cable size.",
         "operating_cases": "Base switch.closed and source.in_service values define normal operation. Each named operating case overrides listed switch/source states. Its arc equipment starts with no inherited upstream_device, clearing_s, or fallback_duration_s; list case-specific values in equipment_states, or leave them absent for automatic protection selection or an explicit failure. At most one switch can control a branch. A switch group limits simultaneous closures using max_closed. `run` evaluates the base configuration and each named valid case; inspect per-case failures before using an arc-flash maximum.",
         "switch_model": "Opening a switch removes its entire referenced branch, including any transformer grounding shunt or line charging on that branch. For an independent breaker or ATS contact, use a separate short finite-impedance branch with separate bus nodes; put transformers and other equipment on their own branches. The closed field is required for every switch, especially normally open ties and ATS contacts.",

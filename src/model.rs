@@ -240,6 +240,12 @@ pub struct Source {
     pub p_mw: f64,
     pub qmin_mvar: Option<f64>,
     pub qmax_mvar: Option<f64>,
+    /// Machine class for the first-cycle and interrupting reactance
+    /// multipliers (IEEE C37.010-1979 5.4.1). None keeps `mva_sc` for both duties.
+    pub machine_kind: Option<GeneratorKind>,
+    /// Three-phase short-circuit MVA at the terminals from the transient
+    /// reactance Xd'. Used only by `hydro_without_amortisseur`.
+    pub transient_mva_sc: Option<f64>,
     /// Names of fields omitted from the input and filled with defaults. Not a
     /// JSON field: a defaulted value that is still at its default is omitted
     /// again when saved, so the assumption stays visible.
@@ -274,6 +280,10 @@ struct SourceWire {
     qmin_mvar: Option<f64>,
     #[serde(default)]
     qmax_mvar: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    machine_kind: Option<GeneratorKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transient_mva_sc: Option<f64>,
 }
 
 /// Take an entered value, or record the field as defaulted.
@@ -294,7 +304,8 @@ impl From<SourceWire> for Source {
         Self {
             id: w.id, name: w.name, bus: w.bus, in_service: w.in_service, v_pu: w.v_pu, angle_deg: w.angle_deg,
             mva_sc: w.mva_sc, decrement_curve: w.decrement_curve, xr: w.xr, x0_over_x1, r0_over_r1,
-            is_slack: w.is_slack, p_mw: w.p_mw, qmin_mvar: w.qmin_mvar, qmax_mvar: w.qmax_mvar, defaulted,
+            is_slack: w.is_slack, p_mw: w.p_mw, qmin_mvar: w.qmin_mvar, qmax_mvar: w.qmax_mvar,
+            machine_kind: w.machine_kind, transient_mva_sc: w.transient_mva_sc, defaulted,
         }
     }
 }
@@ -307,6 +318,7 @@ impl From<Source> for SourceWire {
             id: s.id, name: s.name, bus: s.bus, in_service: s.in_service, v_pu: s.v_pu, angle_deg: s.angle_deg,
             mva_sc: s.mva_sc, decrement_curve: s.decrement_curve, xr: s.xr,
             is_slack: s.is_slack, p_mw: s.p_mw, qmin_mvar: s.qmin_mvar, qmax_mvar: s.qmax_mvar,
+            machine_kind: s.machine_kind, transient_mva_sc: s.transient_mva_sc,
         }
     }
 }
@@ -410,6 +422,26 @@ pub struct OperatingCase {
     pub equipment_states: Vec<EquipmentState>,
 }
 
+/// Motor class for the IEEE C37.010-1979 5.4.1 reactance multipliers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MotorKind {
+    Induction,
+    Synchronous,
+}
+
+/// Rotating-machine class of a source for the IEEE C37.010-1979 5.4.1
+/// reactance multipliers. `utility` is a remote equivalent and is not scaled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GeneratorKind {
+    Utility,
+    Turbogenerator,
+    HydroWithAmortisseur,
+    HydroWithoutAmortisseur,
+    SynchronousCondenser,
+}
+
 /// JSON shape is unchanged from the plain derive; omitted ratings take the
 /// typical values below and are reported as assumptions.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -428,6 +460,15 @@ pub struct Motor {
     pub x_subtransient_pu: f64,
     /// Defaults to 6 when omitted.
     pub xr: f64,
+    /// Induction or synchronous, for the first-cycle and interrupting
+    /// reactance multipliers (IEEE C37.010-1979 5.4.1). None keeps
+    /// `x_subtransient_pu` unscaled for both duties and is reported.
+    pub machine_kind: Option<MotorKind>,
+    /// Synchronous speed in r/min. Needed to classify induction motors above
+    /// 250 hp and up to 1000 hp.
+    pub synchronous_rpm: Option<f64>,
+    /// 1 or 3. None is treated as three-phase, the existing network model.
+    pub phases: Option<u8>,
     /// Names of fields omitted from the input and filled with defaults; see `Source::defaulted`.
     pub defaulted: Vec<String>,
 }
@@ -448,6 +489,12 @@ struct MotorWire {
     x_subtransient_pu: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     xr: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    machine_kind: Option<MotorKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    synchronous_rpm: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    phases: Option<u8>,
 }
 
 impl From<MotorWire> for Motor {
@@ -457,7 +504,10 @@ impl From<MotorWire> for Motor {
         let efficiency = entered_or(w.efficiency, "efficiency", default_eff(), &mut defaulted);
         let x_subtransient_pu = entered_or(w.x_subtransient_pu, "x_subtransient_pu", default_xd(), &mut defaulted);
         let xr = entered_or(w.xr, "xr", default_mxr(), &mut defaulted);
-        Self { id: w.id, name: w.name, bus: w.bus, hp: w.hp, kv: w.kv, pf, efficiency, x_subtransient_pu, xr, defaulted }
+        Self {
+            id: w.id, name: w.name, bus: w.bus, hp: w.hp, kv: w.kv, pf, efficiency, x_subtransient_pu, xr,
+            machine_kind: w.machine_kind, synchronous_rpm: w.synchronous_rpm, phases: w.phases, defaulted,
+        }
     }
 }
 
@@ -468,6 +518,7 @@ impl From<Motor> for MotorWire {
             efficiency: unless_default(m.efficiency, "efficiency", default_eff(), &m.defaulted),
             x_subtransient_pu: unless_default(m.x_subtransient_pu, "x_subtransient_pu", default_xd(), &m.defaulted),
             xr: unless_default(m.xr, "xr", default_mxr(), &m.defaulted),
+            machine_kind: m.machine_kind, synchronous_rpm: m.synchronous_rpm, phases: m.phases,
             id: m.id, name: m.name, bus: m.bus, hp: m.hp, kv: m.kv,
         }
     }
@@ -891,7 +942,7 @@ impl Project {
                 Load { id: "load-mcc".into(), name: "MCC load".into(), bus: "mcc".into(), kw: 400.0, kvar: 200.0, basis: String::new() },
                 Load { id: "load-pnl".into(), name: "Panel load".into(), bus: "pnl".into(), kw: 75.0, kvar: 40.0, basis: String::new() },
             ],
-            sources: vec![Source {
+            sources: vec![Source { machine_kind: None, transient_mva_sc: None,
                 id: "grid".into(),
                 name: "Utility".into(),
                 bus: "util".into(),
@@ -909,7 +960,7 @@ impl Project {
                 qmax_mvar: None,
                 defaulted: Vec::new(),
             }],
-            motors: vec![Motor {
+            motors: vec![Motor { machine_kind: None, synchronous_rpm: None, phases: None,
                 id: "m1".into(),
                 name: "M1".into(),
                 bus: "mcc".into(),
@@ -1407,11 +1458,13 @@ impl Project {
                 && zero_sequence_defined, &s.id, "source impedance or voltage");
             check(s.qmin_mvar.map_or(true, f64::is_finite) && s.qmax_mvar.map_or(true, f64::is_finite)
                 && s.qmin_mvar.unwrap_or(f64::NEG_INFINITY) <= s.qmax_mvar.unwrap_or(f64::INFINITY), &s.id, "reactive limits");
+            check(s.transient_mva_sc.map_or(true, positive), &s.id, "transient_mva_sc");
         }
         for l in &self.loads { check(l.kw.is_finite() && l.kvar.is_finite(), &l.id, "load"); }
         for m in &self.motors {
             check([m.hp, m.kv, m.pf, m.efficiency, m.x_subtransient_pu, m.xr].into_iter().all(positive)
                 && m.pf <= 1.0 && m.efficiency <= 1.0, &m.id, "motor ratings, reactance, or X/R");
+            check(m.synchronous_rpm.map_or(true, positive) && m.phases.map_or(true, |n| n == 1 || n == 3), &m.id, "motor synchronous_rpm or phases (1 or 3)");
             // Allow customary nameplate/nominal differences (e.g. 460 V on 480 V).
             check(self.bus(&m.bus).map_or(false, |b| (m.kv / b.kv - 1.0).abs() <= 0.10), &m.id, "motor voltage (must be within 10% of bus voltage)");
         }
