@@ -154,8 +154,48 @@ pub fn build(project: &Project) -> Result<SystemModel, String> {
     build_validated(project)
 }
 
+/// Which part of each element impedance a network carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Part {
+    /// The full complex impedance.
+    Complex,
+    /// Resistance only. Used for the separate-network duty X/R.
+    Resistance,
+    /// Reactance only. Used for the separate-network duty X/R.
+    Reactance,
+}
+
+/// Fraction of an element's impedance magnitude used in place of a missing
+/// resistance or reactance, so that part stays a near short instead of an
+/// open circuit or a singular admittance.
+pub const PART_FLOOR: f64 = 1e-6;
+
+impl Part {
+    /// The part of `z` this network carries.
+    pub fn of(self, z: Cplx) -> Cplx {
+        let floor = z.abs() * PART_FLOOR;
+        match self {
+            Part::Complex => z,
+            Part::Resistance => Cplx::new(if z.re.abs() > floor { z.re } else { floor }, 0.0),
+            Part::Reactance => Cplx::new(0.0, if z.im.abs() > floor { z.im } else { floor }),
+        }
+    }
+
+    /// Admittance of the carried part, or None for a zero or non-finite impedance.
+    fn admit(self, z: Cplx) -> Option<Cplx> {
+        if z.inv().is_none() { return None; }
+        self.of(z).inv()
+    }
+}
+
 /// Build only after validating this unchanged project snapshot.
 pub(crate) fn build_validated(project: &Project) -> Result<SystemModel, String> {
+    build_part(project, Part::Complex)
+}
+
+/// Build with every element impedance reduced to `part`. A resistance-only
+/// or reactance-only network omits shunt capacitance and reactors.
+pub(crate) fn build_part(project: &Project, part: Part) -> Result<SystemModel, String> {
     let index = Index::build(project)?;
     let n = index.n;
     let mut loadflow = SparseY::new(n);
@@ -183,7 +223,7 @@ pub(crate) fn build_validated(project: &Project) -> Result<SystemModel, String> 
             });
             continue;
         }
-        let stamp = stamp_branch(project, &index, branch, &mut warnings)?;
+        let stamp = stamp_branch(project, &index, branch, part, &mut warnings)?;
         let q = stamp.positive;
         loadflow.add(stamp.from, stamp.from, q.yff);
         loadflow.add(stamp.from, stamp.to, q.yft);
@@ -203,7 +243,7 @@ pub(crate) fn build_validated(project: &Project) -> Result<SystemModel, String> 
 
     for bus in &project.buses {
         let i = index.of(&bus.id)?;
-        if bus.shunt_kvar.abs() > 0.0 {
+        if bus.shunt_kvar.abs() > 0.0 && part == Part::Complex {
             // Positive shunt_kvar is a capacitor. B > 0 is the standard Ybus sign.
             let b = bus.shunt_kvar / (project.s_base_mva * 1000.0);
             let y = Cplx::new(0.0, b);
@@ -217,7 +257,7 @@ pub(crate) fn build_validated(project: &Project) -> Result<SystemModel, String> 
         if !source.in_service { continue; }
         let i = index.of(&source.bus)?;
         let z1 = Cplx::from_mag_xr(project.s_base_mva / source.mva_sc, source.xr);
-        let y1 = z1.inv().ok_or_else(|| format!("source '{}' has zero impedance", source.id))?;
+        let y1 = part.admit(z1).ok_or_else(|| format!("source '{}' has zero impedance", source.id))?;
         infeeds.push(Infeed {
             bus: i,
             y: y1,
@@ -228,7 +268,7 @@ pub(crate) fn build_validated(project: &Project) -> Result<SystemModel, String> 
         neg.shunt(i, y1);
         if let Neutral::Grounded(zn) = neutral(project, &source.id, None, index.kv[i]) {
             let z0 = Cplx::new(z1.re * source.r0_over_r1, z1.im * source.x0_over_x1) + zn * 3.0;
-            let y0 = z0.inv().ok_or_else(|| format!("source {}: invalid zero-sequence impedance", source.id))?;
+            let y0 = part.admit(z0).ok_or_else(|| format!("source {}: invalid zero-sequence impedance", source.id))?;
             zero.shunt(i, y0);
         }
     }
@@ -248,7 +288,7 @@ pub(crate) fn build_validated(project: &Project) -> Result<SystemModel, String> 
         let kva = kw / motor.pf;
         let x = motor.x_subtransient_pu * (project.s_base_mva / (kva / 1000.0)) * (motor.kv / index.kv[i]).powi(2);
         let r = x / motor.xr;
-        let y = Cplx::new(r, x).inv().ok_or_else(|| format!("motor '{}' has zero impedance", motor.id))?;
+        let y = part.admit(Cplx::new(r, x)).ok_or_else(|| format!("motor '{}' has zero impedance", motor.id))?;
         infeeds.push(Infeed { bus: i, y, remote: false, source_id: None });
         pos.shunt(i, y);
         neg.shunt(i, y);
@@ -301,7 +341,7 @@ fn input_warnings(project: &Project) -> Vec<String> {
     warnings
 }
 
-fn stamp_branch(project: &Project, index: &Index, branch: &Branch, warnings: &mut Vec<String>) -> Result<BranchStamp, String> {
+fn stamp_branch(project: &Project, index: &Index, branch: &Branch, part: Part, warnings: &mut Vec<String>) -> Result<BranchStamp, String> {
     let i = index.of(&branch.from)?;
     let j = index.of(&branch.to)?;
     match &branch.kind {
@@ -321,10 +361,12 @@ fn stamp_branch(project: &Project, index: &Index, branch: &Branch, warnings: &mu
             // between unequal physical voltages.
             let z1 = Cplx::new(r_ohm / zb_to, x_ohm / zb_to);
             tiny_impedance_warning(branch, z1, warnings);
-            let y = z1.inv().ok_or_else(|| format!("line '{}' has zero impedance", branch.id))?;
+            let y = part.admit(z1).ok_or_else(|| format!("line '{}' has zero impedance", branch.id))?;
             let mut q = quad(y, base_ratio)?;
-            q.yff += Cplx::new(0.0, b_siemens * zb_from / 2.0);
-            q.ytt += Cplx::new(0.0, b_siemens * zb_to / 2.0);
+            if part == Part::Complex {
+                q.yff += Cplx::new(0.0, b_siemens * zb_from / 2.0);
+                q.ytt += Cplx::new(0.0, b_siemens * zb_to / 2.0);
+            }
             let (r0_missing, x0_missing) = (r0_ohm.abs() < 1e-12, x0_ohm.abs() < 1e-12);
             let (r0, x0) = if r0_missing && x0_missing {
                 { warnings.push(format!("line {}: R0=3R1 and X0=3X1 assumed", branch.id)); (3.0 * r_ohm, 3.0 * x_ohm) }
@@ -337,7 +379,7 @@ fn stamp_branch(project: &Project, index: &Index, branch: &Branch, warnings: &mu
                 (*r0_ohm, *x0_ohm)
             };
             if *b_siemens != 0.0 { warnings.push(format!("line {}: zero-sequence charging omitted; B0 was not supplied", branch.id)); }
-            let y0 = Cplx::new(r0 / zb_to, x0 / zb_to).inv()
+            let y0 = part.admit(Cplx::new(r0 / zb_to, x0 / zb_to))
                 .ok_or_else(|| format!("line {}: zero or non-finite zero-sequence impedance", branch.id))?;
             let zero = ZeroStamp::Series(quad(y0, base_ratio)?);
             Ok(BranchStamp {
@@ -367,7 +409,7 @@ fn stamp_branch(project: &Project, index: &Index, branch: &Branch, warnings: &mu
             let z_mag = (z_percent / 100.0) * (project.s_base_mva / (kva / 1000.0)) * (to_turns / index.kv[j]).powi(2);
             let z1 = Cplx::from_mag_xr(z_mag, *xr);
             tiny_impedance_warning(branch, z1, warnings);
-            let y1 = z1.inv().ok_or_else(|| format!("transformer '{}' has zero impedance", branch.id))?;
+            let y1 = part.admit(z1).ok_or_else(|| format!("transformer '{}' has zero impedance", branch.id))?;
             for (bus, rated) in [(i, from_rated), (j, to_rated)] {
                 if (index.kv[bus] / rated - 1.0).abs() > 0.10 {
                     warnings.push(format!(
@@ -397,7 +439,7 @@ fn stamp_branch(project: &Project, index: &Index, branch: &Branch, warnings: &mu
             let (from_winding, to_winding) = if from_is_hv { (Winding::Hv, Winding::Lv) } else { (Winding::Lv, Winding::Hv) };
             let from_neutral = neutral(project, &branch.id, Some(from_winding), index.kv[i]);
             let to_neutral = neutral(project, &branch.id, Some(to_winding), index.kv[j]);
-            let invert = |z: Cplx| z.inv().ok_or_else(|| format!("transformer {}: zero or non-finite zero-sequence impedance", branch.id));
+            let invert = |z: Cplx| part.admit(z).ok_or_else(|| format!("transformer {}: zero or non-finite zero-sequence impedance", branch.id));
             let a2 = a_mag.powi(2);
             let zero = match (connection, from_neutral, to_neutral) {
                 (XfmrConn::Dyn, _, Neutral::Grounded(zn)) => ZeroStamp::Shunt { bus_is_from: false, y: invert(z0 + zn * 3.0)? },
@@ -518,4 +560,20 @@ pub fn reduce(y: &SparseY, mask: &[bool]) -> (SparseY, Vec<Option<usize>>) {
         }
     }
     (out, map)
+}
+
+#[cfg(test)]
+mod part_tests {
+    use super::*;
+
+    #[test]
+    fn parts_keep_one_component_and_floor_a_missing_one() {
+        let z = Cplx::new(3.0, 4.0);
+        assert_eq!(Part::Complex.of(z), z);
+        assert_eq!(Part::Resistance.of(z), Cplx::new(3.0, 0.0));
+        assert_eq!(Part::Reactance.of(z), Cplx::new(0.0, 4.0));
+        assert_eq!(Part::Resistance.of(Cplx::new(0.0, 2.0)), Cplx::new(2.0 * PART_FLOOR, 0.0));
+        assert_eq!(Part::Reactance.of(Cplx::new(2.0, 0.0)), Cplx::new(0.0, 2.0 * PART_FLOOR));
+        assert!(Part::Resistance.admit(Cplx::ZERO).is_none());
+    }
 }

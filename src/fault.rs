@@ -314,6 +314,66 @@ fn three_phase_split(model: &network::SystemModel, map1: &[Option<usize>], drop:
     (Some(ratio), rows)
 }
 
+/// Separate-network X/R at one bus: reactance from the reactance-only
+/// network over resistance from the resistance-only network.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SeparateXr {
+    pub bus_id: String,
+    /// Three-phase fault X/R. None means no resistance (infinite X/R).
+    pub three_phase: Option<Option<f64>>,
+    /// Line-to-ground fault X/R from X1+X2+X0 over R1+R2+R0.
+    pub line_to_ground: Option<Option<f64>>,
+}
+
+/// Ratio below which the floored part of a separate network is treated as
+/// absent: R under this fraction of X is no resistance, and the reverse.
+const SEPARATE_XR_NEGLIGIBLE: f64 = 100.0 * network::PART_FLOOR;
+
+/// X over R from separate Thevenin values. None is infinite X/R.
+pub fn separate_ratio(x: f64, r: f64) -> Result<Option<f64>, String> {
+    if !x.is_finite() || !r.is_finite() || x < 0.0 || r < 0.0 || (x == 0.0 && r == 0.0) {
+        return Err(format!("separate-network X/R needs finite nonnegative R and X, got R {r} and X {x}"));
+    }
+    if r <= SEPARATE_XR_NEGLIGIBLE * x { return Ok(None); }
+    if x <= SEPARATE_XR_NEGLIGIBLE * r { return Ok(Some(0.0)); }
+    Ok(Some(x / r))
+}
+
+/// Faulted-bus X/R for every energized bus from a resistance-only and a
+/// reactance-only reduction of `project` (validated). Shunt capacitance is
+/// omitted from both. Unenergized buses and buses without a positive-sequence
+/// path give None.
+pub fn separate_xr(project: &Project) -> Result<Vec<SeparateXr>, String> {
+    let r_model = network::build_part(project, network::Part::Resistance)?;
+    let x_model = network::build_part(project, network::Part::Reactance)?;
+    let thevenin = |model: &network::SystemModel| -> Result<Vec<(Option<Cplx>, Option<Cplx>, Option<Cplx>)>, String> {
+        let (y1, m1) = reduced(&model.pos, &model.energized)?;
+        let (y2, m2) = reduced(&model.neg, &model.energized)?;
+        let (y0, m0) = reduced(&model.zero, &model.energized)?;
+        let (mut s1, mut s2, mut s0) = (AdmittanceSolver::new(&y1), AdmittanceSolver::new(&y2), AdmittanceSolver::new(&y0));
+        (0..model.index.n).map(|i| {
+            if !model.energized[i] { return Ok((None, None, None)); }
+            Ok((s1.zth(m1[i])?, s2.zth(m2[i])?, s0.zth(m0[i])?))
+        }).collect()
+    };
+    let r = thevenin(&r_model)?;
+    let x = thevenin(&x_model)?;
+    let mut rows = Vec::with_capacity(r.len());
+    for (i, (rz, xz)) in r.iter().zip(&x).enumerate() {
+        let three_phase = match (rz.0, xz.0) {
+            (Some(r1), Some(x1)) => Some(separate_ratio(x1.im, r1.re)?),
+            _ => None,
+        };
+        let line_to_ground = match (rz, xz) {
+            ((Some(r1), Some(r2), Some(r0)), (Some(x1), Some(x2), Some(x0))) =>
+                Some(separate_ratio(x1.im + x2.im + x0.im, r1.re + r2.re + r0.re)?),
+            _ => None,
+        };
+        rows.push(SeparateXr { bus_id: r_model.index.id_of[i].clone(), three_phase, line_to_ground });
+    }
+    Ok(rows)
+}
+
 fn reduced(net: &Net, energized: &[bool]) -> Result<(crate::network::SparseY, Vec<Option<usize>>), String> {
     let mask: Vec<bool> = network::reaches_shunt(net).iter().zip(energized).map(|(a, b)| *a && *b).collect();
     Ok(network::reduce(&net.y, &mask))

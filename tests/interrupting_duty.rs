@@ -611,3 +611,109 @@ fn machine_fields_load_from_json_and_exec() {
     let plain = serde_json::to_string(&Project::sample()).unwrap();
     assert!(!plain.contains("machine_kind") && !plain.contains("synchronous_rpm") && !plain.contains("transient_mva_sc"));
 }
+
+/// Two buses, each with a source of very different X/R, joined by a
+/// resistive line, so the complex Thevenin X/R and the separate-network X/R
+/// at bus "bus" differ.
+fn mixed_xr_project() -> (Project, f64) {
+    let mut project = one_bus(20.0, Some(1.0), Some(15.0), rating(0.5, 15.0, 480.0));
+    project.buses.push(Bus { id: "far".into(), name: "Far".into(), kv: 0.48, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None });
+    let mut far = project.sources[0].clone();
+    far.id = "far_src".into();
+    far.bus = "far".into();
+    far.xr = 1.0;
+    far.is_slack = false;
+    project.sources.push(far);
+    project.branches.push(Branch {
+        id: "tie".into(), name: "Tie".into(), from: "bus".into(), to: "far".into(),
+        kind: BranchKind::Line { r_ohm: 0.0002, x_ohm: 0.0001, b_siemens: 0.0, r0_ohm: 0.0006, x0_ohm: 0.0003, ampacity_a: None },
+    });
+    assert!(project.validate().is_empty(), "{:?}", project.validate());
+    // Hand reduction in per unit on the 100 MVA, 0.48 kV base.
+    let zb = 0.48 * 0.48 / project.s_base_mva;
+    let part = |mag: f64, xr: f64| { let r = mag / (1.0 + xr * xr).sqrt(); (r, r * xr) };
+    let (ra, xa) = part(project.s_base_mva / 10.0, 20.0);
+    let (rb, xb) = part(project.s_base_mva / 10.0, 1.0);
+    let (rl, xl) = (0.0002 / zb, 0.0001 / zb);
+    let parallel = |a: f64, b: f64| a * b / (a + b);
+    let want = parallel(xa, xb + xl) / parallel(ra, rb + rl);
+    (project, want)
+}
+
+#[test]
+fn separate_network_xr_differs_from_the_complex_thevenin_xr() {
+    let (project, want) = mixed_xr_project();
+    let separate = flashmob::fault::separate_xr(&project).unwrap();
+    let at_bus = separate.iter().find(|row| row.bus_id == "bus").unwrap();
+    close(at_bus.three_phase.unwrap().unwrap(), want);
+    let out = study::run(&project, fault_only()).unwrap();
+    let complex = out.fault.as_ref().unwrap().buses.iter().find(|b| b.id == "bus").unwrap().three_phase.as_ref().unwrap().x_over_r.unwrap();
+    assert!((complex / want - 1.0).abs() > 0.01, "complex {complex} separate {want}");
+    let row = device_row(&out);
+    assert_eq!(row.fault, "three_phase");
+    close(row.system_xr.unwrap(), want);
+    close(row.half_cycle_rms_ka, row.symmetrical_ka * half_cycle_factor(Some(want)).unwrap());
+    // The duty symmetrical current is still the complex-network current.
+    let bus_sym = out.fault.as_ref().unwrap().buses.iter().find(|b| b.id == "bus").unwrap().three_phase.as_ref().unwrap().symmetrical_ka;
+    close(row.symmetrical_ka, bus_sym);
+    let bracing = bracing_row(&out);
+    if bracing.fault == "three_phase" { close(bracing.system_xr.unwrap(), want); }
+    assert!(row.note.contains("separate resistance and reactance networks"), "{}", row.note);
+    // A single source gives the same X/R either way.
+    let single = one_bus(12.0, None, None, rating(0.5, 15.0, 480.0));
+    close(device_row(&study::run(&single, fault_only()).unwrap()).system_xr.unwrap(), 12.0);
+}
+
+#[test]
+fn line_to_ground_separate_xr_sums_the_sequence_parts() {
+    let (project, _) = mixed_xr_project();
+    let separate = flashmob::fault::separate_xr(&project).unwrap();
+    let lg = separate.iter().find(|row| row.bus_id == "bus").unwrap().line_to_ground.unwrap().unwrap();
+    let three = separate.iter().find(|row| row.bus_id == "bus").unwrap().three_phase.unwrap().unwrap();
+    assert!(lg.is_finite() && lg > 0.0);
+    assert!((lg - three).abs() > 1e-6, "zero-sequence line R0/X0 should move the ground-fault X/R");
+}
+
+#[test]
+fn separate_ratio_edge_cases() {
+    use flashmob::fault::separate_ratio;
+    assert_eq!(separate_ratio(5.0, 0.0).unwrap(), None);
+    assert_eq!(separate_ratio(5.0, 5.0e-5).unwrap(), None);
+    assert_eq!(separate_ratio(0.0, 3.0).unwrap(), Some(0.0));
+    assert_eq!(separate_ratio(3.0e-5, 3.0).unwrap(), Some(0.0));
+    close(separate_ratio(8.0, 2.0).unwrap().unwrap(), 4.0);
+    assert!(separate_ratio(0.0, 0.0).is_err());
+    assert!(separate_ratio(-1.0, 1.0).is_err());
+    assert!(separate_ratio(1.0, f64::NAN).is_err());
+}
+
+#[test]
+fn nearly_pure_reactance_and_resistance_sources_reach_the_limits() {
+    let reactive = one_bus(1.0e7, None, None, rating(0.5, 15.0, 480.0));
+    let row = flashmob::fault::separate_xr(&reactive).unwrap().remove(0);
+    assert_eq!(row.three_phase, Some(None), "{row:?}");
+    let resistive = one_bus(1.0e-7, None, None, rating(0.5, 15.0, 480.0));
+    let row = flashmob::fault::separate_xr(&resistive).unwrap().remove(0);
+    assert_eq!(row.three_phase, Some(Some(0.0)), "{row:?}");
+    // Duty rows use those limits: no resistance gives the sqrt(3) half-cycle factor.
+    let out = study::run(&reactive, fault_only()).unwrap();
+    let duty = device_row(&out);
+    assert_eq!(duty.system_xr, None);
+    close(duty.half_cycle_rms_ka, duty.symmetrical_ka * 3f64.sqrt());
+}
+
+#[test]
+fn first_cycle_and_interrupting_separate_xr_follow_the_machine_multipliers() {
+    let mut project = medium_voltage_motor_bus(Some(MotorKind::Induction), 400.0, Some(1800.0), Some(3));
+    project.motors[0].xr = 4.0;
+    let out = study::run(&project, fault_only()).unwrap();
+    let row = device_row(&out);
+    let expect = |duty| flashmob::fault::separate_xr(&flashmob::machine::duty_project(&project, duty).unwrap()).unwrap()[0].three_phase.unwrap().unwrap();
+    let first = expect(flashmob::machine::Duty::FirstCycle);
+    let interrupting = expect(flashmob::machine::Duty::Interrupting);
+    close(row.system_xr.unwrap(), first);
+    // A weaker low-X/R motor in the interrupting network raises the bus X/R.
+    assert!(interrupting > first + 1e-6, "{interrupting} vs {first}");
+    let factor = duty::remote_multiplying_factor(Some(interrupting), 3.0).unwrap();
+    close(row.remote_multiplying_factor.unwrap(), factor);
+}

@@ -375,7 +375,7 @@ fn run_one(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
         case_id: "normal".into(),
         methods: Methods {
             load_flow: "Newton-Raphson positive-sequence power flow".into(),
-            short_circuit: "Symmetrical components. Peak current uses the IEC 60909 factor. Half-cycle rms is the first-half-cycle asymmetrical value. Minimum and maximum symmetrical currents apply IEC 60909-0 Table 1 voltage factor c to that current. Impedance correction factors are not applied. A breaker above 1 kV with contact_parting_cycles reports an IEEE C37.010 multiplier: asymmetrical rms at that parting time divided by the breaker asymmetry capability, and not below 1. NACD is reported. When NACD is below 1 and a local source has an entered decrement curve, that multiplier blends the remote DC-decrement factor with the local factor from the curve at 60 Hz. Motor contribution without a decrement curve is not reduced. A source with no decrement curve stays remote. Above 1 kV, closing and latching duty is 1.6 times that symmetrical current, and capability is 1.6 times K times the rated symmetrical current. Omitted K is 1. Duty rows use IEEE C37.010 5.4.1 machine reactance multipliers for classified motors and generators: the half-cycle comparison, bracing, and closing and latching use the first-cycle network, and the interrupting multiplier uses the interrupting network. Unclassified machines keep their entered reactance for both duties. Resistance and reactance are not separate networks.".into(),
+            short_circuit: "Symmetrical components. Peak current uses the IEC 60909 factor. Half-cycle rms is the first-half-cycle asymmetrical value. Minimum and maximum symmetrical currents apply IEC 60909-0 Table 1 voltage factor c to that current. Impedance correction factors are not applied. A breaker above 1 kV with contact_parting_cycles reports an IEEE C37.010 multiplier: asymmetrical rms at that parting time divided by the breaker asymmetry capability, and not below 1. NACD is reported. When NACD is below 1 and a local source has an entered decrement curve, that multiplier blends the remote DC-decrement factor with the local factor from the curve at 60 Hz. Motor contribution without a decrement curve is not reduced. A source with no decrement curve stays remote. Above 1 kV, closing and latching duty is 1.6 times that symmetrical current, and capability is 1.6 times K times the rated symmetrical current. Omitted K is 1. Duty rows use IEEE C37.010 5.4.1 machine reactance multipliers for classified motors and generators: the half-cycle comparison, bracing, and closing and latching use the first-cycle network, and the interrupting multiplier uses the interrupting network. Unclassified machines keep their entered reactance for both duties. Duty X/R comes from separate networks: the faulted-bus Thevenin reactance of a reactance-only network over the Thevenin resistance of a resistance-only network, each with that duty's machine multipliers and without shunt capacitance. Duty symmetrical current stays from the complex network. The fault study table keeps the complex-network X/R.".into(),
             arc_flash: "IEEE 1584-2018".into(),
             coordination: "IEC 60255, IEEE C37.112, definite time, and a simplified thermal-magnetic breaker".into(),
         },
@@ -2010,32 +2010,54 @@ pub fn interrupting_duty_rows(project: &Project) -> Result<Vec<InterruptingDuty>
     interrupting_duties(project, loadflow.as_ref(), &fault)
 }
 
-/// Fault study with machine reactances set for one breaker duty (IEEE
-/// C37.010-1979 5.4.1). None means the base fault already applies.
-fn duty_fault(project: &Project, loadflow: Option<&crate::loadflow::LoadflowResult>, duty: crate::machine::Duty) -> Result<Option<FaultResult>, String> {
-    let Some(scaled) = crate::machine::duty_project(project, duty) else { return Ok(None) };
-    let fault = fault::solve(&scaled, loadflow)?;
-    if !fault.valid {
-        return Err(fault.error.unwrap_or_else(|| "duty fault study is invalid".into()));
+/// Fault study for one breaker duty. Machine reactances follow IEEE C37.010
+/// 5.4.1 for classified machines, and every bus X/R is replaced by the
+/// separate-network value: reactance-only Thevenin X over resistance-only
+/// Thevenin R. Symmetrical current stays from the complex network. The
+/// half-cycle rms is recomputed from that X/R. Returns whether a machine was
+/// scaled or omitted.
+fn duty_fault(project: &Project, loadflow: Option<&crate::loadflow::LoadflowResult>, base: &FaultResult, duty: crate::machine::Duty) -> Result<(FaultResult, bool), String> {
+    let scaled = crate::machine::duty_project(project, duty);
+    let network_project = scaled.as_ref().unwrap_or(project);
+    let mut fault = match &scaled {
+        Some(scaled) => {
+            let fault = fault::solve(scaled, loadflow)?;
+            if !fault.valid {
+                return Err(fault.error.unwrap_or_else(|| "duty fault study is invalid".into()));
+            }
+            fault
+        }
+        None => base.clone(),
+    };
+    let separate = fault::separate_xr(network_project)?;
+    for bus in &mut fault.buses {
+        let Some(row) = separate.iter().find(|row| row.bus_id == bus.id) else { continue };
+        for (point, xr) in [(bus.three_phase.as_mut(), row.three_phase), (bus.line_to_ground.as_mut(), row.line_to_ground)] {
+            let (Some(point), Some(xr)) = (point, xr) else { continue };
+            // A zero-current ground fault (no zero-sequence path) keeps its row.
+            if point.symmetrical_ka == 0.0 { continue; }
+            point.x_over_r = xr;
+            point.half_cycle_rms_ka = point.symmetrical_ka * fault::half_cycle_factor(xr)?;
+        }
     }
-    Ok(Some(fault))
+    Ok((fault, scaled.is_some()))
 }
 
 fn interrupting_duties(project: &Project, loadflow: Option<&crate::loadflow::LoadflowResult>, fault: &FaultResult) -> Result<Vec<InterruptingDuty>, String> {
     let mut rows = Vec::new();
     let has_ratings = project.buses.iter().any(|b| b.bracing_ka.is_some()) || project.devices.iter().any(|d| d.interrupting.is_some());
     if !has_ratings { return Ok(rows); }
-    let first_cycle_owned = duty_fault(project, loadflow, crate::machine::Duty::FirstCycle)?;
-    let interrupting_owned = duty_fault(project, loadflow, crate::machine::Duty::Interrupting)?;
-    let first_cycle = first_cycle_owned.as_ref().unwrap_or(fault);
-    let interrupting = interrupting_owned.as_ref().unwrap_or(fault);
+    let (first_cycle, first_scaled) = duty_fault(project, loadflow, fault, crate::machine::Duty::FirstCycle)?;
+    let (interrupting, int_scaled) = duty_fault(project, loadflow, fault, crate::machine::Duty::Interrupting)?;
+    let (first_cycle, interrupting) = (&first_cycle, &interrupting);
+    let machines_scaled = first_scaled || int_scaled;
     for bus in &project.buses {
         if let Some(row) = bracing_duty(bus, first_cycle)? {
             rows.push(row);
         }
     }
     for device in &project.devices {
-        if let Some(row) = device_duty(project, device, first_cycle, interrupting)? {
+        if let Some(row) = device_duty(project, device, first_cycle, interrupting, machines_scaled)? {
             rows.push(row);
         }
     }
@@ -2064,19 +2086,19 @@ fn bracing_duty(bus: &crate::model::Bus, fault: &FaultResult) -> Result<Option<I
         point.symmetrical_ka, point.x_over_r, rated, bus.bracing_test_xr, &comparison,
         &RemoteDuty::none(),
         &CloseLatch::none(),
-        "Equipment bracing compared with the greater of the three-phase and line-to-ground bus faults.".into(),
+        "Equipment bracing compared with the greater of the three-phase and line-to-ground bus faults. X/R is from separate resistance and reactance networks.".into(),
     )))
 }
 
-fn device_duty(project: &Project, device: &crate::model::Device, first_cycle: &FaultResult, interrupting: &FaultResult) -> Result<Option<InterruptingDuty>, String> {
+fn device_duty(project: &Project, device: &crate::model::Device, first_cycle: &FaultResult, interrupting: &FaultResult, machines_scaled: bool) -> Result<Option<InterruptingDuty>, String> {
     let Some(rating) = &device.interrupting else { return Ok(None) };
     let Some(best) = duty_pick(project, device, rating, first_cycle)? else { return Ok(None) };
     let mut note = if device.protected_branch.is_some() {
-        "Device current is the bolted three-phase current through the protected branch. Line-to-ground current through the device is not stored, so it was not compared. Device current uses the faulted bus Thevenin X/R. Resistance and reactance are not separate networks.".to_string()
+        "Device current is the bolted three-phase current through the protected branch. Line-to-ground current through the device is not stored, so it was not compared. Device current uses the faulted bus X/R from separate resistance and reactance networks.".to_string()
     } else {
-        "No protected branch; bus fault current was used. The greater of the three-phase and line-to-ground bus faults was kept. Device current uses the faulted bus Thevenin X/R. Resistance and reactance are not separate networks.".to_string()
+        "No protected branch; bus fault current was used. The greater of the three-phase and line-to-ground bus faults was kept. Device current uses the faulted bus X/R from separate resistance and reactance networks.".to_string()
     };
-    if !std::ptr::eq(first_cycle, interrupting) {
+    if machines_scaled {
         note.push_str(" The half-cycle comparison and closing and latching use the first-cycle machine reactances; the interrupting multiplier uses the interrupting machine reactances (IEEE C37.010 5.4.1, classified machines only).");
     }
     if rating.voltage_v > 0.0 {
