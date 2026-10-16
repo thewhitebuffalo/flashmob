@@ -16,6 +16,17 @@ pub enum Duty {
     Interrupting,
 }
 
+/// Nominal bus voltage (kV) at and below which ANSI bolted and arc-flash
+/// currents use the first-cycle duty network; above it they use interrupting.
+/// Matches the 1000 V gate that selects between the LV and interrupting ANSI
+/// networks for a faulted bus.
+pub const ANSI_LV_KV: f64 = 1.0;
+
+/// ANSI duty network for a bus at `kv` kilovolts.
+pub fn ansi_duty_for_kv(kv: f64) -> Duty {
+    if kv <= ANSI_LV_KV { Duty::FirstCycle } else { Duty::Interrupting }
+}
+
 /// What a duty network does with one machine.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Treatment {
@@ -150,6 +161,14 @@ pub fn warnings(project: &Project) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ansi_duty_follows_one_kv_gate() {
+        assert_eq!(super::ansi_duty_for_kv(0.48), super::Duty::FirstCycle);
+        assert_eq!(super::ansi_duty_for_kv(1.0), super::Duty::FirstCycle);
+        assert_eq!(super::ansi_duty_for_kv(1.0001), super::Duty::Interrupting);
+        assert_eq!(super::ansi_duty_for_kv(12.47), super::Duty::Interrupting);
+    }
+
     use super::*;
 
     fn motor(kind: Option<MotorKind>, hp: f64, rpm: Option<f64>, phases: Option<u8>) -> Motor {

@@ -383,15 +383,65 @@ pub fn run(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
     Ok(normal)
 }
 
-/// Project whose machine reactances match the selected fault method.
-/// Comprehensive leaves the project unchanged. ANSI applies the first-cycle
-/// (momentary) C37.010 duty network when any machine is scaled or omitted.
+/// Project for fault and arc flash under the selected fault method.
+/// Comprehensive leaves the project unchanged. ANSI clears the generator /
+/// synchronous-motor step-down; duty networks are chosen per bus voltage.
 fn fault_method_project(project: &Project) -> Project {
     match project.fault_method {
         FaultMethod::Comprehensive => project.clone(),
-        FaultMethod::Ansi => crate::machine::duty_project(project, crate::machine::Duty::FirstCycle)
-            .unwrap_or_else(|| project.clone()),
+        FaultMethod::Ansi => {
+            let mut p = project.clone();
+            p.machine_step_down = None;
+            p
+        }
     }
+}
+
+/// Bolted fault study under the selected fault method. ANSI solves the
+/// first-cycle and interrupting C37.010 networks and keeps each bus from the
+/// network selected by its nominal voltage (≤ 1 kV first-cycle, above that
+/// interrupting).
+fn fault_for_method(project: &Project, loadflow: Option<&crate::loadflow::LoadflowResult>) -> Result<crate::fault::FaultResult, String> {
+    if project.fault_method != FaultMethod::Ansi {
+        let model = crate::network::build_validated(project)?;
+        return crate::fault::solve_with_model(project, loadflow, &model);
+    }
+    let first = crate::machine::duty_project(project, crate::machine::Duty::FirstCycle)
+        .unwrap_or_else(|| project.clone());
+    let interrupting = crate::machine::duty_project(project, crate::machine::Duty::Interrupting)
+        .unwrap_or_else(|| project.clone());
+    let first_model = crate::network::build_validated(&first)?;
+    let int_model = crate::network::build_validated(&interrupting)?;
+    let first_fault = crate::fault::solve_with_model(&first, loadflow, &first_model)?;
+    let int_fault = crate::fault::solve_with_model(&interrupting, loadflow, &int_model)?;
+    Ok(merge_ansi_bus_faults(project, first_fault, int_fault))
+}
+
+fn merge_ansi_bus_faults(
+    project: &Project,
+    first_cycle: crate::fault::FaultResult,
+    interrupting: crate::fault::FaultResult,
+) -> crate::fault::FaultResult {
+    let mut out = first_cycle.clone();
+    out.buses = project.buses.iter().filter_map(|bus| {
+        let source = if crate::machine::ansi_duty_for_kv(bus.kv) == crate::machine::Duty::FirstCycle {
+            &first_cycle
+        } else {
+            &interrupting
+        };
+        source.buses.iter().find(|row| row.id == bus.id).cloned()
+    }).collect();
+    for warning in &interrupting.iec_warnings {
+        if !out.iec_warnings.iter().any(|existing| existing == warning) {
+            out.iec_warnings.push(warning.clone());
+        }
+    }
+    for correction in &interrupting.iec_corrections {
+        if !out.iec_corrections.iter().any(|existing| existing == correction) {
+            out.iec_corrections.push(correction.clone());
+        }
+    }
+    out
 }
 
 fn run_one(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
@@ -435,22 +485,22 @@ fn run_one(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
         None => project,
     };
     // Fault and arc flash use the network selected by fault_method. Load flow
-    // keeps the entered reactances. Under ANSI the first-cycle C37.010 duty
-    // network is used and the generator / synchronous-motor step-down is off.
+    // keeps the entered reactances. Under ANSI each bus uses the first-cycle
+    // C37.010 network at or below 1 kV and the interrupting network above that;
+    // the generator / synchronous-motor step-down is off. Post-motor arc-flash
+    // stages use the same duty with induction motors removed.
     let method_held;
     let method_project = {
-        let mut p = fault_method_project(project);
+        let p = fault_method_project(project);
         if project.fault_method == FaultMethod::Ansi {
-            p.machine_step_down = None;
             warnings.extend(crate::machine::warnings(project));
-            warnings.push("Fault method is ANSI: bolted currents use the first-cycle (momentary) C37.010 duty network. The generator and synchronous-motor step-down is not applied.".into());
+            warnings.push("Fault method is ANSI: bolted currents use the first-cycle C37.010 duty network at buses through 1 kV and the interrupting network above 1 kV. The generator and synchronous-motor step-down is not applied.".into());
         }
         method_held = p;
         &method_held
     };
     let fault = if need_fault {
-        let method_model = crate::network::build_validated(method_project)?;
-        Some(fault::solve_with_model(method_project, loadflow.as_ref(), &method_model)?)
+        Some(fault_for_method(method_project, loadflow.as_ref())?)
     } else {
         None
     };
@@ -1482,6 +1532,11 @@ fn machine_scale(project: &Project, machine: &StagedMachine, time_s: f64) -> f64
 /// rated current (used from the step-down instant on). Each is solved once
 /// at a flat 1.0 pu prefault; a fault increment is linear in the faulted
 /// bus's prefault voltage, so every bus is scaled by its own study prefault.
+struct AnsiDutyStages {
+    base: crate::fault::FaultResult,
+    no_induction: Option<crate::fault::FaultResult>,
+}
+
 struct MachineStages {
     base: crate::fault::FaultResult,
     no_induction: Option<crate::fault::FaultResult>,
@@ -1489,6 +1544,24 @@ struct MachineStages {
     stepped_labels: Vec<String>,
     dropped_labels: Vec<String>,
     warnings: Vec<String>,
+    /// ANSI only: first-cycle and interrupting stage pairs. When set, bus
+    /// currents are taken from the pair selected by nominal voltage.
+    ansi: Option<(AnsiDutyStages, AnsiDutyStages)>,
+}
+
+impl MachineStages {
+    fn for_bus(&self, kv: f64) -> (&crate::fault::FaultResult, Option<&crate::fault::FaultResult>) {
+        if let Some((first_cycle, interrupting)) = &self.ansi {
+            let pair = if crate::machine::ansi_duty_for_kv(kv) == crate::machine::Duty::FirstCycle {
+                first_cycle
+            } else {
+                interrupting
+            };
+            (&pair.base, pair.no_induction.as_ref())
+        } else {
+            (&self.base, self.no_induction.as_ref())
+        }
+    }
 }
 
 thread_local! {
@@ -1499,10 +1572,48 @@ fn is_induction(motor: &crate::model::Motor) -> bool {
     motor.machine_kind != Some(crate::model::MotorKind::Synchronous)
 }
 
+fn solve_stage_pair(project: &Project) -> Result<(crate::fault::FaultResult, Option<crate::fault::FaultResult>), String> {
+    let mut base_project = project.clone();
+    base_project.prefault = Prefault::Flat;
+    base_project.prefault_pu = 1.0;
+    for bus in &mut base_project.buses { bus.prefault_pu = None; }
+    let base = crate::fault::solve_uncorrected(&base_project, None)?;
+    let mut without = base_project.clone();
+    without.motors.retain(|motor| !is_induction(motor));
+    let no_induction = if base_project.motors.iter().any(is_induction) {
+        Some(crate::fault::solve_uncorrected(&without, None)?)
+    } else {
+        None
+    };
+    Ok((base, no_induction))
+}
+
 fn machine_stages(project: &Project) -> Result<std::rc::Rc<MachineStages>, String> {
     let key = serde_json::to_string(project).map_err(|error| error.to_string())?;
     if let Some(hit) = STAGE_CACHE.with(|cache| cache.borrow().as_ref().filter(|(k, _)| *k == key).map(|(_, stages)| stages.clone())) {
         return Ok(hit);
+    }
+    if project.fault_method == FaultMethod::Ansi {
+        let first = crate::machine::duty_project(project, crate::machine::Duty::FirstCycle)
+            .unwrap_or_else(|| project.clone());
+        let interrupting = crate::machine::duty_project(project, crate::machine::Duty::Interrupting)
+            .unwrap_or_else(|| project.clone());
+        let (fc_base, fc_ni) = solve_stage_pair(&first)?;
+        let (int_base, int_ni) = solve_stage_pair(&interrupting)?;
+        let stages = std::rc::Rc::new(MachineStages {
+            base: fc_base.clone(),
+            no_induction: fc_ni.clone(),
+            stepped: None,
+            stepped_labels: Vec::new(),
+            dropped_labels: Vec::new(),
+            warnings: Vec::new(),
+            ansi: Some((
+                AnsiDutyStages { base: fc_base, no_induction: fc_ni },
+                AnsiDutyStages { base: int_base, no_induction: int_ni },
+            )),
+        });
+        STAGE_CACHE.with(|cache| *cache.borrow_mut() = Some((key, stages.clone())));
+        return Ok(stages);
     }
     let mut base_project = project.clone();
     base_project.prefault = Prefault::Flat;
@@ -1561,7 +1672,7 @@ fn machine_stages(project: &Project) -> Result<std::rc::Rc<MachineStages>, Strin
             stepped = Some(crate::fault::solve_uncorrected(&reduced, None)?);
         }
     }
-    let stages = std::rc::Rc::new(MachineStages { base, no_induction, stepped, stepped_labels, dropped_labels, warnings });
+    let stages = std::rc::Rc::new(MachineStages { base, no_induction, stepped, stepped_labels, dropped_labels, warnings, ansi: None });
     STAGE_CACHE.with(|cache| *cache.borrow_mut() = Some((key, stages.clone())));
     Ok(stages)
 }
@@ -1623,7 +1734,8 @@ fn one_solution_exposure(project: &Project, case: &ArcEquipment, fault: &crate::
     let gap = |detail: String| missing_arc_flash_message(&case.bus, &detail);
     let bus_kv = project.bus(&case.bus).map(|bus| bus.kv).ok_or_else(|| "unknown bus".to_string())?;
     let stages = machine_stages(project)?;
-    let stage_bus = stages.base.buses.iter().find(|b| b.id == case.bus)
+    let (stage_base, stage_no_induction) = stages.for_bus(bus_kv);
+    let stage_bus = stage_base.buses.iter().find(|b| b.id == case.bus)
         .ok_or_else(|| format!("missing stage fault for bus '{}'", case.bus))?;
     // Machines listed on the base solution.
     let mut machines: Vec<StagedMachine> = Vec::new();
@@ -1669,7 +1781,7 @@ fn one_solution_exposure(project: &Project, case: &ArcEquipment, fault: &crate::
             [a[0] / 1000.0 * scale, a[1] / 1000.0 * scale]
         };
         let base = take(stage_bus);
-        let no_induction = stages.no_induction.as_ref().and_then(|f| f.buses.iter().find(|b| b.id == case.bus)).map(take).unwrap_or(base);
+        let no_induction = stage_no_induction.and_then(|f| f.buses.iter().find(|b| b.id == case.bus)).map(take).unwrap_or(base);
         let stepped = stages.stepped.as_ref().and_then(|f| f.buses.iter().find(|b| b.id == case.bus)).map(take).unwrap_or(no_induction);
         let component = component_beyond(project, &case.bus, far);
         let behind: Vec<(usize, [f64; 2])> = machine_bus.iter().enumerate()
@@ -1691,7 +1803,7 @@ fn one_solution_exposure(project: &Project, case: &ArcEquipment, fault: &crate::
             }) else { return [0.0, 0.0] };
             [m.current_pu[0] * ibase * scale, m.current_pu[1] * ibase * scale]
         };
-        let no_induction = stages.no_induction.as_ref().map(|f| take_m(f)).unwrap_or(base);
+        let no_induction = stage_no_induction.map(|f| take_m(f)).unwrap_or(base);
         let stepped = stages.stepped.as_ref().map(|f| take_m(f)).unwrap_or(no_induction);  // falls back to no_induction/base
         streams.push(Stream { label: machines[index].label.clone(), base, no_induction, stepped, machines: vec![(index, *current)], device: None, has_source: *source });
     }

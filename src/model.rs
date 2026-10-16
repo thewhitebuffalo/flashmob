@@ -50,8 +50,10 @@ pub struct Project {
     pub prefault: Prefault,
     /// Fault-study network used for the main fault result and for arc flash.
     /// `comprehensive` (the default) uses each machine's entered reactance.
-    /// `ansi` uses the first-cycle (momentary) C37.010 duty network and turns
-    /// the generator / synchronous-motor step-down off.
+    /// `ansi` picks the first-cycle C37.010 duty network at buses through 1 kV
+    /// and the interrupting network above 1 kV, and turns the generator /
+    /// synchronous-motor step-down off. Arc-flash post-motor stages keep that
+    /// duty with induction motors removed.
     #[serde(default, skip_serializing_if = "is_comprehensive")]
     pub fault_method: FaultMethod,
     /// Staged arc flash: incident energy accumulates in trip order until the
@@ -160,8 +162,9 @@ pub enum FaultMethod {
     /// Entered machine reactances, no C37.010 duty multipliers. Default.
     #[default]
     Comprehensive,
-    /// First-cycle (momentary) IEEE C37.010-1979 5.4.1 duty network. The
-    /// generator and synchronous-motor step-down is not applied.
+    /// IEEE C37.010-1979 5.4.1 duty networks selected by bus voltage: first-cycle
+    /// through 1 kV, interrupting above 1 kV. The generator and synchronous-motor
+    /// step-down is not applied.
     Ansi,
 }
 
