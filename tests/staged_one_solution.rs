@@ -76,11 +76,11 @@ fn synchronous_motor_step_down_lowers_energy_and_is_validated() {
     // The synchronous motor has no feeder device; the main breaker clears the
     // utility share and its remaining current is excluded.
     assert!(held.label_reasons.iter().any(|c| c == "remaining_current_excluded"), "{:?}", held.label_reasons);
-    p.machine_step_down = Some(MachineStepDown { percent_of_rated: 0.0, after_cycles: 6.0 });
+    p.machine_step_down = Some(MachineStepDown { percent_of_rated: 0.0, after_cycles: 6.0 , apply_to_generators: true, apply_to_synchronous_motors: true, synchronous_motor_percent_of_rated: None });
     let stepped = row(&run(&p), "af-mcc");
     assert!(stepped.label_reasons.iter().any(|c| c == "machine_step_down_assumed"));
     assert!(stepped.governing_cal_cm2 < held.governing_cal_cm2, "{} vs {}", stepped.governing_cal_cm2, held.governing_cal_cm2);
-    p.machine_step_down = Some(MachineStepDown { percent_of_rated: 50.0, after_cycles: 4.0 });
+    p.machine_step_down = Some(MachineStepDown { percent_of_rated: 50.0, after_cycles: 4.0 , apply_to_generators: true, apply_to_synchronous_motors: true, synchronous_motor_percent_of_rated: None });
     assert!(p.validate().iter().any(|e| e.contains("after_cycles")));
 }
 

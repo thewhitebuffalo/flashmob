@@ -57,6 +57,9 @@ pub struct Project {
     /// during an arc. None (the default) keeps their initial contribution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine_step_down: Option<MachineStepDown>,
+    /// Optional upstream backup check for staged arc clearing. Off when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_backup: Option<UpstreamBackup>,
     /// Re-time each device on its reduced current after motors drop out,
     /// machines step down, or a source decrement falls. Default false: each
     /// device is timed once at its initial arcing current.
@@ -923,8 +926,45 @@ fn default_cleared_fraction() -> f64 {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MachineStepDown {
+    /// Generator step-down level, percent of rated current. Also used for
+    /// synchronous motors unless `synchronous_motor_percent_of_rated` is set.
     pub percent_of_rated: f64,
     pub after_cycles: f64,
+    /// Step generators down. Default true.
+    #[serde(default = "default_true")]
+    pub apply_to_generators: bool,
+    /// Step synchronous motors down. Default true.
+    #[serde(default = "default_true")]
+    pub apply_to_synchronous_motors: bool,
+    /// Separate synchronous-motor level; `percent_of_rated` when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synchronous_motor_percent_of_rated: Option<f64>,
+}
+
+impl MachineStepDown {
+    pub fn synchronous_percent(&self) -> f64 {
+        self.synchronous_motor_percent_of_rated.unwrap_or(self.percent_of_rated)
+    }
+}
+
+/// Optional upstream backup check for staged arc clearing. A device up to
+/// `levels` device levels above a branch's own fastest device times that
+/// branch instead when it clears sooner and carries at least `ratio` of the
+/// near device's current. Fuses and current-limiting devices are not used.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamBackup {
+    #[serde(default = "default_backup_levels")]
+    pub levels: usize,
+    #[serde(default = "default_backup_ratio")]
+    pub ratio: f64,
+}
+
+fn default_backup_levels() -> usize {
+    5
+}
+fn default_backup_ratio() -> f64 {
+    0.80
 }
 
 fn default_one() -> f64 {
@@ -968,6 +1008,7 @@ impl Default for Project {
             prefault_pu: 1.0,
             cleared_fault_fraction: 0.80,
             machine_step_down: None,
+            upstream_backup: None,
             retime_on_reduced_current: false,
             low_voltage_tolerance_plus_10: false,
             assumptions: Vec::new(),
@@ -988,6 +1029,7 @@ impl Project {
             prefault_pu: 1.0,
             cleared_fault_fraction: 0.80,
             machine_step_down: None,
+            upstream_backup: None,
             retime_on_reduced_current: false,
             low_voltage_tolerance_plus_10: false,
             assumptions: Vec::new(),
@@ -1274,8 +1316,19 @@ impl Project {
             if !(step.percent_of_rated.is_finite() && step.percent_of_rated >= 0.0) {
                 errors.push("machine_step_down percent_of_rated must be zero or positive".into());
             }
+            if !(step.synchronous_percent().is_finite() && step.synchronous_percent() >= 0.0) {
+                errors.push("machine_step_down synchronous_motor_percent_of_rated must be zero or positive".into());
+            }
             if !(step.after_cycles.is_finite() && step.after_cycles / 60.0 > self.motor_contribution_s) {
                 errors.push(format!("machine_step_down after_cycles must be greater than the induction-motor window of {:.2} cycles", self.motor_contribution_s * 60.0));
+            }
+        }
+        if let Some(backup) = &self.upstream_backup {
+            if !(1..=5).contains(&backup.levels) {
+                errors.push("upstream_backup levels must be 1 to 5".into());
+            }
+            if !(backup.ratio.is_finite() && backup.ratio > 0.0 && backup.ratio <= 1.0) {
+                errors.push("upstream_backup ratio must be above 0 and at most 1".into());
             }
         }
         if !(self.prefault_pu.is_finite() && self.prefault_pu > 0.0) {

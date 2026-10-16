@@ -715,7 +715,12 @@ fn evaluate_equipment(project: &Project, fault: &FaultResult,
     let decrement_source_ids = curved_sources_reaching(project, &case.bus);
     let Some(bus_fault) = fault.buses.iter().find(|b| b.id == bus.id) else { return Err("missing fault result".into()) };
     let Some(bolted) = bus_fault.three_phase.as_ref().map(|p| p.symmetrical_ka) else {
-        return Err(format!("bus is out of service: zero three-phase fault current ({})", bus_fault.note.clone().unwrap_or_else(|| "no source".into())));
+        let deenergized = !project.sources.iter().any(|s| s.in_service && reachable_buses(project, &case.bus).contains(&s.bus));
+        return Err(if deenergized {
+            format!("bus '{}' is out of service: zero three-phase fault current ({})", case.bus, bus_fault.note.clone().unwrap_or_else(|| "de-energized".into()))
+        } else {
+            format!("bus '{}' fault current is zero ({})", case.bus, bus_fault.note.clone().unwrap_or_else(|| "no source".into()))
+        });
     };
     if !(0.208..=15.0).contains(&bus.kv) {
         return Err(format!("{:.2} kV is outside the IEEE 1584-2018 range of 208 V to 15 kV", bus.kv));
@@ -1416,66 +1421,151 @@ fn finish_clearing(raw: f64, cap: f64, escape: bool, what: &str, not_a_label: &s
 
 
 
-/// Arc duration when one device does not end every contribution.
-/// Devices are timed at the initial arcing current. Later topology uses a new
-/// bolted current. A motor with no feeder device is removed after
-/// `motor_contribution_s`. When a decrement curve reaches the bus, each
-/// interval is subdivided and the source strength follows that curve.
-/// How one machine's share of the fault current changes during the arc.
+/// How one machine's share of a stage solution changes inside that stage.
+/// The induction-motor window and the generator/synchronous-motor step-down
+/// are separate fault solutions (see `MachineStages`); this rule only covers
+/// what varies inside a stage: a source decrement curve and an entered motor
+/// decay time constant.
 #[derive(Clone, Copy)]
 enum MachineRule {
-    /// Utility: constant.
     Constant,
-    /// Source with an entered decrement curve (index into project.sources).
     Decrement(usize),
-    /// Generator or synchronous motor. Rated current in per unit on the
-    /// study base, when known, for the optional step-down. Optional decay
-    /// time constant for a synchronous motor.
-    Synchronous { rated_pu: Option<f64>, tau_s: Option<f64> },
-    /// Induction motor (or a motor with no machine kind): drops out after the
-    /// motor window; optional exponential decay inside it.
+    Synchronous { tau_s: Option<f64> },
     Induction { tau_s: Option<f64> },
 }
 
 struct StagedMachine {
     rule: MachineRule,
-    /// Initial per-unit current magnitude in the one fault solution.
-    initial_pu: f64,
     label: String,
 }
 
 fn machine_scale(project: &Project, machine: &StagedMachine, time_s: f64) -> f64 {
-    let step = |rated: Option<f64>| -> f64 {
-        match (&project.machine_step_down, rated) {
-            (Some(step), Some(rated)) if time_s >= step.after_cycles / 60.0 - 1e-12 && machine.initial_pu > 0.0 =>
-                (step.percent_of_rated / 100.0 * rated / machine.initial_pu).min(1.0),
-            _ => 1.0,
-        }
-    };
     match machine.rule {
         MachineRule::Constant => 1.0,
         MachineRule::Decrement(index) => project.sources[index].decrement_ratio_at(time_s),
-        MachineRule::Synchronous { rated_pu, tau_s } => step(rated_pu) * tau_s.map_or(1.0, |tau| (-time_s / tau).exp()),
+        MachineRule::Synchronous { tau_s } => tau_s.map_or(1.0, |tau| (-time_s / tau).exp()),
         MachineRule::Induction { tau_s } => if time_s >= project.motor_contribution_s - 1e-12 { 0.0 } else { tau_s.map_or(1.0, |tau| (-time_s / tau).exp()) },
     }
 }
 
-/// One contribution into the faulted bus from the single fault solution: a
-/// connected branch, or a machine on the faulted bus itself.
+/// Machine-stage fault solutions, all from the same prefault and never
+/// re-solved for a device opening: the base network; the network with every
+/// induction motor removed (used from the motor window on); and, when the
+/// step-down is enabled, the network with induction motors removed and each
+/// stepped generator or synchronous motor reduced to its entered percent of
+/// rated current (used from the step-down instant on). Each is solved once
+/// at a flat 1.0 pu prefault; a fault increment is linear in the faulted
+/// bus's prefault voltage, so every bus is scaled by its own study prefault.
+struct MachineStages {
+    base: crate::fault::FaultResult,
+    no_induction: Option<crate::fault::FaultResult>,
+    stepped: Option<crate::fault::FaultResult>,
+    stepped_labels: Vec<String>,
+    dropped_labels: Vec<String>,
+    warnings: Vec<String>,
+}
+
+thread_local! {
+    static STAGE_CACHE: std::cell::RefCell<Option<(String, std::rc::Rc<MachineStages>)>> = const { std::cell::RefCell::new(None) };
+}
+
+fn is_induction(motor: &crate::model::Motor) -> bool {
+    motor.machine_kind != Some(crate::model::MotorKind::Synchronous)
+}
+
+fn machine_stages(project: &Project) -> Result<std::rc::Rc<MachineStages>, String> {
+    let key = serde_json::to_string(project).map_err(|error| error.to_string())?;
+    if let Some(hit) = STAGE_CACHE.with(|cache| cache.borrow().as_ref().filter(|(k, _)| *k == key).map(|(_, stages)| stages.clone())) {
+        return Ok(hit);
+    }
+    let mut base_project = project.clone();
+    base_project.prefault = Prefault::Flat;
+    base_project.prefault_pu = 1.0;
+    for bus in &mut base_project.buses { bus.prefault_pu = None; }
+    let base = crate::fault::solve_uncorrected(&base_project, None)?;
+    let mut without = base_project.clone();
+    without.motors.retain(|motor| !is_induction(motor));
+    let no_induction = if base_project.motors.iter().any(is_induction) { Some(crate::fault::solve_uncorrected(&without, None)?) } else { None };
+    let mut stepped = None;
+    let mut stepped_labels = Vec::new();
+    let mut dropped_labels = Vec::new();
+    let mut warnings = Vec::new();
+    if let Some(step) = &project.machine_step_down {
+        let mut reduced = without.clone();
+        let generators: Vec<usize> = reduced.sources.iter().enumerate()
+            .filter(|(_, source)| source.in_service && source.decrement_curve.is_empty()
+                && matches!(source.machine_kind, Some(kind) if kind != crate::model::GeneratorKind::Utility))
+            .map(|(index, _)| index).collect();
+        // A switch is off when no machine of that kind exists.
+        if step.apply_to_generators && !generators.is_empty() {
+            for index in generators {
+                let source = &mut reduced.sources[index];
+                let rated = source.generator.as_ref().map_or(0.0, |g| g.rated_mva);
+                let target = step.percent_of_rated / 100.0 * rated;
+                if target <= 1e-9 {
+                    // Zero rating or 0%: the machine drops out at the step.
+                    source.mva_sc = 1e-9;
+                    dropped_labels.push(format!("source {}", source.id));
+                } else {
+                    if target > source.mva_sc {
+                        warnings.push(format!("Source {}: the stepped-down contribution ({:.0}% of rated) is larger than its initial contribution; the entered value is used.", source.id, step.percent_of_rated));
+                    }
+                    source.mva_sc = target;
+                }
+                stepped_labels.push(format!("source {}", source.id));
+            }
+        }
+        if step.apply_to_synchronous_motors {
+            let percent = step.synchronous_percent();
+            for motor in &mut reduced.motors {
+                if percent <= 1e-9 {
+                    motor.x_subtransient_pu = 1e9;
+                    dropped_labels.push(format!("motor {}", motor.id));
+                } else {
+                    let x = 100.0 / percent * motor.x_subtransient_pu;
+                    if x < motor.x_subtransient_pu {
+                        warnings.push(format!("Motor {}: the stepped-down contribution ({:.0}% of rated) is larger than its initial contribution; the entered value is used.", motor.id, percent));
+                    }
+                    motor.x_subtransient_pu = x;
+                }
+                stepped_labels.push(format!("motor {}", motor.id));
+            }
+        }
+        if !stepped_labels.is_empty() {
+            stepped = Some(crate::fault::solve_uncorrected(&reduced, None)?);
+        }
+    }
+    let stages = std::rc::Rc::new(MachineStages { base, no_induction, stepped, stepped_labels, dropped_labels, warnings });
+    STAGE_CACHE.with(|cache| *cache.borrow_mut() = Some((key, stages.clone())));
+    Ok(stages)
+}
+
+/// One contribution into the faulted bus: a connected branch, or a machine
+/// on the faulted bus itself. Currents are the study-prefault-scaled phasors
+/// from each machine-stage solution.
 struct Stream<'a> {
     label: String,
-    /// kA phasor flowing into the faulted bus at t = 0.
-    phasor: [f64; 2],
-    /// (machine index, that machine's per-unit phasor) behind this stream.
+    /// Base, no-induction, and stepped-down kA phasors into the faulted bus.
+    base: [f64; 2],
+    no_induction: [f64; 2],
+    stepped: [f64; 2],
+    /// Machines whose continuous rules (decrement, tau) still scale this stream.
     machines: Vec<(usize, [f64; 2])>,
     device: Option<&'a Device>,
     has_source: bool,
 }
 
 impl Stream<'_> {
-    /// Complex factor applied to this stream's t = 0 phasor at `time_s`:
-    /// the machine-current-weighted scale of the machines behind it.
-    fn factor(&self, project: &Project, machines: &[StagedMachine], time_s: f64) -> [f64; 2] {
+    fn phasor_at(&self, project: &Project, machines: &[StagedMachine], time_s: f64) -> [f64; 2] {
+        let stage = if project.machine_step_down.as_ref().is_some_and(|s| time_s >= s.after_cycles / 60.0 - 1e-12) {
+            self.stepped
+        } else if time_s >= project.motor_contribution_s - 1e-12 {
+            self.no_induction
+        } else {
+            self.base
+        };
+        // Continuous rules (decrement curves, entered decay time constants)
+        // still scale relative to the stage's t = 0 machines.
         let mut total = [0.0, 0.0];
         let mut scaled = [0.0, 0.0];
         for (index, current) in &self.machines {
@@ -1484,9 +1574,9 @@ impl Stream<'_> {
             scaled = [scaled[0] + k * current[0], scaled[1] + k * current[1]];
         }
         let norm = total[0] * total[0] + total[1] * total[1];
-        if norm < 1e-18 { return [1.0, 0.0]; }
-        // scaled / total
-        [(scaled[0] * total[0] + scaled[1] * total[1]) / norm, (scaled[1] * total[0] - scaled[0] * total[1]) / norm]
+        if norm < 1e-18 { return stage; }
+        let factor = [(scaled[0] * total[0] + scaled[1] * total[1]) / norm, (scaled[1] * total[0] - scaled[0] * total[1]) / norm];
+        cmul(stage, factor)
     }
 }
 
@@ -1500,29 +1590,19 @@ struct OneSolutionExposure {
     reduced_segments: Vec<EnergySegment>,
     full_device: Option<String>,
     reduced_device: Option<String>,
-    /// True when some contribution follows a decrement, a motor decay, or a
-    /// machine step-down, so the profile is not piecewise constant per opening.
     time_varying: bool,
 }
 
-/// Arc exposure from the one fault solution. Each contribution into the
-/// faulted bus (each connected branch, and each machine on the bus) is
-/// cleared by its own device. Opening a device removes the contributions it
-/// carries; the network is not re-solved. Incident energy accumulates in
-/// trip order until the devices that have operated have cleared
-/// `cleared_fault_fraction` of the total bus current, and the arc is then
-/// extinguished. Machine rules (induction-motor window, optional decay,
-/// optional generator and synchronous-motor step-down, source decrement)
-/// scale the contributions in time.
 fn one_solution_exposure(project: &Project, case: &ArcEquipment, fault: &crate::fault::BusFault, bolted_ka: f64, template: &IeeeInput, decrement_source_ids: &[String], protection: &crate::protection::Protection, fixed: Option<(f64, f64)>) -> Result<OneSolutionExposure, String> {
     let gap = |detail: String| missing_arc_flash_message(&case.bus, &detail);
     let bus_kv = project.bus(&case.bus).map(|bus| bus.kv).ok_or_else(|| "unknown bus".to_string())?;
-    // Machines in the one solution.
+    let stages = machine_stages(project)?;
+    let stage_bus = stages.base.buses.iter().find(|b| b.id == case.bus)
+        .ok_or_else(|| format!("missing stage fault for bus '{}'", case.bus))?;
+    // Machines listed on the base solution.
     let mut machines: Vec<StagedMachine> = Vec::new();
     let mut machine_bus: Vec<(String, [f64; 2], bool)> = Vec::new();
-    let mut step_missing: Vec<String> = Vec::new();
-    for current in &fault.machine_currents {
-        let initial_pu = cabs(current.current_pu);
+    for current in &stage_bus.machine_currents {
         let (rule, label, is_source) = if let Some(id) = &current.source_id {
             let index = project.sources.iter().position(|source| &source.id == id).ok_or_else(|| format!("unknown source '{id}'"))?;
             let source = &project.sources[index];
@@ -1530,9 +1610,7 @@ fn one_solution_exposure(project: &Project, case: &ArcEquipment, fault: &crate::
             let rule = if !source.decrement_curve.is_empty() {
                 MachineRule::Decrement(index)
             } else if generator {
-                let rated = source.generator.as_ref().map(|g| g.rated_mva / project.s_base_mva);
-                if rated.is_none() && project.machine_step_down.is_some() { step_missing.push(source.id.clone()); }
-                MachineRule::Synchronous { rated_pu: rated, tau_s: None }
+                MachineRule::Synchronous { tau_s: None }
             } else {
                 MachineRule::Constant
             };
@@ -1541,62 +1619,77 @@ fn one_solution_exposure(project: &Project, case: &ArcEquipment, fault: &crate::
             let id = current.motor_id.clone().unwrap_or_default();
             let motor = project.motors.iter().find(|motor| motor.id == id).ok_or_else(|| format!("unknown motor '{id}'"))?;
             let rule = if motor.machine_kind == Some(crate::model::MotorKind::Synchronous) {
-                let kva = motor.hp * 0.746 / motor.efficiency / motor.pf;
-                MachineRule::Synchronous { rated_pu: Some(kva / 1000.0 / project.s_base_mva), tau_s: motor.decay_time_constant_s }
+                MachineRule::Synchronous { tau_s: motor.decay_time_constant_s }
             } else {
                 MachineRule::Induction { tau_s: motor.decay_time_constant_s }
             };
             (rule, format!("motor {id}"), false)
         };
-        machines.push(StagedMachine { rule, initial_pu, label });
+        machines.push(StagedMachine { rule, label });
         machine_bus.push((current.bus_id.clone(), current.current_pu, is_source));
     }
-    // Streams: connected branches, then machines on the faulted bus.
+    let scale = fault.prefault_pu; // stages solved at 1.0 pu
     let located = located_devices(project);
-    let preferred = case.upstream_device.as_deref().and_then(|id| located.iter().copied().find(|device| device.id == id));
-    if fixed.is_some() {
-        // Entered duration: no device is selected or timed.
-    } else if let Some(device) = preferred {
-        if !machine_bus.iter().any(|(bus, _, _)| device_disconnects(project, device, &case.bus, bus)) {
-            return Err(format!("opening the selected device {} [{}] does not disconnect a utility, generator, or motor from bus '{}'; multiple-device clearing cannot use a device that isolates nothing", device.name, device.id, case.bus));
-        }
-    } else if let Some(id) = &case.upstream_device {
-        return Err(missing_arc_flash_message(&case.bus, &format!("a closed protected branch for upstream device [{id}]")));
-    }
     let mut streams: Vec<Stream> = Vec::new();
-    for terminal in &fault.terminal_currents {
+    for terminal in &stage_bus.terminal_currents {
         let Some(branch) = project.branches.iter().find(|branch| branch.id == terminal.branch_id) else { continue };
-        let (increment, far) = if branch.from == case.bus { (terminal.from_increment_a, &branch.to) }
-            else if branch.to == case.bus { (terminal.to_increment_a, &branch.from) }
+        let (near_end, far) = if branch.from == case.bus { (true, &branch.to) }
+            else if branch.to == case.bus { (false, &branch.from) }
             else { continue };
         if !project.branch_closed(branch) { continue; }
-        let phasor = [increment[0] / 1000.0, increment[1] / 1000.0];
+        let take = |stage: &crate::fault::BusFault| -> [f64; 2] {
+            let Some(t) = stage.terminal_currents.iter().find(|t| t.branch_id == branch.id) else { return [0.0, 0.0] };
+            let a = if near_end { t.from_increment_a } else { t.to_increment_a };
+            [a[0] / 1000.0 * scale, a[1] / 1000.0 * scale]
+        };
+        let base = take(stage_bus);
+        let no_induction = stages.no_induction.as_ref().and_then(|f| f.buses.iter().find(|b| b.id == case.bus)).map(take).unwrap_or(base);
+        let stepped = stages.stepped.as_ref().and_then(|f| f.buses.iter().find(|b| b.id == case.bus)).map(take).unwrap_or(no_induction);
         let component = component_beyond(project, &case.bus, far);
         let behind: Vec<(usize, [f64; 2])> = machine_bus.iter().enumerate()
             .filter(|(_, (bus, _, _))| component.contains(bus))
             .map(|(index, (_, current, _))| (index, *current)).collect();
         let has_source = machine_bus.iter().any(|(bus, _, source)| *source && component.contains(bus));
-        let device = match preferred.filter(|device| device_disconnects(project, device, &case.bus, far)) {
-            Some(device) => Some(device),
-            None => {
-                let mut candidates: Vec<&Device> = located.iter().copied().filter(|device| device_disconnects(project, device, &case.bus, far)).collect();
-                candidates.sort_by(|a, b| device_hops(project, &case.bus, a).cmp(&device_hops(project, &case.bus, b)).then(a.id.cmp(&b.id)));
-                candidates.first().copied()
-            }
-        };
-        streams.push(Stream { label: format!("branch {}", branch.id), phasor, machines: behind, device, has_source });
+        streams.push(Stream { label: format!("branch {}", branch.id), base, no_induction, stepped, machines: behind, device: None, has_source });
     }
     let ibase = crate::model::i_base_ka(bus_kv, project.s_base_mva);
     for (index, (bus, current, source)) in machine_bus.iter().enumerate() {
         if bus != &case.bus { continue; }
-        streams.push(Stream { label: machines[index].label.clone(), phasor: [current[0] * ibase, current[1] * ibase], machines: vec![(index, *current)], device: None, has_source: *source });
+        let base = [current[0] * ibase * scale, current[1] * ibase * scale];
+        // On-bus machines: their stage currents come from the stage's machine list.
+        let take_m = |stage: &crate::fault::FaultResult| -> [f64; 2] {
+            let Some(b) = stage.buses.iter().find(|b| b.id == case.bus) else { return [0.0, 0.0] };
+            let Some(m) = b.machine_currents.iter().find(|m| {
+                (m.source_id.as_ref().map(|s| format!("source {s}")) == Some(machines[index].label.clone()))
+                || (m.motor_id.as_ref().map(|s| format!("motor {s}")) == Some(machines[index].label.clone()))
+            }) else { return [0.0, 0.0] };
+            [m.current_pu[0] * ibase * scale, m.current_pu[1] * ibase * scale]
+        };
+        let no_induction = stages.no_induction.as_ref().map(|f| take_m(f)).unwrap_or(base);
+        let stepped = stages.stepped.as_ref().map(|f| take_m(f)).unwrap_or(no_induction);  // falls back to no_induction/base
+        streams.push(Stream { label: machines[index].label.clone(), base, no_induction, stepped, machines: vec![(index, *current)], device: None, has_source: *source });
     }
-    let total = streams.iter().fold([0.0, 0.0], |sum, stream| [sum[0] + stream.phasor[0], sum[1] + stream.phasor[1]]);
+    let total = streams.iter().fold([0.0, 0.0], |sum, stream| [sum[0] + stream.base[0], sum[1] + stream.base[1]]);
     let total_abs = cabs(total);
     if !(total_abs.is_finite() && total_abs > 0.0) {
-        return Err(format!("bus '{}' is out of service: its fault current is zero", case.bus));
+        let deenergized = !project.sources.iter().any(|s| s.in_service && reachable_buses(project, &case.bus).contains(&s.bus));
+        return Err(if deenergized {
+            format!("bus '{}' is out of service: zero three-phase fault current (de-energized)", case.bus)
+        } else {
+            format!("bus '{}' fault current is zero", case.bus)
+        });
     }
-    streams.retain(|stream| cabs(stream.phasor) > 1e-9 * total_abs);
+    streams.retain(|stream| cabs(stream.base) > 1e-9 * total_abs);
+
+    // Assign each branch its fastest located device (lowest total clearing
+    // time at the base arcing current; ties broken by the uncapped time).
+    let arcing0 = {
+        let out = arcflash::calculate(template)?;
+        out.i_arc_ka
+    };
+    let fraction0 = arcing0 / bolted_ka;
+    assign_stream_devices(project, case, fault, &mut streams, &located, fraction0, fixed.is_some())?;
+
     if fixed.is_none() && streams.iter().all(|stream| stream.device.is_none()) {
         return Err(missing_arc_flash_message(&case.bus, &format!("an upstream device that isolates this bus. {}", protection.detail)));
     }
@@ -1606,20 +1699,20 @@ fn one_solution_exposure(project: &Project, case: &ArcEquipment, fault: &crate::
         }
     }
     let time_varying = !decrement_source_ids.is_empty()
-        || machines.iter().any(|m| matches!(m.rule, MachineRule::Induction { tau_s: Some(_) } | MachineRule::Synchronous { tau_s: Some(_), .. }))
-        || (project.machine_step_down.is_some() && machines.iter().any(|m| matches!(m.rule, MachineRule::Synchronous { rated_pu: Some(_), .. })));
+        || machines.iter().any(|m| matches!(m.rule, MachineRule::Induction { tau_s: Some(_) } | MachineRule::Synchronous { tau_s: Some(_) }))
+        || (project.machine_step_down.is_some() && !stages.stepped_labels.is_empty())
+        || stages.no_induction.is_some();
     if let Some((full_s, reduced_s)) = fixed {
         let profile = |duration_s: f64| fixed_profile(project, &streams, &machines, total, bolted_ka, decrement_source_ids, duration_s);
         let empty = || Clearing { seconds: 0.0, capped: false, assumed: false, effective_arc_ka: None, basis: "", reasons: Vec::new(), note: String::new() };
         return Ok(OneSolutionExposure {
             full: empty(), reduced: empty(),
             full_segments: profile(full_s)?, reduced_segments: profile(reduced_s)?,
-            full_device: None, reduced_device: None,
-            time_varying,
+            full_device: None, reduced_device: None, time_varying,
         });
     }
     let run = |reduced: bool| -> Result<(Clearing, Vec<EnergySegment>, Option<String>), String> {
-        stage_streams(project, case, fault, bolted_ka, template, reduced, &streams, &machines, total, decrement_source_ids, &step_missing, gap)
+        stage_streams(project, case, fault, bolted_ka, template, reduced, &streams, &machines, total, decrement_source_ids, &stages, gap)
     };
     let full = run(false)?;
     let preview = arcflash::calculate(template)?;
@@ -1627,16 +1720,112 @@ fn one_solution_exposure(project: &Project, case: &ArcEquipment, fault: &crate::
     Ok(OneSolutionExposure {
         full: full.0, reduced: reduced.0,
         full_segments: full.1, reduced_segments: reduced.1,
-        full_device: full.2, reduced_device: reduced.2,
-        time_varying,
+        full_device: full.2, reduced_device: reduced.2, time_varying,
     })
 }
 
-/// Bus current over an entered duration from the one fault solution, with
-/// the machine rules applied and no device opening.
+fn assign_stream_devices<'a>(project: &'a Project, case: &ArcEquipment, fault: &crate::fault::BusFault, streams: &mut [Stream<'a>], located: &[&'a Device], fraction0: f64, skip: bool) -> Result<(), String> {
+    if skip { return Ok(()); }
+    // Prefer the selected upstream only for the "isolates nothing" check: the
+    // selection itself no longer prefers that device for timing.
+    if let Some(id) = &case.upstream_device {
+        if let Some(device) = located.iter().copied().find(|d| d.id == *id) {
+            if !streams.iter().any(|s| s.label.starts_with("branch ") && {
+                let far = project.branches.iter().find(|b| format!("branch {}", b.id) == s.label).map(|b| if b.from == case.bus { &b.to } else { &b.from });
+                far.is_some_and(|far| device_disconnects(project, device, &case.bus, far))
+            }) {
+                return Err(format!("opening the selected device {} [{}] does not disconnect a utility, generator, or motor from bus '{}'; multiple-device clearing cannot use a device that isolates nothing", device.name, device.id, case.bus));
+            }
+        } else {
+            return Err(missing_arc_flash_message(&case.bus, &format!("a closed protected branch for upstream device [{id}]")));
+        }
+    }
+    for stream in streams.iter_mut() {
+        if !stream.label.starts_with("branch ") { continue; }
+        let branch_id = &stream.label["branch ".len()..];
+        let Some(branch) = project.branches.iter().find(|b| b.id == branch_id) else { continue };
+        let far = if branch.from == case.bus { &branch.to } else { &branch.from };
+        let mut candidates: Vec<&Device> = located.iter().copied().filter(|d| device_disconnects(project, d, &case.bus, far)).collect();
+        if candidates.is_empty() { continue; }
+        // Sort by total clearing time (lowest first); ties by uncapped time, then id.
+        let mut scored: Vec<(f64, f64, &Device)> = Vec::new();
+        for device in candidates.drain(..) {
+            let Some(amps) = device_current(project, device, fault, fraction0) else { continue };
+            match device_exposure(device, amps, false) {
+                Ok(exposure) if exposure.seconds.is_finite() && exposure.seconds > 0.0 => {
+                    let uncapped = exposure.seconds; // same; finish_clearing not applied here
+                    scored.push((exposure.seconds, uncapped, device));
+                }
+                _ => {}
+            }
+        }
+        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .then(a.2.id.cmp(&b.2.id)));
+        // When no candidate has a finite clearing time at the initial current
+        // (for example a relay below pickup), keep the nearest hop so the
+        // continuous retime path can still try to clear on the decaying current.
+        let near = if let Some((_, _, device)) = scored.first().copied() {
+            device
+        } else {
+            let mut by_hop: Vec<&Device> = located.iter().copied().filter(|d| device_disconnects(project, d, &case.bus, far)).collect();
+            by_hop.sort_by(|a, b| device_hops(project, &case.bus, a).cmp(&device_hops(project, &case.bus, b)).then(a.id.cmp(&b.id)));
+            let Some(device) = by_hop.first().copied() else { continue };
+            device
+        };
+        let mut chosen = near;
+        if let Some(backup) = &project.upstream_backup {
+            if let Some(up) = upstream_backup_device(project, case, fault, near, far, located, fraction0, backup) {
+                chosen = up;
+            }
+        }
+        stream.device = Some(chosen);
+    }
+    Ok(())
+}
+
+fn upstream_backup_device<'a>(project: &'a Project, case: &ArcEquipment, fault: &crate::fault::BusFault, near: &'a Device, far: &str, located: &[&'a Device], fraction0: f64, backup: &crate::model::UpstreamBackup) -> Option<&'a Device> {
+    let near_amps = device_current(project, near, fault, fraction0)?;
+    let near_time = device_exposure(near, near_amps, false).ok()?.seconds;
+    // Walk device-levels away from the fault bus along the near device's branch.
+    let mut frontier = vec![near.bus.clone()];
+    let mut seen = std::collections::HashSet::from([near.bus.clone(), case.bus.clone()]);
+    let mut best: Option<(f64, &Device)> = None;
+    for _ in 0..backup.levels {
+        let mut next = Vec::new();
+        for _bus in &frontier {
+            for device in located.iter().copied() {
+                if seen.contains(&device.bus) { continue; }
+                if device.fuse_total_clearing || device.curve_is_total_clearing || curves::average_melt_fuse(device) { continue; }
+                if device.current_limiting.is_some() { continue; }
+                if !device_disconnects(project, device, &case.bus, far) { continue; }
+                // Same branch level: only consider devices that sit further from the fault than `near`.
+                if device_hops(project, &case.bus, device) <= device_hops(project, &case.bus, near) { continue; }
+                let Some(amps) = device_current(project, device, fault, fraction0) else { continue };
+                if amps + 1e-9 < backup.ratio * near_amps { continue; }
+                let Ok(exposure) = device_exposure(device, amps, false) else { continue };
+                if !(exposure.seconds.is_finite() && exposure.seconds > 0.0 && exposure.seconds < near_time - 1e-9) { continue; }
+                if best.as_ref().is_none_or(|(t, d)| exposure.seconds < *t - 1e-12 || ((exposure.seconds - *t).abs() < 1e-12 && device.id < d.id)) {
+                    best = Some((exposure.seconds, device));
+                }
+                next.push(device.bus.clone());
+                seen.insert(device.bus.clone());
+            }
+        }
+        if next.is_empty() { break; }
+        frontier = next;
+    }
+    best.map(|(_, d)| d)
+}
+
+/// Bus current over an entered duration from the machine-stage solutions,
+/// with continuous machine rules applied and no device opening.
 fn fixed_profile(project: &Project, streams: &[Stream], machines: &[StagedMachine], total: [f64; 2], bolted_ka: f64, decrement_source_ids: &[String], duration_s: f64) -> Result<Vec<EnergySegment>, String> {
     let total_abs = cabs(total);
-    let mut knots: Vec<f64> = vec![project.motor_contribution_s];
+    let mut knots: Vec<f64> = Vec::new();
+    if machines.iter().any(|m| matches!(m.rule, MachineRule::Induction { .. })) {
+        knots.push(project.motor_contribution_s);
+    }
     if let Some(step) = &project.machine_step_down { knots.push(step.after_cycles / 60.0); }
     let mut segments = Vec::new();
     let mut t = 0.0;
@@ -1647,7 +1836,7 @@ fn fixed_profile(project: &Project, streams: &[Stream], machines: &[StagedMachin
         let knot = knots.iter().copied().filter(|k| *k > t + 1e-9).fold(duration_s, f64::min);
         let end = next_decrement_end(project, decrement_source_ids, t, knot);
         let midpoint = t + (end - t) / 2.0;
-        let now = streams.iter().fold([0.0, 0.0], |sum, stream| { let p = cmul(stream.phasor, stream.factor(project, machines, midpoint)); [sum[0] + p[0], sum[1] + p[1]] });
+        let now = streams.iter().fold([0.0, 0.0], |sum, stream| { let p = stream.phasor_at(project, machines, midpoint); [sum[0] + p[0], sum[1] + p[1]] });
         segments.push(EnergySegment { ibf_ka: bolted_ka * cabs(now) / total_abs, duration_s: end - t });
         t = end;
     }
@@ -1671,8 +1860,12 @@ fn component_beyond(project: &Project, fault_bus: &str, start: &str) -> std::col
 
 struct StreamDevice<'a> {
     device: &'a Device,
-    /// Opening time once known.
     open_s: Option<f64>,
+    /// True when this device was timed as a fuse / total-clearing / limiting
+    /// device and must keep its base-solution time even when retiming.
+    static_time: bool,
+    /// Present when retime is on and the device follows a trip-only curve; used
+    /// for continuous advance under a source decrement curve.
     relay: Option<curves::DynamicRelay>,
     interrupting_s: f64,
     prior_amps: f64,
@@ -1681,7 +1874,7 @@ struct StreamDevice<'a> {
 
 #[allow(clippy::too_many_arguments)]
 fn stage_streams(project: &Project, case: &ArcEquipment, fault: &crate::fault::BusFault, bolted_ka: f64, template: &IeeeInput, reduced: bool,
-    streams: &[Stream], machines: &[StagedMachine], total: [f64; 2], decrement_source_ids: &[String], step_missing: &[String],
+    streams: &[Stream], machines: &[StagedMachine], total: [f64; 2], decrement_source_ids: &[String], stages: &MachineStages,
     gap: impl Fn(String) -> String) -> Result<(Clearing, Vec<EnergySegment>, Option<String>), String> {
     let total_abs = cabs(total);
     let arcing_of = |ibf_ka: f64| -> Result<f64, String> {
@@ -1696,149 +1889,240 @@ fn stage_streams(project: &Project, case: &ArcEquipment, fault: &crate::fault::B
     let mut assumed = false;
     let mut static_names: Vec<String> = Vec::new();
     let mut basis_single: Option<&'static str> = None;
-    // One timing per device.
     let mut devices: Vec<StreamDevice> = Vec::new();
     for stream in streams {
         let Some(device) = stream.device else { continue };
         if devices.iter().any(|d| d.device.id == device.id) { continue; }
         let amps = device_current(project, device, fault, fraction0).ok_or_else(|| gap(format!("the current through protected branch '{}' of {} [{}]", device.protected_branch.as_deref().unwrap_or(""), device.name, device.id)))?;
         let limiting = device.current_limiting.as_ref().is_some_and(|limit| amps >= limit.threshold_a);
-        let follows = retime && !device.fuse_total_clearing && !device.curve_is_total_clearing && !curves::average_melt_fuse(device) && !limiting;
+        let is_static = device.fuse_total_clearing || device.curve_is_total_clearing || curves::average_melt_fuse(device) || limiting;
+        let follows = retime && !is_static && device.breaker_interrupting_s.is_some();
         let relay = if follows { curves::DynamicRelay::new(&device.curve).ok() } else { None };
-        match (relay, device.breaker_interrupting_s) {
-            (Some(relay), Some(interrupting_s)) => devices.push(StreamDevice { device, open_s: None, relay: Some(relay), interrupting_s, prior_amps: amps, initial_amps: amps }),
-            _ => {
-                let exposure = device_exposure(device, amps, false).map_err(|detail| gap(detail))?;
-                if !exposure.seconds.is_finite() || exposure.seconds <= 0.0 {
-                    return Err(format!("clearing time of {} [{}] at bus '{}' is not a positive finite duration", device.name, device.id, case.bus));
-                }
+        let exposure = device_exposure(device, amps, false);
+        match exposure {
+            Ok(exposure) if exposure.seconds.is_finite() && exposure.seconds > 0.0 => {
                 assumed |= exposure.assumed;
                 for code in exposure.reasons { if !reasons.contains(&code) { reasons.push(code); } }
                 if !exposure.extra.is_empty() { extras.push(exposure.extra); }
                 basis_single = Some(exposure.basis);
-                if retime { static_names.push(format!("{} [{}]", device.name, device.id)); }
-                devices.push(StreamDevice { device, open_s: Some(exposure.seconds), relay: None, interrupting_s: 0.0, prior_amps: amps, initial_amps: amps });
+                if retime && is_static { static_names.push(format!("{} [{}]", device.name, device.id)); }
+                let open_s = if relay.is_some() && !decrement_source_ids.is_empty() { None } else { Some(exposure.seconds) };
+                devices.push(StreamDevice {
+                    device, open_s, static_time: is_static, relay,
+                    interrupting_s: device.breaker_interrupting_s.unwrap_or(0.0),
+                    prior_amps: amps, initial_amps: amps,
+                });
+            }
+            Ok(_) | Err(_) if relay.is_some() => {
+                // Below pickup at the initial current: continuous retime may still clear.
+                devices.push(StreamDevice {
+                    device, open_s: None, static_time: false, relay,
+                    interrupting_s: device.breaker_interrupting_s.unwrap_or(0.0),
+                    prior_amps: amps, initial_amps: amps,
+                });
+            }
+            Ok(_) => {
+                return Err(format!("clearing time of {} [{}] at bus '{}' is not a positive finite duration", device.name, device.id, case.bus));
+            }
+            Err(detail) => return Err(gap(detail)),
+        }
+    }
+    // Two one-time retimes, ordered by time: at the motor window, then at the
+    // step-down. Each uses that stage's solution currents and only retimes
+    // devices that have not yet cleared. Fuses keep their base time.
+    if retime {
+        let mut events: Vec<(f64, fn(&Stream) -> [f64; 2])> = Vec::new();
+        if stages.no_induction.is_some() {
+            events.push((project.motor_contribution_s, |s: &Stream| s.no_induction));
+        }
+        if stages.stepped.is_some() {
+            if let Some(step) = &project.machine_step_down {
+                events.push((step.after_cycles / 60.0, |s: &Stream| s.stepped));
+            }
+        }
+        events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        for (at, pick) in events {
+            // Stage bolted = |sum of stage stream phasors|.
+            let stage_total = streams.iter().fold([0.0, 0.0], |sum, s| { let p = pick(s); [sum[0] + p[0], sum[1] + p[1]] });
+            let stage_abs = cabs(stage_total);
+            if stage_abs <= 1e-12 * total_abs { continue; }
+            let stage_bolted = bolted_ka * stage_abs / total_abs;
+            let stage_fraction = arcing_of(stage_bolted)? / stage_bolted;
+            for d in devices.iter_mut() {
+                if d.static_time { continue; }
+                if d.open_s.is_some_and(|s| s <= at + 1e-9) { continue; }
+                let carried: Vec<&Stream> = streams.iter().filter(|s| s.device.is_some_and(|dev| dev.id == d.device.id)).collect();
+                let base = carried.iter().fold(0.0, |sum, s| sum + cabs(s.base));
+                let now = carried.iter().fold(0.0, |sum, s| sum + cabs(pick(s)));
+                if base <= 1e-18 { continue; }
+                let amps = d.initial_amps * (now / base) * (stage_fraction / fraction0);
+                let exposure = device_exposure(d.device, amps, false).map_err(|detail| gap(detail))?;
+                if !exposure.seconds.is_finite() || exposure.seconds <= 0.0 { continue; }
+                // Trip time is measured from the event; add the interrupting
+                // time that was already in the exposure (device_exposure
+                // already includes breaker_interrupting_s for relays).
+                let new_open = at + exposure.seconds;
+                if d.open_s.is_none_or(|s| new_open + 1e-9 < s) {
+                    d.open_s = Some(new_open);
+                }
             }
         }
     }
     let motor_streams = streams.iter().any(|stream| stream.device.is_none());
     let staged = devices.len() > 1 || motor_streams;
     let continuous = !decrement_source_ids.is_empty()
-        || machines.iter().any(|m| matches!(m.rule, MachineRule::Induction { tau_s: Some(_) } | MachineRule::Synchronous { tau_s: Some(_), .. }))
-        || retime;
-    // Fixed instants where a machine rule steps.
-    let mut knots: Vec<f64> = vec![project.motor_contribution_s];
-    if let Some(step) = &project.machine_step_down { knots.push(step.after_cycles / 60.0); }
+        || machines.iter().any(|m| matches!(m.rule, MachineRule::Induction { tau_s: Some(_) } | MachineRule::Synchronous { tau_s: Some(_) }))
+        || devices.iter().any(|d| d.relay.is_some() && d.open_s.is_none());
+    let mut knots: Vec<f64> = Vec::new();
+    if stages.no_induction.is_some() { knots.push(project.motor_contribution_s); }
+    if stages.stepped.is_some() {
+        if let Some(step) = &project.machine_step_down { knots.push(step.after_cycles / 60.0); }
+    }
     let cap = project.arc_duration_cap_s;
     let limit_s = exposure_limit_s(project, decrement_source_ids);
+    // Sort devices by clearing time, name as tiebreak.
+    devices.sort_by(|a, b| {
+        let ta = a.open_s.unwrap_or(f64::INFINITY);
+        let tb = b.open_s.unwrap_or(f64::INFINITY);
+        ta.partial_cmp(&tb).unwrap_or(std::cmp::Ordering::Equal).then(a.device.id.cmp(&b.device.id))
+    });
     let remaining_at = |cleared: &[bool], time_s: f64| -> [f64; 2] {
         streams.iter().zip(cleared).filter(|(_, done)| !**done)
-            .fold([0.0, 0.0], |sum, (stream, _)| { let p = cmul(stream.phasor, stream.factor(project, machines, time_s)); [sum[0] + p[0], sum[1] + p[1]] })
+            .fold([0.0, 0.0], |sum, (stream, _)| { let p = stream.phasor_at(project, machines, time_s); [sum[0] + p[0], sum[1] + p[1]] })
     };
     let mut cleared = vec![false; streams.len()];
     let mut segments: Vec<EnergySegment> = Vec::new();
     let mut t = 0.0;
-    let mut prior_sample_s = 0.0;
     let mut last_device: Option<String> = None;
+    let mut governing: Option<String> = None;
     let mut crossing: Option<f64> = None;
     let mut stopped_at_cap = false;
+    let mut ended_at_max = false;
     let mut trips: Vec<String> = Vec::new();
     let mut reset_matters = false;
-    let mut point_notes: Vec<(bool, String)> = Vec::new();
+    // Threshold: limit = (1 - fraction) * |bus total| using magnitudes.
+    let remainder_limit = (1.0 - project.cleared_fault_fraction) * total_abs;
+    // Process openings in trip order.
+    let mut open_index = 0;
     loop {
-        // Openings at t.
-        let mut opened_now: Vec<String> = Vec::new();
-        for d in devices.iter_mut() {
-            if let Some(open_s) = d.open_s {
-                if open_s <= t + 1e-9 && open_s > -1.0 {
-                    for (index, stream) in streams.iter().enumerate() {
-                        if !cleared[index] && stream.device.is_some_and(|device| device.id == d.device.id) { cleared[index] = true; }
-                    }
-                    opened_now.push(d.device.id.clone());
-                    d.open_s = Some(-2.0);
-                }
+        // Apply openings at t. The cleared-current threshold is checked only
+        // after a device opens; natural decay alone does not extinguish the arc.
+        let mut opened_here = false;
+        while open_index < devices.len() {
+            let open_s = devices[open_index].open_s.unwrap_or(f64::INFINITY);
+            if open_s > t + 1e-9 { break; }
+            let id = devices[open_index].device.id.clone();
+            for (index, stream) in streams.iter().enumerate() {
+                if !cleared[index] && stream.device.is_some_and(|d| d.id == id) { cleared[index] = true; }
             }
-        }
-        if !opened_now.is_empty() {
-            opened_now.sort();
-            last_device = opened_now.last().cloned();
-            let cleared_sum = streams.iter().zip(&cleared).filter(|(_, done)| **done)
-                .fold([0.0, 0.0], |sum, (stream, _)| [sum[0] + stream.phasor[0], sum[1] + stream.phasor[1]]);
-            let share = (cabs(cleared_sum) / total_abs).min(1.0);
-            if share >= project.cleared_fault_fraction - 1e-9 && cabs(remaining_at(&cleared, t + 1e-9)) > 1e-9 * total_abs {
-                crossing = Some(share);
-                break;
-            }
+            last_device = Some(id);
+            open_index += 1;
+            opened_here = true;
         }
         let remaining = cabs(remaining_at(&cleared, t + 1e-9));
+        if opened_here && remaining <= remainder_limit + 1e-9 * total_abs {
+            if remaining > 1e-9 * total_abs {
+                crossing = Some(1.0 - remaining / total_abs);
+                governing = last_device.clone();
+            }
+            break;
+        }
         if remaining <= 1e-9 * total_abs { break; }
+        if project.escape_possible && t >= cap - 1e-12 { stopped_at_cap = true; break; }
         if t >= limit_s - 1e-12 && !continuous_decay_left(project, machines, t) {
-            for d in devices.iter().filter(|d| d.open_s.is_none()) {
+            for d in devices.iter().filter(|d| d.relay.is_some() && d.open_s.is_none()) {
                 if let Some(relay) = &d.relay {
                     if !relay.timing_at(d.prior_amps).unwrap_or(false) {
                         return Err(gap(format!("a trip of {} [{}] within the {limit_s:.3} s study cap. Under the {current_case} arcing current it is below every entered pickup at {:.0} A at the cap, so total clearing is unresolved", d.device.name, d.device.id, d.prior_amps)));
                     }
                 }
             }
+            ended_at_max = true;
+            break;
         }
-        if project.escape_possible && t >= cap - 1e-12 { stopped_at_cap = true; break; }
         if segments.len() >= 10_000 {
             return Err("staged arc exceeds 10,000 slices; reduce the arc duration or provide a shorter exposure limit".into());
         }
-        let next_open = devices.iter().filter_map(|d| d.open_s.filter(|s| *s > t + 1e-9)).fold(f64::INFINITY, f64::min);
+        let next_open = devices.iter().skip(open_index).filter_map(|d| d.open_s.filter(|s| *s > t + 1e-9)).fold(f64::INFINITY, f64::min);
         let next_knot = knots.iter().copied().filter(|k| *k > t + 1e-9).fold(f64::INFINITY, f64::min);
         let mut horizon = next_open.min(next_knot);
         if project.escape_possible { horizon = horizon.min(cap); }
-        let pending_relays = devices.iter().any(|d| d.relay.is_some() && d.open_s.is_none());
-        let end = if continuous || pending_relays {
-            if horizon.is_finite() { next_decrement_end(project, decrement_source_ids, t, horizon) } else { next_decrement_end(project, decrement_source_ids, t, t + DECREMENT_STEP_S) }
-        } else {
-            horizon
-        };
-        if !end.is_finite() {
-            if t >= limit_s - 1e-12 || !continuous {
-                return Err(gap(format!("a device that clears the remaining contribution into this bus under the {current_case} arcing current. After {t:.3} s the remaining current does not decay and no device remains to open, so arc clearing is unresolved")));
+        if !horizon.is_finite() {
+            if continuous {
+                horizon = next_decrement_end(project, decrement_source_ids, t, t + DECREMENT_STEP_S);
+            } else {
+                ended_at_max = true;
+                break;
             }
         }
-        if end <= t { return Err("staged arc slice did not advance".into()); }
+        let end = if continuous { next_decrement_end(project, decrement_source_ids, t, horizon) } else { horizon };
+        if !end.is_finite() || end <= t {
+            if t >= limit_s - 1e-12 {
+                ended_at_max = true;
+                break;
+            }
+            return Err(gap(format!("a device that clears the remaining contribution into this bus under the {current_case} arcing current. After {t:.3} s the remaining current does not decay and no device remains to open, so arc clearing is unresolved")));
+        }
         let width = end - t;
         let midpoint = t + width / 2.0;
         let ibf_ka = bolted_ka * cabs(remaining_at(&cleared, midpoint)) / total_abs;
+        let pending_relays = devices.iter().any(|d| d.relay.is_some() && d.open_s.is_none());
         if pending_relays {
             let fraction = if ibf_ka > 0.0 { arcing_of(ibf_ka)? / ibf_ka } else { 0.0 };
             for d in devices.iter_mut().filter(|d| d.relay.is_some() && d.open_s.is_none()) {
-                // Device current: its initial terminal current scaled by the
-                // contributions it carries and the arcing-current fraction.
-                let carried: Vec<&Stream> = streams.iter().filter(|s| s.device.is_some_and(|device| device.id == d.device.id)).collect();
-                let base = carried.iter().fold(0.0, |sum, s| sum + cabs(s.phasor));
-                let now = carried.iter().fold(0.0, |sum, s| sum + cabs(cmul(s.phasor, s.factor(project, machines, midpoint))));
+                let carried: Vec<&Stream> = streams.iter().filter(|s| s.device.is_some_and(|dev| dev.id == d.device.id)).collect();
+                let base = carried.iter().fold(0.0, |sum, s| sum + cabs(s.base));
+                let now = carried.iter().fold(0.0, |sum, s| sum + cabs(s.phasor_at(project, machines, midpoint)));
                 let amps = if base > 0.0 { d.initial_amps * (now / base) * (fraction / fraction0) } else { 0.0 };
                 let relay = d.relay.as_mut().unwrap();
-                let step = advance_relay_over_ramp(relay, d.prior_amps, amps, midpoint - prior_sample_s)
+                let step = advance_relay_over_ramp(relay, d.prior_amps, amps, width)
                     .map_err(|error| gap(format!("a trip time for {} [{}] on the reduced current. {error}", d.device.name, d.device.id)))?;
                 d.prior_amps = amps;
                 if let Some(within_s) = step {
-                    let trip_s = prior_sample_s + within_s;
+                    let trip_s = t + within_s;
                     d.open_s = Some((trip_s + d.interrupting_s).max(end));
                     trips.push(format!("{} [{}] relay trip at {trip_s:.3} s plus entered breaker interruption of {:.3} s", d.device.name, d.device.id, d.interrupting_s));
                     reset_matters |= relay.reset_affects_result();
-                    if let Some(note) = relay.point_note() { point_notes.push(note); }
                 } else if t >= limit_s - 1e-12 && !relay.timing_at(amps).unwrap_or(false) && !continuous_decay_left(project, machines, end) {
-                    return Err(gap(format!("a trip of {} [{}] on the reduced {current_case} arcing current. It is below every entered pickup at {amps:.0} A after {t:.3} s, so arc clearing is unresolved", d.device.name, d.device.id)));
+                    return Err(gap(format!("a trip of {} [{}] within the {limit_s:.3} s study cap. Under the {current_case} arcing current it is below every entered pickup at {amps:.0} A at the cap, so total clearing is unresolved", d.device.name, d.device.id)));
+                }
+            }
+            devices.sort_by(|a, b| {
+                let ta = a.open_s.unwrap_or(f64::INFINITY);
+                let tb = b.open_s.unwrap_or(f64::INFINITY);
+                ta.partial_cmp(&tb).unwrap_or(std::cmp::Ordering::Equal).then(a.device.id.cmp(&b.device.id))
+            });
+        }
+        // Before the study cap, a pending relay that never picked up must fail.
+        if project.escape_possible && end >= cap - 1e-12 {
+            for d in devices.iter().filter(|d| d.relay.is_some() && d.open_s.is_none()) {
+                if let Some(relay) = &d.relay {
+                    if !relay.timing_at(d.prior_amps).unwrap_or(false) && !continuous_decay_left(project, machines, end) {
+                        return Err(gap(format!("a trip of {} [{}] within the {cap:.3} s study cap. Under the {current_case} arcing current it is below every entered pickup at {:.0} A at the cap, so total clearing is unresolved", d.device.name, d.device.id, d.prior_amps)));
+                    }
                 }
             }
         }
         segments.push(EnergySegment { ibf_ka, duration_s: width });
-        prior_sample_s = midpoint;
         t = end;
+    }
+    if segments.is_empty() && t <= 1e-12 {
+        // Instantaneous clearing: one zero-width is not useful; invent a tiny slice.
+        segments.push(EnergySegment { ibf_ka: bolted_ka, duration_s: 1e-6 });
+        t = 1e-6;
     }
     if segments.is_empty() {
         return Err(format!("staged arc at bus '{}' produced no current interval", case.bus));
     }
     let not_a_label = "This cap is not a field trip setting and is not for an arc-flash label.";
+    let timing = devices.iter().any(|d| d.relay.is_some() && d.open_s.is_none());
     let mut clear = if stopped_at_cap {
-        let timing = devices.iter().any(|d| d.relay.is_some() && d.open_s.is_none());
         finish_clearing(f64::INFINITY, cap, true, if timing { "clearing, with a relay still timing on the reduced current," } else { "clearing still in progress" }, not_a_label)
+    } else if ended_at_max {
+        let end_t = t.min(limit_s);
+        let mut c = finish_clearing(end_t, cap, project.escape_possible, &format!("clearing time of {end_t:.3} s from the one fault solution"), not_a_label);
+        c.note.push_str(&format!(" The cleared-current threshold was not reached by {end_t:.3} s, so the arc ends at the study's maximum trip time."));
+        c
     } else {
         finish_clearing(t, cap, project.escape_possible, &format!("clearing time of {t:.3} s from the one fault solution"), not_a_label)
     };
@@ -1848,74 +2132,73 @@ fn stage_streams(project: &Project, case: &ArcEquipment, fault: &crate::fault::B
     if staged { clear.reason(if retime { "staged_decaying_current" } else { "staged_clearing_assumed" }); }
     for code in reasons { clear.reason(code); }
     if !static_names.is_empty() { clear.reason("static_device_timing"); }
-    if reset_matters { clear.reason("relay_reset_assumed"); }
-    for (flag, note) in &point_notes { if *flag { clear.assumed = true; for code in point_note_reasons(note) { clear.reason(code); } } }
-    if reset_matters { clear.assumed = true; }
-    let decaying: Vec<&str> = machines.iter().filter(|m| matches!(m.rule, MachineRule::Induction { tau_s: Some(_) } | MachineRule::Synchronous { tau_s: Some(_), .. })).map(|m| m.label.as_str()).collect();
+    let decaying: Vec<&str> = machines.iter().filter(|m| matches!(m.rule, MachineRule::Induction { tau_s: Some(_) } | MachineRule::Synchronous { tau_s: Some(_) })).map(|m| m.label.as_str()).collect();
     if !decaying.is_empty() { clear.reason("motor_decay_assumed"); }
-    let stepped: Vec<&str> = machines.iter().filter(|m| project.machine_step_down.is_some() && matches!(m.rule, MachineRule::Synchronous { rated_pu: Some(_), .. })).map(|m| m.label.as_str()).collect();
-    if !stepped.is_empty() { clear.reason("machine_step_down_assumed"); }
+    if !stages.stepped_labels.is_empty() { clear.reason("machine_step_down_assumed"); }
     let mut note = String::new();
     if staged {
-        note.push_str(&format!(" The arc is staged from one fault solution (IEEE 1584-2018 Clause 6.9): each contribution into the bus is removed when its own device opens, and the network is not re-solved. {}", if retime {
-            "Each relay is re-timed on its contribution as it is reduced."
+        note.push_str(&format!(" The arc is staged from one fault solution with machine-stage variants (IEEE 1584-2018 Clause 6.9): each contribution into the bus is removed when its own device opens, and a device opening does not re-solve the network. {}", if retime {
+            "Devices that are not fuses are re-timed on the reduced current (once at the motor window and once at the step-down; continuously under a source decrement curve)."
         } else {
-            "Each device is timed once at its initial arcing current."
+            "Each device is timed once at its initial arcing current from the base solution."
         }));
     }
     if !trips.is_empty() { note.push_str(&format!(" {}.", trips.join("; "))); }
+    if reset_matters {
+        clear.reason("relay_reset_assumed");
+        clear.assumed = true;
+        note.push_str(" Relay progress was reset immediately when the current fell below pickup; verify the device reset setting.");
+    }
     if !static_names.is_empty() {
         note.push_str(&format!(" {} keep one time read at the initial arcing current: a fuse, a total-clearing curve, or a current-limiting let-through time does not by itself establish clearing on a reduced current.", static_names.join(", ")));
     }
-    if reset_matters {
-        note.push_str(" Relay progress was reset immediately when the current fell below pickup; verify the device reset setting.");
-    }
     let induction: Vec<&str> = machines.iter().filter(|m| matches!(m.rule, MachineRule::Induction { .. })).map(|m| m.label.as_str()).collect();
     if !induction.is_empty() {
-        note.push_str(&format!(" Induction motor contribution ({}) drops out after {:.1} cycles unless its device opens first; the window is assumed.", induction.join(", "), project.motor_contribution_s * 60.0));
+        note.push_str(&format!(" Induction motor contribution ({}) is removed at {:.1} cycles by a separate fault solution with those motors taken out; the window is assumed.", induction.join(", "), project.motor_contribution_s * 60.0));
     }
     if !decaying.is_empty() {
         note.push_str(&format!(" {} decay as exp(-t / decay_time_constant_s); the time constant is entered and assumed.", decaying.join(", ")));
     }
     if let Some(step) = &project.machine_step_down {
-        if !stepped.is_empty() {
-            note.push_str(&format!(" {} step down to {:.0}% of rated current after {:.1} cycles.", stepped.join(", "), step.percent_of_rated, step.after_cycles));
+        if !stages.stepped_labels.is_empty() {
+            note.push_str(&format!(" {} step down to an entered percent of rated current after {:.1} cycles, using a separate fault solution.", stages.stepped_labels.join(", "), step.after_cycles));
         }
-        if !step_missing.is_empty() {
-            note.push_str(&format!(" Source(s) {} have no generator rating, so the step-down is not applied to them.", step_missing.join(", ")));
+        if !stages.dropped_labels.is_empty() {
+            note.push_str(&format!(" {} drop out at the step (zero rating or 0% of rated).", stages.dropped_labels.join(", ")));
         }
+    }
+    for warning in &stages.warnings {
+        note.push(' ');
+        note.push_str(warning);
     }
     if !decrement_source_ids.is_empty() {
-        note.push_str(" Source contribution follows its entered decrement curve; source X/R is held constant.");
+        note.push_str(" Source contribution follows its entered decrement curve; source X/R is held constant. A source with an entered decrement curve is not stepped down.");
     }
     for extra in extras { note.push_str(&extra); }
-    for (_, point) in point_notes { note.push(' '); note.push_str(&point); }
     if let Some(share) = crossing {
         clear.reason("remaining_current_excluded");
         let left: Vec<&str> = streams.iter().zip(&cleared).filter(|(_, done)| !**done).map(|(s, _)| s.label.as_str()).collect();
-        note.push_str(&format!(" The arc is taken as extinguished at {t:.3} s, when {} [{}] brought the cleared share of the bus fault current to {:.0}%, at or above the {:.0}% threshold. The remaining contribution ({}) is excluded.",
-            project.device(last_device.as_deref().unwrap_or("")).map(|d| d.name.as_str()).unwrap_or(""), last_device.as_deref().unwrap_or(""), share * 100.0, project.cleared_fault_fraction * 100.0, left.join(", ")));
+        let gov = governing.clone().or_else(|| last_device.clone()).unwrap_or_default();
+        note.push_str(&format!(" The arc is taken as extinguished at {t:.3} s, when {} [{}] brought the remaining bus fault current to or below the {:.0}% threshold (cleared share {:.0}%). The remaining contribution ({}) is excluded.",
+            project.device(gov.as_str()).map(|d| d.name.as_str()).unwrap_or(""), gov, (1.0 - project.cleared_fault_fraction) * 100.0, share * 100.0, left.join(", ")));
+        last_device = Some(gov);
+    } else if governing.is_none() {
+        // Governing device is the last in the trip list when the threshold
+        // was never crossed (everything cleared, or max trip time).
+        governing = last_device.clone();
     }
     clear.note.push_str(&note);
-    Ok((clear, segments, last_device))
+    Ok((clear, segments, governing.or(last_device)))
 }
 
-/// True when some machine contribution can still fall after `time_s`.
 fn continuous_decay_left(project: &Project, machines: &[StagedMachine], time_s: f64) -> bool {
     machines.iter().any(|m| match m.rule {
-        MachineRule::Induction { .. } => time_s < project.motor_contribution_s,
-        MachineRule::Synchronous { tau_s: Some(_), .. } => true,
-        MachineRule::Synchronous { rated_pu: Some(_), .. } => project.machine_step_down.as_ref().is_some_and(|s| time_s < s.after_cycles / 60.0),
+        MachineRule::Induction { tau_s: Some(_) } => time_s < project.motor_contribution_s,
+        MachineRule::Synchronous { tau_s: Some(_) } => true,
         MachineRule::Decrement(index) => project.sources[index].decrement_curve.last().is_some_and(|p| time_s < p.time_s),
         _ => false,
     })
 }
-
-
-
-
-
-
 
 
 fn truncate_segments(segments: &mut Vec<EnergySegment>, cap: f64) {
@@ -2087,19 +2370,17 @@ fn prefault_fallback(project: &Project, loadflow: Option<&crate::loadflow::Loadf
     if project.prefault != Prefault::Loadflow {
         return None;
     }
+    // Fall back only on load-flow errors (missing result or non-convergence).
+    // Warnings alone do not switch the prefault. The switched setting is used
+    // for this study run only; it is not written back to the project.
     let problem = match loadflow {
         None => "it could not be solved".to_string(),
         Some(result) if !result.converged => result.message.clone().unwrap_or_else(|| "it did not converge".into()),
-        // Excluding a bus that has no source is a notice about topology, not a
-        // load-flow problem; it does not switch the prefault.
-        Some(result) => match &result.message {
-            Some(message) if !message.ends_with("unenergized bus(es) excluded from load flow") => message.clone(),
-            _ => return None,
-        },
+        Some(_) => return None,
     };
     let mut changed = project.clone();
     changed.prefault = Prefault::NoLoadTap;
-    Some((changed, format!("Prefault was requested from load-flow voltages, but the load flow reported a problem ({problem}). The whole fault and arc-flash study uses the no-load-with-tap prefault instead.")))
+    Some((changed, format!("Prefault was requested from load-flow voltages, but the load flow reported an error ({problem}). The whole fault and arc-flash study uses the no-load-with-tap prefault instead.")))
 }
 
 /// Interrupting duty from a fault study of `project`.
