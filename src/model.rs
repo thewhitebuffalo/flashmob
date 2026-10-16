@@ -246,6 +246,10 @@ pub struct Source {
     /// Three-phase short-circuit MVA at the terminals from the transient
     /// reactance Xd'. Used only by `hydro_without_amortisseur`.
     pub transient_mva_sc: Option<f64>,
+    /// Generator nameplate for the IEC 60909 generator or power station unit
+    /// correction factor. None leaves the maximum current uncorrected for
+    /// this source (reported when `machine_kind` is a rotating machine).
+    pub generator: Option<GeneratorRating>,
     /// Names of fields omitted from the input and filled with defaults. Not a
     /// JSON field: a defaulted value that is still at its default is omitted
     /// again when saved, so the assumption stays visible.
@@ -284,6 +288,8 @@ struct SourceWire {
     machine_kind: Option<GeneratorKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transient_mva_sc: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    generator: Option<GeneratorRating>,
 }
 
 /// Take an entered value, or record the field as defaulted.
@@ -305,7 +311,7 @@ impl From<SourceWire> for Source {
             id: w.id, name: w.name, bus: w.bus, in_service: w.in_service, v_pu: w.v_pu, angle_deg: w.angle_deg,
             mva_sc: w.mva_sc, decrement_curve: w.decrement_curve, xr: w.xr, x0_over_x1, r0_over_r1,
             is_slack: w.is_slack, p_mw: w.p_mw, qmin_mvar: w.qmin_mvar, qmax_mvar: w.qmax_mvar,
-            machine_kind: w.machine_kind, transient_mva_sc: w.transient_mva_sc, defaulted,
+            machine_kind: w.machine_kind, transient_mva_sc: w.transient_mva_sc, generator: w.generator, defaulted,
         }
     }
 }
@@ -318,7 +324,7 @@ impl From<Source> for SourceWire {
             id: s.id, name: s.name, bus: s.bus, in_service: s.in_service, v_pu: s.v_pu, angle_deg: s.angle_deg,
             mva_sc: s.mva_sc, decrement_curve: s.decrement_curve, xr: s.xr,
             is_slack: s.is_slack, p_mw: s.p_mw, qmin_mvar: s.qmin_mvar, qmax_mvar: s.qmax_mvar,
-            machine_kind: s.machine_kind, transient_mva_sc: s.transient_mva_sc,
+            machine_kind: s.machine_kind, transient_mva_sc: s.transient_mva_sc, generator: s.generator,
         }
     }
 }
@@ -420,6 +426,38 @@ pub struct OperatingCase {
     pub source_states: Vec<SourceState>,
     #[serde(default)]
     pub equipment_states: Vec<EquipmentState>,
+}
+
+/// Generator nameplate used by the IEC 60909 correction factors.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeneratorRating {
+    /// Rated apparent power, MVA.
+    pub rated_mva: f64,
+    /// Rated power factor, 0 to 1.
+    pub rated_pf: f64,
+    /// Rated voltage, kV. Omitted uses the bus nominal voltage and is reported.
+    #[serde(default)]
+    pub rated_kv: Option<f64>,
+    /// Set when the generator and its step-up transformer form a power
+    /// station unit; the unit factor then replaces K_G and K_T.
+    #[serde(default)]
+    pub unit: Option<PowerStationUnit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PowerStationUnit {
+    /// Id of the unit transformer branch, with one terminal on the source bus.
+    pub transformer: String,
+    /// True selects K_S, false K_SO.
+    pub on_load_tap_changer: bool,
+    /// K_SO generator voltage regulation range, per unit. Omitted is 0 and reported.
+    #[serde(default)]
+    pub p_g: Option<f64>,
+    /// K_SO signed tap offset in use, per unit; the tap term is 1 + p_t. Omitted is 0 and reported.
+    #[serde(default)]
+    pub p_t: Option<f64>,
 }
 
 /// Motor class for the IEEE C37.010-1979 5.4.1 reactance multipliers.
@@ -942,7 +980,7 @@ impl Project {
                 Load { id: "load-mcc".into(), name: "MCC load".into(), bus: "mcc".into(), kw: 400.0, kvar: 200.0, basis: String::new() },
                 Load { id: "load-pnl".into(), name: "Panel load".into(), bus: "pnl".into(), kw: 75.0, kvar: 40.0, basis: String::new() },
             ],
-            sources: vec![Source { machine_kind: None, transient_mva_sc: None,
+            sources: vec![Source { generator: None, machine_kind: None, transient_mva_sc: None,
                 id: "grid".into(),
                 name: "Utility".into(),
                 bus: "util".into(),
@@ -1459,6 +1497,15 @@ impl Project {
             check(s.qmin_mvar.map_or(true, f64::is_finite) && s.qmax_mvar.map_or(true, f64::is_finite)
                 && s.qmin_mvar.unwrap_or(f64::NEG_INFINITY) <= s.qmax_mvar.unwrap_or(f64::INFINITY), &s.id, "reactive limits");
             check(s.transient_mva_sc.map_or(true, positive), &s.id, "transient_mva_sc");
+            if let Some(g) = &s.generator {
+                let unit_ok = g.unit.as_ref().map_or(true, |u| {
+                    self.branches.iter().any(|b| b.id == u.transformer && matches!(b.kind, BranchKind::Transformer { .. }) && (b.from == s.bus || b.to == s.bus))
+                        && u.p_g.map_or(true, |p| p.is_finite() && p > -1.0) && u.p_t.map_or(true, |p| p.is_finite() && p > -1.0)
+                });
+                check(positive(g.rated_mva) && g.rated_pf.is_finite() && (0.0..=1.0).contains(&g.rated_pf) && g.rated_kv.map_or(true, positive)
+                    && s.machine_kind != Some(GeneratorKind::Utility) && unit_ok,
+                    &s.id, "generator rating (rated_mva, rated_pf 0-1, rated_kv, not a utility, unit transformer on the source bus)");
+            }
         }
         for l in &self.loads { check(l.kw.is_finite() && l.kvar.is_finite(), &l.id, "load"); }
         for m in &self.motors {

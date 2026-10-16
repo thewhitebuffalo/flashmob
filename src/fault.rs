@@ -13,6 +13,12 @@ pub struct FaultResult {
     pub valid: bool,
     pub error: Option<String>,
     pub buses: Vec<BusFault>,
+    /// IEC 60909 impedance correction factors applied to the maximum current.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub iec_corrections: Vec<crate::iec::IecCorrection>,
+    /// Data gaps that left a correction factor unapplied or used a fallback.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub iec_warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -87,7 +93,9 @@ pub struct FaultPoint {
     pub half_cycle_rms_ka: f64,
     /// IEC 60909-0 Table 1 voltage factor c at this bus nominal voltage.
     /// Minimum and maximum symmetrical currents are this fault current times
-    /// c / |prefault|. Impedance correction factors are not applied.
+    /// c / |prefault|. The maximum uses the network with the IEC 60909
+    /// impedance correction factors when `iec_max_corrected` is true; the
+    /// minimum is uncorrected.
     #[serde(default)]
     pub c_min: f64,
     #[serde(default)]
@@ -96,6 +104,12 @@ pub struct FaultPoint {
     pub symmetrical_min_ka: f64,
     #[serde(default)]
     pub symmetrical_max_ka: f64,
+    #[serde(default)]
+    pub iec_max_corrected: bool,
+    /// IEC 60909 peak basis: "radial" (no 1.15), "meshed" (1.15 applied), or
+    /// "meshed_low_rx" (meshed, every branch R/X below 0.3, no 1.15).
+    #[serde(default)]
+    pub peak_basis: String,
 }
 
 pub fn solve(project: &Project, loadflow: Option<&LoadflowResult>) -> Result<FaultResult, String> {
@@ -103,7 +117,113 @@ pub fn solve(project: &Project, loadflow: Option<&LoadflowResult>) -> Result<Fau
     solve_with_model(project, loadflow, &model)
 }
 
+/// Fault study without the IEC 60909 impedance-corrected maximum current.
+/// Used where only the symmetrical, peak, and X/R values are read.
+pub fn solve_uncorrected(project: &Project, loadflow: Option<&LoadflowResult>) -> Result<FaultResult, String> {
+    let model = network::build(project)?;
+    solve_core(project, loadflow, &model)
+}
+
 pub(crate) fn solve_with_model(project: &Project, loadflow: Option<&LoadflowResult>, model: &network::SystemModel) -> Result<FaultResult, String> {
+    let mut result = solve_core(project, loadflow, model)?;
+    if !result.valid { return Ok(result); }
+    let (corrections, warnings) = crate::iec::corrections(project);
+    result.iec_warnings = warnings;
+    if corrections.is_empty() { return Ok(result); }
+    let corrected = crate::iec::corrected_project(project, &corrections);
+    let corrected_model = network::build_validated(&corrected)?;
+    let corrected_result = solve_core(&corrected, loadflow, &corrected_model)?;
+    for (bus, fixed) in result.buses.iter_mut().zip(&corrected_result.buses) {
+        let prefault = bus.prefault_pu;
+        let pairs = [
+            (&mut bus.three_phase, &fixed.three_phase),
+            (&mut bus.line_to_ground, &fixed.line_to_ground),
+            (&mut bus.line_to_line, &fixed.line_to_line),
+            (&mut bus.line_to_line_ground, &fixed.line_to_line_ground),
+        ];
+        for (point, fixed) in pairs {
+            let (Some(point), Some(fixed)) = (point.as_mut(), fixed.as_ref()) else { continue };
+            if prefault <= 1e-12 { continue; }
+            let max = fixed.symmetrical_ka * point.c_max / prefault;
+            if !max.is_finite() { return Err("non-finite corrected maximum current".into()); }
+            point.symmetrical_max_ka = max;
+            point.iec_max_corrected = true;
+        }
+    }
+    result.iec_corrections = corrections;
+    Ok(result)
+}
+
+/// IEC 60909 peak basis at a bus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeakBasis {
+    /// The faulted bus's network has no closed loop of branches: kappa from
+    /// the faulted-bus R/X (clauses 8.1.1 and 8.1.2).
+    Radial,
+    /// A closed loop exists: method B, kappa times 1.15 (clause 8.1.3).
+    Meshed,
+    /// A closed loop exists, but every branch in it has R/X below 0.3, so the
+    /// 1.15 factor is not needed (clause 8.1.3).
+    MeshedLowRx,
+}
+
+impl PeakBasis {
+    pub fn as_str(self) -> &'static str {
+        match self { PeakBasis::Radial => "radial", PeakBasis::Meshed => "meshed", PeakBasis::MeshedLowRx => "meshed_low_rx" }
+    }
+}
+
+/// Peak basis for every bus from the closed, energized branch graph. A
+/// connected group of buses is meshed when it has at least as many branches
+/// as buses (parallel branches count as a loop). Sources and motors are not
+/// joined through ground, so separate radial infeeds stay radial.
+pub fn peak_basis(project: &Project, model: &network::SystemModel) -> Vec<PeakBasis> {
+    let n = model.index.n;
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i { parent[i] = parent[parent[i]]; i = parent[i]; }
+        i
+    }
+    let active: Vec<(usize, usize, f64)> = project.branches.iter().zip(&model.branches)
+        .filter(|(_, stamp)| stamp.active && model.energized[stamp.from] && model.energized[stamp.to])
+        .map(|(branch, stamp)| {
+            let r_over_x = match &branch.kind {
+                crate::model::BranchKind::Line { r_ohm, x_ohm, .. } => if *x_ohm > 0.0 { r_ohm / x_ohm } else { f64::INFINITY },
+                crate::model::BranchKind::Transformer { xr, .. } => 1.0 / xr,
+            };
+            (stamp.from, stamp.to, r_over_x)
+        }).collect();
+    for &(a, b, _) in &active {
+        let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+        if ra != rb { parent[ra] = rb; }
+    }
+    let mut nodes = vec![0usize; n];
+    let mut edges = vec![0usize; n];
+    let mut high_rx = vec![false; n];
+    for i in 0..n { let r = find(&mut parent, i); nodes[r] += 1; }
+    for &(a, _, r_over_x) in &active {
+        let r = find(&mut parent, a);
+        edges[r] += 1;
+        if !(r_over_x < 0.3) { high_rx[r] = true; }
+    }
+    (0..n).map(|i| {
+        let r = find(&mut parent, i);
+        if edges[r] < nodes[r] { PeakBasis::Radial } else if high_rx[r] { PeakBasis::Meshed } else { PeakBasis::MeshedLowRx }
+    }).collect()
+}
+
+fn set_peak(point: &mut FaultPoint, kv: f64, basis: PeakBasis) {
+    point.peak_basis = basis.as_str().into();
+    let r_over_x = match point.x_over_r {
+        None => 0.0,
+        Some(xr) if xr > 0.0 => 1.0 / xr,
+        // Purely resistive or zero current: no DC component, already set.
+        Some(_) => return,
+    };
+    point.iec_peak_ka = iec_kappa(r_over_x, kv, basis == PeakBasis::Meshed) * std::f64::consts::SQRT_2 * point.symmetrical_ka;
+}
+
+fn solve_core(project: &Project, loadflow: Option<&LoadflowResult>, model: &network::SystemModel) -> Result<FaultResult, String> {
     let n = model.index.n;
     let (z1, map1) = reduced(&model.pos, &model.energized)?;
     let (z2, map2) = reduced(&model.neg, &model.energized)?;
@@ -172,7 +292,13 @@ pub(crate) fn solve_with_model(project: &Project, loadflow: Option<&LoadflowResu
         };
         buses.push(bus);
     }
-    Ok(FaultResult { prefault: label, prefault_requested: requested.into(), valid, error, buses })
+    let basis = peak_basis(project, model);
+    for (i, bus) in buses.iter_mut().enumerate() {
+        for point in [&mut bus.three_phase, &mut bus.line_to_ground, &mut bus.line_to_line, &mut bus.line_to_line_ground].into_iter().flatten() {
+            set_peak(point, model.index.kv[i], basis[i]);
+        }
+    }
+    Ok(FaultResult { prefault: label, prefault_requested: requested.into(), valid, error, buses, iec_corrections: Vec::new(), iec_warnings: Vec::new() })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -398,6 +524,8 @@ fn point(i1: Cplx, i2: Cplx, i0: Cplx, zth: Cplx, ibase: f64, kv: f64, prefault_
         c_max,
         symmetrical_min_ka,
         symmetrical_max_ka,
+        iec_max_corrected: false,
+        peak_basis: String::new(),
     })
 }
 
@@ -416,6 +544,8 @@ fn zero_point(kv: f64, low_voltage_tolerance_plus_10: bool) -> Result<FaultPoint
         c_max,
         symmetrical_min_ka: 0.0,
         symmetrical_max_ka: 0.0,
+        iec_max_corrected: false,
+        peak_basis: String::new(),
     })
 }
 
@@ -459,16 +589,16 @@ fn checked_impedance(z: Cplx) -> Result<(), String> {
     if z.inv().is_none() { Err("zero or non-finite fault impedance denominator".into()) } else { Ok(()) }
 }
 
-/// IEC 60909-0 peak factor, method B (§8.1.3.2 b): kappa_b from the Thevenin
-/// R/X at the fault location, multiplied by 1.15 to cover meshed networks
-/// whose parallel paths have different X/R. The product is limited to 1.8 at
-/// or below 1 kV and 2.0 above, but never below kappa_b itself. IEC omits the
-/// 1.15 factor only when R/X < 0.3 in *every* branch; Flashmob does not test
-/// branch-by-branch and always applies it, so radial results are conservative.
-/// A purely resistive Thevenin impedance has no DC component (kappa = 1).
-pub fn iec_kappa(r_over_x: f64, kv: f64) -> f64 {
+/// IEC 60909-0 peak factor kappa from the R/X at the fault location
+/// (clause 8.1). With `meshed` set this is method B of clause 8.1.3: kappa
+/// times 1.15, limited to 1.8 at or below 1 kV and 2.0 above, and never below
+/// kappa itself. Without it (radial networks, or meshed networks whose
+/// branches all have R/X below 0.3) kappa is used directly. A purely
+/// resistive impedance has no DC component (kappa = 1).
+pub fn iec_kappa(r_over_x: f64, kv: f64, meshed: bool) -> f64 {
     if r_over_x.is_infinite() { return 1.0; }
     let kappa_b = 1.02 + 0.98 * (-3.0 * r_over_x).exp();
+    if !meshed { return kappa_b; }
     let cap = if kv <= 1.0 { 1.8 } else { 2.0 };
     kappa_b.max((1.15 * kappa_b).min(cap))
 }
@@ -521,7 +651,7 @@ fn asymmetry(i_sym: f64, z: Cplx, kv: f64) -> Result<(Option<f64>, f64, f64), St
     }
     let r_over_x = z.re / z.im;
     let xr = if z.re == 0.0 { None } else { Some(z.im / z.re) };
-    let kappa = iec_kappa(r_over_x, kv);
+    let kappa = iec_kappa(r_over_x, kv, true);
     let peak = kappa * std::f64::consts::SQRT_2 * i_sym;
     let asym = i_sym * half_cycle_factor(xr)?;
     if !peak.is_finite() || !asym.is_finite() { return Err("non-finite asymmetrical current".into()); }
@@ -537,7 +667,7 @@ mod tests {
     fn utility_fault_matches_short_circuit_mva() {
         let project = Project {
             buses: vec![Bus { id: "a".into(), name: "A".into(), kv: 13.8, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None }],
-            sources: vec![Source { machine_kind: None, transient_mva_sc: None,
+            sources: vec![Source { generator: None, machine_kind: None, transient_mva_sc: None,
                 id: "s".into(),
                 name: "grid".into(),
                 bus: "a".into(),
@@ -579,7 +709,7 @@ mod tests {
     fn nacd_drops_when_a_motor_or_a_decrement_curve_is_local() {
         let mut project = Project {
             buses: vec![Bus { id: "a".into(), name: "A".into(), kv: 13.8, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None }],
-            sources: vec![Source { machine_kind: None, transient_mva_sc: None,
+            sources: vec![Source { generator: None, machine_kind: None, transient_mva_sc: None,
                 id: "s".into(), name: "grid".into(), bus: "a".into(), in_service: true,
                 decrement_curve: Vec::new(), v_pu: 1.0, angle_deg: 0.0, mva_sc: 500.0, xr: 15.0,
                 x0_over_x1: 1.0, r0_over_r1: 1.0, is_slack: true, p_mw: 0.0,
@@ -646,7 +776,7 @@ mod tests {
                     r0_over_r1: 1.0,
                 },
             }],
-            sources: vec![Source { machine_kind: None, transient_mva_sc: None,
+            sources: vec![Source { generator: None, machine_kind: None, transient_mva_sc: None,
                 id: "s".into(),
                 name: "grid".into(),
                 bus: "hv".into(),
@@ -732,15 +862,15 @@ mod asymmetry_regression {
         let kappa_b = |rx: f64| 1.02 + 0.98 * (-3.0 * rx).exp();
         // R/X = 0.5: 1.15 * kappa_b = 1.4245 is below both caps.
         for kv in [0.48, 13.8] {
-            assert!((iec_kappa(0.5, kv) - 1.15 * kappa_b(0.5)).abs() < 1e-12);
+            assert!((iec_kappa(0.5, kv, true) - 1.15 * kappa_b(0.5)).abs() < 1e-12);
         }
         // R/X = 0.1: 1.15 * 1.7460 = 2.008, limited to 1.8 at LV and 2.0 above 1 kV.
-        assert!((iec_kappa(0.1, 0.48) - 1.8).abs() < 1e-12);
-        assert!((iec_kappa(0.1, 1.0) - 1.8).abs() < 1e-12);
-        assert!((iec_kappa(0.1, 4.16) - 2.0).abs() < 1e-12);
+        assert!((iec_kappa(0.1, 0.48, true) - 1.8).abs() < 1e-12);
+        assert!((iec_kappa(0.1, 1.0, true) - 1.8).abs() < 1e-12);
+        assert!((iec_kappa(0.1, 4.16, true) - 2.0).abs() < 1e-12);
         // R/X = 0.02: kappa_b = 1.9229 exceeds the LV cap and is kept.
-        assert!((iec_kappa(0.02, 0.48) - kappa_b(0.02)).abs() < 1e-12);
-        assert_eq!(iec_kappa(f64::INFINITY, 0.48), 1.0);
+        assert!((iec_kappa(0.02, 0.48, true) - kappa_b(0.02)).abs() < 1e-12);
+        assert_eq!(iec_kappa(f64::INFINITY, 0.48, true), 1.0);
         // Peak uses kappa; X/R 10 at 0.48 kV gives sqrt(2) * 1.8 * I.
         let (_, peak, _) = asymmetry(10.0, Cplx::new(0.1, 1.0), 0.48).unwrap();
         assert!((peak - 1.8 * 2.0_f64.sqrt() * 10.0).abs() < 1e-12);

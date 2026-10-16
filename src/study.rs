@@ -360,6 +360,7 @@ fn run_one(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
         None
     };
     if let Some(error) = fault.as_ref().and_then(|f| f.error.as_ref()) { warnings.push(error.clone()); }
+    if let Some(f) = fault.as_ref() { warnings.extend(f.iec_warnings.iter().cloned()); }
     let interrupting = if let Some(solved) = fault.as_ref().filter(|result| result.valid) {
         let rows = interrupting_duties(project, loadflow.as_ref(), solved)?;
         if !rows.is_empty() { warnings.extend(crate::machine::warnings(project)); }
@@ -375,7 +376,7 @@ fn run_one(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
         case_id: "normal".into(),
         methods: Methods {
             load_flow: "Newton-Raphson positive-sequence power flow".into(),
-            short_circuit: "Symmetrical components. Peak current uses the IEC 60909 factor. Half-cycle rms is the first-half-cycle asymmetrical value. Minimum and maximum symmetrical currents apply IEC 60909-0 Table 1 voltage factor c to that current. Impedance correction factors are not applied. A breaker above 1 kV with contact_parting_cycles reports an IEEE C37.010 multiplier: asymmetrical rms at that parting time divided by the breaker asymmetry capability, and not below 1. NACD is reported. When NACD is below 1 and a local source has an entered decrement curve, that multiplier blends the remote DC-decrement factor with the local factor from the curve at 60 Hz. Motor contribution without a decrement curve is not reduced. A source with no decrement curve stays remote. Above 1 kV, closing and latching duty is 1.6 times that symmetrical current, and capability is 1.6 times K times the rated symmetrical current. Omitted K is 1. Duty rows use IEEE C37.010 5.4.1 machine reactance multipliers for classified motors and generators: the half-cycle comparison, bracing, and closing and latching use the first-cycle network, and the interrupting multiplier uses the interrupting network. Unclassified machines keep their entered reactance for both duties. Duty X/R comes from separate networks: the faulted-bus Thevenin reactance of a reactance-only network over the Thevenin resistance of a resistance-only network, each with that duty's machine multipliers and without shunt capacitance. Duty symmetrical current stays from the complex network. The fault study table keeps the complex-network X/R.".into(),
+            short_circuit: "Symmetrical components. Peak current uses the IEC 60909 factor. Peak current uses kappa from the faulted-bus R/X (IEC 60909-0 clause 8.1). A bus whose closed, energized branch graph contains a loop is meshed and uses method B, kappa times 1.15 limited to 1.8 at or below 1 kV and 2.0 above, unless every branch in that loop group has R/X below 0.3. A radial bus uses kappa without 1.15; several radial infeeds are combined through the Thevenin R/X, not a sum of partial peak currents. Each fault point reports peak_basis. Half-cycle rms is the first-half-cycle asymmetrical value. Minimum and maximum symmetrical currents apply IEC 60909-0 Table 1 voltage factor c to that current. The maximum symmetrical current uses a network with IEC 60909-0 impedance correction factors: K_T on network transformers (clause 6.3.3), K_G on generators with an entered generator rating (clause 6.6.1), and K_S or K_SO on a generator and its unit transformer when generator.unit is entered (clause 6.7). Each is evaluated in closed form from entered data, and the corrected impedance is the entered impedance times the factor. The minimum current is uncorrected. A rotating-machine source without a generator rating is not corrected and is reported. A breaker above 1 kV with contact_parting_cycles reports an IEEE C37.010 multiplier: asymmetrical rms at that parting time divided by the breaker asymmetry capability, and not below 1. NACD is reported. When NACD is below 1 and a local source has an entered decrement curve, that multiplier blends the remote DC-decrement factor with the local factor from the curve at 60 Hz. Motor contribution without a decrement curve is not reduced. A source with no decrement curve stays remote. Above 1 kV, closing and latching duty is 1.6 times that symmetrical current, and capability is 1.6 times K times the rated symmetrical current. Omitted K is 1. Duty rows use IEEE C37.010 5.4.1 machine reactance multipliers for classified motors and generators: the half-cycle comparison, bracing, and closing and latching use the first-cycle network, and the interrupting multiplier uses the interrupting network. Unclassified machines keep their entered reactance for both duties. Duty X/R comes from separate networks: the faulted-bus Thevenin reactance of a reactance-only network over the Thevenin resistance of a resistance-only network, each with that duty's machine multipliers and without shunt capacitance. Duty symmetrical current stays from the complex network. The fault study table keeps the complex-network X/R.".into(),
             arc_flash: "IEEE 1584-2018".into(),
             coordination: "IEC 60255, IEEE C37.112, definite time, and a simplified thermal-magnetic breaker".into(),
         },
@@ -1093,7 +1094,7 @@ impl DecrementFaultCache {
                 let ratio = source.decrement_ratio_at(midpoint_s);
                 source.mva_sc *= ratio;
             }
-            let sampled_fault = fault::solve(&snapshot, loadflow)?;
+            let sampled_fault = fault::solve_uncorrected(&snapshot, loadflow)?;
             if !sampled_fault.valid {
                 return Err(sampled_fault.error.unwrap_or_else(|| "time-varying fault result is invalid".into()));
             }
@@ -1865,14 +1866,14 @@ fn solve_staged_fault(project: &mut Project) -> Result<FaultResult, String> {
     if project.prefault == Prefault::Loadflow {
         if let Ok(loadflow) = loadflow::solve(project) {
             if loadflow.converged {
-                if let Ok(fault) = fault::solve(project, Some(&loadflow)) {
+                if let Ok(fault) = fault::solve_uncorrected(project, Some(&loadflow)) {
                     if fault.valid { return Ok(fault); }
                 }
             }
         }
         project.prefault = Prefault::Flat;
     }
-    let fault = fault::solve(project, None)?;
+    let fault = fault::solve_uncorrected(project, None)?;
     if !fault.valid {
         return Err(fault.error.unwrap_or_else(|| "staged fault result is invalid".into()));
     }
@@ -2021,7 +2022,7 @@ fn duty_fault(project: &Project, loadflow: Option<&crate::loadflow::LoadflowResu
     let network_project = scaled.as_ref().unwrap_or(project);
     let mut fault = match &scaled {
         Some(scaled) => {
-            let fault = fault::solve(scaled, loadflow)?;
+            let fault = fault::solve_uncorrected(scaled, loadflow)?;
             if !fault.valid {
                 return Err(fault.error.unwrap_or_else(|| "duty fault study is invalid".into()));
             }
@@ -2587,8 +2588,9 @@ pub fn text_report(project: &Project, out: &StudyOutput) -> String {
             lines.push(format!("    Short circuit  3P {three}  LG {lg}  (calculated, prefault {})", out.fault.as_ref().map(|f| f.prefault.as_str()).unwrap_or("")));
             if let Some(point) = fault.three_phase.as_ref().filter(|point| point.c_max > 0.0) {
                 lines.push(format!(
-                    "    Voltage factor  cmin {:.2}  cmax {:.2}  3P minimum {:.2} kA  3P maximum {:.2} kA. IEC 60909-0 Table 1 applied to this symmetrical current. Impedance correction factors are not applied.",
-                    point.c_min, point.c_max, point.symmetrical_min_ka, point.symmetrical_max_ka
+                    "    Voltage factor  cmin {:.2}  cmax {:.2}  3P minimum {:.2} kA  3P maximum {:.2} kA. IEC 60909-0 Table 1 applied to this symmetrical current. {}",
+                    point.c_min, point.c_max, point.symmetrical_min_ka, point.symmetrical_max_ka,
+                    if point.iec_max_corrected { "The maximum uses the impedance correction factors." } else { "Impedance correction factors are not applied." },
                 ));
             }
         }

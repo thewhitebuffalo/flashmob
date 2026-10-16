@@ -31,7 +31,7 @@ fn one_bus(source_xr: f64, bracing_ka: Option<f64>, bracing_test_xr: Option<f64>
         bracing_test_xr,
         equipment_class: None,
     });
-    project.sources.push(Source { machine_kind: None, transient_mva_sc: None,
+    project.sources.push(Source { generator: None, machine_kind: None, transient_mva_sc: None,
         id: "src".into(),
         name: "Source".into(),
         bus: "bus".into(),
@@ -306,7 +306,7 @@ fn nacd_blends_a_remote_source_with_an_entered_generator_decrement() {
     high.contact_parting_cycles = Some(3.0);
     let mut project = one_bus(80.0, None, None, high);
     project.buses[0].kv = 13.8;
-    project.sources.push(Source { machine_kind: None, transient_mva_sc: None,
+    project.sources.push(Source { generator: None, machine_kind: None, transient_mva_sc: None,
         id: "gen".into(),
         name: "Generator".into(),
         bus: "bus".into(),
