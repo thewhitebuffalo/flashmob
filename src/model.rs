@@ -48,6 +48,12 @@ pub struct Project {
     pub motor_contribution_s: f64,
     #[serde(default)]
     pub prefault: Prefault,
+    /// Fault-study network used for the main fault result and for arc flash.
+    /// `comprehensive` (the default) uses each machine's entered reactance.
+    /// `ansi` uses the first-cycle (momentary) C37.010 duty network and turns
+    /// the generator / synchronous-motor step-down off.
+    #[serde(default, skip_serializing_if = "is_comprehensive")]
+    pub fault_method: FaultMethod,
     /// Staged arc flash: incident energy accumulates in trip order until the
     /// devices that have operated have cleared this fraction of the total bus
     /// arcing current. The arc is then taken as extinguished. Default 0.80.
@@ -137,14 +143,26 @@ pub enum Prefault {
     /// (default 1.0).
     #[default]
     Flat,
-    /// Converged load-flow bus voltages. A load flow with an error or a
-    /// warning switches the whole study to `NoLoadTap`, and that is reported.
+    /// Converged load-flow bus voltages. Under the comprehensive fault method,
+    /// a load-flow error switches the study run to `NoLoadTap` (not persisted).
     Loadflow,
     /// No-load voltages from each source's entered voltage through
     /// transformer ratios and taps.
     NoLoadTap,
     /// An entered per-unit prefault voltage on every bus, `Bus::prefault_pu`.
     PerBus,
+}
+
+/// Which network the main fault study and arc flash use for bolted currents.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FaultMethod {
+    /// Entered machine reactances, no C37.010 duty multipliers. Default.
+    #[default]
+    Comprehensive,
+    /// First-cycle (momentary) IEEE C37.010-1979 5.4.1 duty network. The
+    /// generator and synchronous-motor step-down is not applied.
+    Ansi,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -970,6 +988,9 @@ fn default_backup_ratio() -> f64 {
 fn default_one() -> f64 {
     1.0
 }
+fn is_comprehensive(method: &FaultMethod) -> bool {
+    *method == FaultMethod::Comprehensive
+}
 fn default_x0() -> f64 {
     1.0
 }
@@ -1005,6 +1026,7 @@ impl Default for Project {
             escape_possible: default_true(),
             motor_contribution_s: default_motor_contribution(),
             prefault: Prefault::Flat,
+            fault_method: FaultMethod::Comprehensive,
             prefault_pu: 1.0,
             cleared_fault_fraction: 0.80,
             machine_step_down: None,
@@ -1026,6 +1048,7 @@ impl Project {
             escape_possible: true,
             motor_contribution_s: default_motor_contribution(),
             prefault: Prefault::Flat,
+            fault_method: FaultMethod::Comprehensive,
             prefault_pu: 1.0,
             cleared_fault_fraction: 0.80,
             machine_step_down: None,
@@ -1319,7 +1342,11 @@ impl Project {
             if !(step.synchronous_percent().is_finite() && step.synchronous_percent() >= 0.0) {
                 errors.push("machine_step_down synchronous_motor_percent_of_rated must be zero or positive".into());
             }
-            if !(step.after_cycles.is_finite() && step.after_cycles / 60.0 > self.motor_contribution_s) {
+            // Under the ANSI fault method the step-down is not applied, so the
+            // cycle-order check is skipped (matching the reference options dialog).
+            if self.fault_method != FaultMethod::Ansi
+                && !(step.after_cycles.is_finite() && step.after_cycles / 60.0 > self.motor_contribution_s)
+            {
                 errors.push(format!("machine_step_down after_cycles must be greater than the induction-motor window of {:.2} cycles", self.motor_contribution_s * 60.0));
             }
         }

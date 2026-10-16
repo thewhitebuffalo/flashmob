@@ -5,7 +5,7 @@ use crate::curves::{self, curve_label};
 use crate::duty;
 use crate::fault::{self, FaultResult};
 use crate::loadflow::{self, LoadflowResult};
-use crate::model::{classes_for_assumed_bus, typical_equipment, ArcEquipment, CurveSpec, Device, EquipmentSpec, Prefault, Project};
+use crate::model::{FaultMethod, classes_for_assumed_bus, typical_equipment, ArcEquipment, CurveSpec, Device, EquipmentSpec, Prefault, Project};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Studies {
@@ -383,6 +383,17 @@ pub fn run(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
     Ok(normal)
 }
 
+/// Project whose machine reactances match the selected fault method.
+/// Comprehensive leaves the project unchanged. ANSI applies the first-cycle
+/// (momentary) C37.010 duty network when any machine is scaled or omitted.
+fn fault_method_project(project: &Project) -> Project {
+    match project.fault_method {
+        FaultMethod::Comprehensive => project.clone(),
+        FaultMethod::Ansi => crate::machine::duty_project(project, crate::machine::Duty::FirstCycle)
+            .unwrap_or_else(|| project.clone()),
+    }
+}
+
 fn run_one(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
     let errors = project.validate();
     if !errors.is_empty() { return Err(errors.join("; ")); }
@@ -423,8 +434,23 @@ fn run_one(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
         }
         None => project,
     };
+    // Fault and arc flash use the network selected by fault_method. Load flow
+    // keeps the entered reactances. Under ANSI the first-cycle C37.010 duty
+    // network is used and the generator / synchronous-motor step-down is off.
+    let method_held;
+    let method_project = {
+        let mut p = fault_method_project(project);
+        if project.fault_method == FaultMethod::Ansi {
+            p.machine_step_down = None;
+            warnings.extend(crate::machine::warnings(project));
+            warnings.push("Fault method is ANSI: bolted currents use the first-cycle (momentary) C37.010 duty network. The generator and synchronous-motor step-down is not applied.".into());
+        }
+        method_held = p;
+        &method_held
+    };
     let fault = if need_fault {
-        Some(fault::solve_with_model(project, loadflow.as_ref(), model.as_ref().map_err(Clone::clone)?)?)
+        let method_model = crate::network::build_validated(method_project)?;
+        Some(fault::solve_with_model(method_project, loadflow.as_ref(), &method_model)?)
     } else {
         None
     };
@@ -432,7 +458,7 @@ fn run_one(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
     let protection = crate::protection::identify_all(project);
     let mut arc_flash_failures = Vec::new();
     let arc_flash = if studies.arcflash {
-        Some(arc_flash(project, loadflow.as_ref(), fault.as_ref().unwrap(), &protection, &mut warnings, &mut arc_flash_failures))
+        Some(arc_flash(method_project, loadflow.as_ref(), fault.as_ref().unwrap(), &protection, &mut warnings, &mut arc_flash_failures))
     } else {
         None
     };
@@ -2368,6 +2394,11 @@ impl RemoteDuty {
 /// no-load-with-tap prefault and says so. A flat 1.0 pu is never substituted.
 fn prefault_fallback(project: &Project, loadflow: Option<&crate::loadflow::LoadflowResult>) -> Option<(Project, String)> {
     if project.prefault != Prefault::Loadflow {
+        return None;
+    }
+    // The reference only switches load-flow prefault to no-load-with-tap under
+    // the comprehensive fault method. Other methods keep the requested prefault.
+    if project.fault_method != FaultMethod::Comprehensive {
         return None;
     }
     // Fall back only on load-flow errors (missing result or non-convergence).
