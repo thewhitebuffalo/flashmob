@@ -140,6 +140,19 @@ pub fn point_curve_note(curve: &CurveSpec, amps: f64) -> Option<(bool, String)> 
     (!notes.is_empty()).then(|| (assumed, notes.join(" ")))
 }
 
+/// Label-readiness reason codes behind `point_curve_note`'s assumed flag:
+/// "point_curve_tail_held" when the last time is held beyond the last point,
+/// and "assumed_curve_band" when the band interpretation is assumed.
+pub fn point_curve_reasons(curve: &CurveSpec, amps: f64) -> Vec<&'static str> {
+    let CurveSpec::Points { points, max_points, beyond_last, band_interpretation } = curve else { return Vec::new() };
+    let mut reasons = Vec::new();
+    if matches!(point_time(governing_band(points, max_points), amps), PointTime::Beyond { .. }) && *beyond_last == PointTail::HoldLastTime {
+        reasons.push("point_curve_tail_held");
+    }
+    if *band_interpretation == BandInterpretation::Assumed { reasons.push("assumed_curve_band"); }
+    reasons
+}
+
 /// Governing-band time when that time is plotted strictly below 0.01 s.
 /// A held tail whose last plotted time is 0.01 s or longer is not included.
 /// An unavailable tail is not a plotted time.

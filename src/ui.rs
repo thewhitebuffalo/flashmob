@@ -499,7 +499,7 @@ impl App {
         };
         ui.label("IEEE 1584-2018. The governing energy is the higher of the arcing-current case and the reduced-arcing-current case.");
         egui::Grid::new("arc").striped(true).show(ui, |ui| {
-            for heading in ["Equipment", "Bus", "Bolted kA", "Arc kA", "s", "cal/cm²", "AFB in"] {
+            for heading in ["Equipment", "Bus", "Bolted kA", "Arc kA", "s", "cal/cm²", "AFB in", "Clearing basis", "Label"] {
                 ui.label(RichText::new(heading).strong());
             }
             ui.end_row();
@@ -512,6 +512,12 @@ impl App {
                 ui.label(format!("{seconds:.3}")).on_hover_text(&row.duration_note);
                 ui.label(RichText::new(format!("{:.2}", row.governing_cal_cm2)).color(color(sld::energy_color(row.governing_cal_cm2))));
                 ui.label(format!("{:.0}", row.afb_in));
+                ui.label(&row.clearing_basis);
+                if row.label_ready {
+                    ui.label("ready");
+                } else {
+                    ui.label(RichText::new("not ready").color(color("#F59E0B"))).on_hover_text(row.label_reasons.join(", "));
+                }
                 ui.end_row();
             }
         });
@@ -600,6 +606,7 @@ impl App {
                     ui.label(format!("{:.2} cal/cm²    AFB {:.0} in", row.governing_cal_cm2, row.afb_in));
                     ui.label(format!("Arcing {:.2} / {:.2} kA", row.arcing_ka, row.arcing_min_ka));
                     ui.label(&row.duration_note);
+                    ui.label(if row.label_ready { format!("Clearing basis {}. Label-ready on its data basis.", row.clearing_basis) } else { format!("Clearing basis {}. Not label-ready: {}.", row.clearing_basis, row.label_reasons.join(", ")) });
                     ui.label(format!("IEEE 1584-2018  {}", row.electrode));
                     if row.assumed {
                         ui.label("Assumed inputs: see duration note and equipment record.");

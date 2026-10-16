@@ -369,6 +369,8 @@ fn library_fuse_average_melt_sets_an_assumed_arc_duration() {
     close(row.time_s, melt * 1.10 + 0.004);
     close(row.time_min_s, melt_min * 1.10 + 0.004);
     assert!(row.assumed);
+    assert_eq!((row.clearing_basis.as_str(), row.clearing_basis_reduced.as_str()), ("fuse_melt_estimate", "fuse_melt_estimate"));
+    assert!(!row.label_ready && row.label_reasons.iter().any(|r| r == "fuse_melt_estimate"), "{:?}", row.label_reasons);
     assert!(row.duration_note.contains("IEEE 1584-2018") && row.duration_note.contains("not for an arc-flash label"), "{}", row.duration_note);
     let protection = out.protection.iter().find(|r| r.device_id.as_deref() == Some("brk-main")).unwrap();
     assert_eq!(protection.clearing_data, "average_melt_adjustment");
@@ -425,6 +427,8 @@ fn fast_band_gap_names_the_unresolved_range_and_does_not_use_the_fast_time() {
     assert!(failure.error.contains("melt-tolerance pair") && failure.error.contains("fuse_total_clearing stays off"), "{}", failure.error);
     assert!(failure.error.contains("IEEE 1584-2018 Clause 6.9.2 is not applied"), "{}", failure.error);
     assert!(!failure.error.contains("does not operate"), "{}", failure.error);
+    assert_eq!(failure.clearing_basis, "unresolved");
+    assert!(!failure.label_ready && failure.label_reasons == vec!["unresolved".to_string()]);
     let coord = out.coordination.as_ref().unwrap().iter().find(|row| row.device_id == "brk-main").unwrap();
     assert!(coord.trip_at_bolted_s.is_none() && coord.min_band_trip_s.is_some(), "{:?}", coord);
     assert!(coord.note.contains("unresolved from 100 A up to 1000000 A"), "{}", coord.note);

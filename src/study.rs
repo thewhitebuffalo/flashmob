@@ -127,6 +127,22 @@ pub struct ArcFailure {
     pub name: String,
     pub bus_id: String,
     pub error: String,
+    /// Always "unresolved": no arc duration was established.
+    #[serde(default = "unresolved_basis")]
+    pub clearing_basis: String,
+    /// Always false for a failure.
+    #[serde(default)]
+    pub label_ready: bool,
+    #[serde(default)]
+    pub label_reasons: Vec<String>,
+}
+
+fn unresolved_basis() -> String { "unresolved".into() }
+
+impl ArcFailure {
+    fn new(case: &ArcEquipment, error: String) -> Self {
+        Self { equipment_id: case.id.clone(), name: case.name.clone(), bus_id: case.bus.clone(), error, clearing_basis: unresolved_basis(), label_ready: false, label_reasons: vec!["unresolved".into()] }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -187,6 +203,53 @@ pub struct ArcRow {
     /// reduced-current duration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_arcing_min_ka: Option<f64>,
+    /// How the full-arcing-current duration was obtained: manual_duration,
+    /// assumed_exposure_duration, total_clearing_curve,
+    /// trip_curve_plus_interrupting_time, fuse_melt_estimate,
+    /// current_limiting_manufacturer_time, current_limiting_fixed_table,
+    /// current_limiting_stored_curve, or staged_multi_device.
+    #[serde(default)]
+    pub clearing_basis: String,
+    /// The same for the reduced-arcing-current duration.
+    #[serde(default)]
+    pub clearing_basis_reduced: String,
+    /// True when no reason below applies to either arcing-current case or to
+    /// the equipment inputs. This is a data-basis screen, not an engineering
+    /// review or approval of a label.
+    #[serde(default)]
+    pub label_ready: bool,
+    /// Reason codes that keep this result off a label. See `LABEL_REASONS`.
+    #[serde(default)]
+    pub label_reasons: Vec<String>,
+}
+
+/// Every label-readiness reason code and what it means.
+pub const LABEL_REASONS: &[(&str, &str)] = &[
+    ("duration_capped", "arc duration is the study cap that applies only when a person can move away"),
+    ("assumed_exposure_duration", "the entered duration is marked assumed"),
+    ("fuse_melt_estimate", "a melting-curve fuse uses the assumed IEEE 1584-2018 Clause 6.9.2 clearing estimate"),
+    ("current_limiting_fixed_table", "the fixed 60 Hz half-cycle or quarter-cycle let-through time is used"),
+    ("assumed_curve_band", "the point curve's band interpretation is assumed"),
+    ("point_curve_tail_held", "the current is beyond the point curve's last point and its last time is held"),
+    ("relay_reset_assumed", "relay reset was assumed immediate and changed the result"),
+    ("staged_clearing_assumed", "more than one clearing event; each device is timed at the initial arcing current"),
+    ("assumed_equipment", "equipment class, gap, working distance, or electrode was not collected"),
+    ("bolted_out_of_range", "bolted current is outside the IEEE 1584-2018 model range"),
+    ("model_range_exceeded", "an IEEE 1584-2018 model input is outside its range"),
+    ("assumed_clearing", "the clearing result is marked assumed for another reason given in the duration note"),
+    ("unresolved", "no arc duration was established (arc-flash failure rows)"),
+];
+
+fn label_reasons(case_assumed: bool, full: &Clearing, reduced: &Clearing, bolted_out_of_range: bool, model_range_exceeded: bool, assumed: bool) -> Vec<String> {
+    let mut codes: Vec<&'static str> = Vec::new();
+    for code in full.reasons.iter().chain(&reduced.reasons) {
+        if !codes.contains(code) { codes.push(code); }
+    }
+    if case_assumed { codes.push("assumed_equipment"); }
+    if bolted_out_of_range { codes.push("bolted_out_of_range"); }
+    if model_range_exceeded { codes.push("model_range_exceeded"); }
+    if assumed && codes.is_empty() { codes.push("assumed_clearing"); }
+    codes.into_iter().map(String::from).collect()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -377,7 +440,7 @@ fn run_one(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
         methods: Methods {
             load_flow: "Newton-Raphson positive-sequence power flow".into(),
             short_circuit: "Symmetrical components. Peak current uses the IEC 60909 factor. IEC peak current is kappa times sqrt(2) times the maximum initial symmetrical current (cmax and, where applied, the impedance correction factors), with kappa from the faulted-bus R/X (IEC 60909-0 clause 8.1). C37 half-cycle and duty values stay on the uncorrected symmetrical current. A bus whose closed, energized branch graph contains a loop is meshed and uses method B, kappa times 1.15 limited to 1.8 at or below 1 kV and 2.0 above, unless every branch in that loop group has R/X below 0.3. A radial bus uses kappa without 1.15; several radial infeeds are combined through the Thevenin R/X, not a sum of partial peak currents. Each fault point reports peak_basis. Half-cycle rms is the first-half-cycle asymmetrical value. Minimum and maximum symmetrical currents apply IEC 60909-0 Table 1 voltage factor c to that current. The maximum symmetrical current uses a network with IEC 60909-0 impedance correction factors: K_T on network transformers (clause 6.3.3), K_G on generators with an entered generator rating (clause 6.6.1), and K_S or K_SO on a generator and its unit transformer when generator.unit is entered (clause 6.7). Each is evaluated in closed form from entered data, and the corrected impedance is the entered impedance times the factor. The minimum current is uncorrected. A rotating-machine source without a generator rating is not corrected and is reported. A breaker above 1 kV with contact_parting_cycles reports an IEEE C37.010 multiplier: asymmetrical rms at that parting time divided by the breaker asymmetry capability, and not below 1. NACD is reported. When NACD is below 1 and a local source has an entered decrement curve, that multiplier blends the remote DC-decrement factor with the local factor from the curve at 60 Hz. Motor contribution without a decrement curve is not reduced. A source with no decrement curve stays remote. Above 1 kV, closing and latching duty is 1.6 times that symmetrical current, and capability is 1.6 times K times the rated symmetrical current. Omitted K is 1. Duty rows use IEEE C37.010 5.4.1 machine reactance multipliers for classified motors and generators: the half-cycle comparison, bracing, and closing and latching use the first-cycle network, and the interrupting multiplier uses the interrupting network. Unclassified machines keep their entered reactance for both duties. Duty X/R comes from separate networks: the faulted-bus Thevenin reactance of a reactance-only network over the Thevenin resistance of a resistance-only network, each with that duty's machine multipliers and without shunt capacitance. Duty symmetrical current stays from the complex network. The fault study table keeps the complex-network X/R.".into(),
-            arc_flash: "IEEE 1584-2018".into(),
+            arc_flash: "IEEE 1584-2018 Each arc-flash row reports clearing_basis and clearing_basis_reduced (manual_duration, assumed_exposure_duration, total_clearing_curve, trip_curve_plus_interrupting_time, fuse_melt_estimate, current_limiting_manufacturer_time, current_limiting_fixed_table, current_limiting_stored_curve, staged_multi_device), label_ready, and label_reasons (duration_capped, assumed_exposure_duration, fuse_melt_estimate, current_limiting_fixed_table, assumed_curve_band, point_curve_tail_held, relay_reset_assumed, staged_clearing_assumed, assumed_equipment, bolted_out_of_range, model_range_exceeded, assumed_clearing). label_ready is true only when no reason applies to either arcing-current case; it is a data-basis screen, not an engineering review. Arc-flash failures report clearing_basis unresolved, label_ready false, and label_reasons [unresolved]. Times and energies are unchanged by this classification.".into(),
             coordination: "IEC 60255, IEEE C37.112, definite time, and a simplified thermal-magnetic breaker".into(),
         },
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
@@ -523,7 +586,7 @@ fn arc_flash(project: &Project, loadflow: Option<&LoadflowResult>, fault: &Fault
         if assumed_enclosure && specs.is_empty() {
             let error = format!("no IEEE 1584 equipment class applies at this voltage");
             warnings.push(format!("{}: {error}", case.name));
-            failures.push(ArcFailure { equipment_id: case.id.clone(), name: case.name.clone(), bus_id: case.bus.clone(), error });
+            failures.push(ArcFailure::new(&case, error));
             continue;
         }
         let variants: Vec<(ArcEquipment, Option<EquipmentSpec>)> = if assumed_enclosure {
@@ -557,7 +620,7 @@ fn arc_flash(project: &Project, loadflow: Option<&LoadflowResult>, fault: &Fault
         }
         if let Some(error) = error {
             warnings.push(format!("{}: {error}", case.name));
-            failures.push(ArcFailure { equipment_id: case.id.clone(), name: case.name.clone(), bus_id: case.bus.clone(), error });
+            failures.push(ArcFailure::new(&case, error));
             continue;
         }
         let mut ieee_warnings: Vec<String> = Vec::new();
@@ -618,6 +681,8 @@ fn governing_assumed_classes(rows: Vec<ArcRow>, specs: &[EquipmentSpec]) -> (Arc
     governing.afb_in = governing.afb_mm / 25.4;
     governing.assumed = true;
     governing.enclosure_assumed = true;
+    if !governing.label_reasons.iter().any(|r| r == "assumed_equipment") { governing.label_reasons.push("assumed_equipment".into()); }
+    governing.label_ready = false;
     governing.warnings.insert(0, note.clone());
     (governing, note)
 }
@@ -737,7 +802,14 @@ fn evaluate_equipment(project: &Project, loadflow: Option<&LoadflowResult>, faul
         final_arcing_ka: final_slice.as_ref().map(|last| last.arcing_ka),
         final_arcing_min_ka: final_slice.as_ref().map(|last| last.arcing_min_ka),
         warnings: notes,
+        clearing_basis: full_clear.basis.into(),
+        clearing_basis_reduced: min_clear.basis.into(),
+        label_ready: false,
+        label_reasons: Vec::new(),
     };
+    let mut row = row;
+    row.label_reasons = label_reasons(assumed, &full_clear, &min_clear, out.bolted_out_of_range, out.model_range_exceeded, row.assumed);
+    row.label_ready = row.label_reasons.is_empty();
     Ok((row, ieee_warnings))
 }
 
@@ -826,9 +898,14 @@ fn decrement_duration(project: &Project, loadflow: Option<&LoadflowResult>, equi
         let mut clear = finish_clearing(raw, project.arc_duration_cap_s, project.escape_possible,
             &format!("{} [{}] {current_case}-arcing-current relay trip at {trip_s:.3} s plus entered breaker interruption of {interrupting_s:.3} s (total {raw:.3} s)", device.name, device.id),
             not_a_label);
+        clear.basis = "trip_curve_plus_interrupting_time";
         if reset_matters {
             clear.assumed = true;
             clear.note.push_str(reset_note);
+            clear.reason("relay_reset_assumed");
+        }
+        if let Some((true, note)) = point_note.as_ref() {
+            for code in point_note_reasons(note) { clear.reason(code); }
         }
         add_point_note(&mut clear, point_note);
         Ok(clear)
@@ -899,11 +976,17 @@ fn decrement_duration(project: &Project, loadflow: Option<&LoadflowResult>, equi
                 capped: true,
                 assumed: true,
                 effective_arc_ka: None,
+                basis: "trip_curve_plus_interrupting_time",
+                reasons: vec!["duration_capped"],
                 note: format!("Arc duration is the {cap:.1} s cap. IEEE 1584-2018 Clause 6.9.1 allows this limit only when a person can move away. {} [{}] {current_case}-arcing-current relay operation plus entered breaker interruption of {interrupting_s:.3} s exceeds the cap: the relay is still timing at {prior_amps:.0} A through its protected terminal under the sampled decrement profile. {not_a_label}",
                     device.name, device.id),
             };
             if relay.reset_affects_result() {
                 clear.note.push_str(reset_note);
+                clear.reason("relay_reset_assumed");
+            }
+            if let Some((true, note)) = relay.point_note().as_ref() {
+                for code in point_note_reasons(note) { clear.reason(code); }
             }
             add_point_note(&mut clear, relay.point_note());
             Ok(clear)
@@ -1207,6 +1290,25 @@ struct Clearing {
     assumed: bool,
     /// Manufacturer effective arc current for a sole-feed current-limiting fuse.
     effective_arc_ka: Option<f64>,
+    /// How the duration was obtained; see `ArcRow::clearing_basis`.
+    basis: &'static str,
+    /// Label-readiness reason codes; see `ArcRow::label_reasons`.
+    reasons: Vec<&'static str>,
+}
+
+impl Clearing {
+    fn reason(&mut self, code: &'static str) {
+        if !self.reasons.contains(&code) { self.reasons.push(code); }
+    }
+}
+
+/// Reason codes for a point-curve note sampled over a time-varying current,
+/// where the current at which the note was made is not kept.
+fn point_note_reasons(note: &str) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    if note.contains("is held (assumed)") { reasons.push("point_curve_tail_held"); }
+    if note.contains("interpretation") && note.contains("is assumed") { reasons.push("assumed_curve_band"); }
+    reasons
 }
 
 /// Missing clearing data is a per-bus error. `fallback_duration_s` is not an arc-flash result.
@@ -1265,6 +1367,12 @@ fn duration(project: &Project, case: &ArcEquipment, fault: &crate::fault::BusFau
         let basis = if case.basis == "assumed" { "assumed exposure duration" } else { "manual duration" };
         let mut clear = finish_clearing(manual, project.arc_duration_cap_s, project.escape_possible, &format!("{basis} of {manual:.3} s"), not_a_label);
         clear.assumed = case.basis == "assumed" || clear.assumed;
+        if case.basis == "assumed" {
+            clear.basis = "assumed_exposure_duration";
+            clear.reason("assumed_exposure_duration");
+        } else {
+            clear.basis = "manual_duration";
+        }
         clear.note.push_str(&format!(" {} Manual duration overrides device-based clearing.", protection.detail));
         return Ok(clear);
     }
@@ -1321,6 +1429,8 @@ struct DeviceExposure {
     extra: String,
     effective_arc_ka: Option<f64>,
     what: String,
+    basis: &'static str,
+    reasons: Vec<&'static str>,
 }
 
 /// Uncapped device time at one terminal current. `sole_feed` is true only when
@@ -1329,13 +1439,21 @@ fn device_exposure(device: &Device, amps: f64, sole_feed: bool) -> Result<Device
     let what_at = |kind: &str| format!("{kind} of {} at {amps:.0} A through its protected terminal (network terminal current; loadflow prefault includes initial branch flow)", device.name);
     if let Some(limit) = &device.current_limiting {
         if amps >= limit.threshold_a {
-            let (seconds, assumed, mut extra) = if limit.cycle_table {
-                let_through_table(device, limit, amps)
+            let (seconds, assumed, mut extra, basis, reasons) = if limit.cycle_table {
+                let (seconds, assumed, extra, stored) = let_through_table(device, limit, amps);
+                if stored {
+                    let reasons = if assumed { curves::point_curve_reasons(&device.curve, amps) } else { Vec::new() };
+                    (seconds, assumed, extra, "current_limiting_stored_curve", reasons)
+                } else {
+                    (seconds, assumed, extra, "current_limiting_fixed_table", vec!["current_limiting_fixed_table"])
+                }
             } else {
                 (
                     limit.clearing_s,
                     false,
                     format!(" Manufacturer current-limiting clearing time is used at {amps:.0} A, at or above the {:.0} A peak let-through threshold (IEEE 1584-2018 Clause 6.9.2).", limit.threshold_a),
+                    "current_limiting_manufacturer_time",
+                    Vec::new(),
                 )
             };
             let effective = if sole_feed {
@@ -1359,6 +1477,8 @@ fn device_exposure(device: &Device, amps: f64, sole_feed: bool) -> Result<Device
                 extra,
                 effective_arc_ka: effective,
                 what: what_at(kind),
+                basis,
+                reasons,
             });
         }
     }
@@ -1367,14 +1487,18 @@ fn device_exposure(device: &Device, amps: f64, sole_feed: bool) -> Result<Device
         let mut extra = format!(" {}", melt.detail(amps));
         let curve_bottom = matches!(melt.adjustment, curves::MeltAdjustment::CurveBottom { .. });
         let mut assumed = true;
+        let mut reasons = vec!["fuse_melt_estimate"];
+        let point_reasons = curves::point_curve_reasons(&device.curve, amps);
         if !curve_bottom {
             if let Some((band_assumed, note)) = &point_note {
                 assumed |= *band_assumed;
                 extra.push(' ');
                 extra.push_str(note);
+                if *band_assumed { reasons.extend(point_reasons); }
             }
         } else if point_note.as_ref().is_some_and(|(band_assumed, _)| *band_assumed) {
             extra.push_str(" The point curve's band interpretation is assumed.");
+            if point_reasons.contains(&"assumed_curve_band") { reasons.push("assumed_curve_band"); }
         }
         return Ok(DeviceExposure {
             seconds: melt.seconds,
@@ -1382,6 +1506,8 @@ fn device_exposure(device: &Device, amps: f64, sole_feed: bool) -> Result<Device
             extra,
             effective_arc_ka: None,
             what: what_at("estimated clearing time"),
+            basis: "fuse_melt_estimate",
+            reasons,
         });
     }
     let Some(raw) = curves::clearing_time(device, amps) else {
@@ -1389,17 +1515,22 @@ fn device_exposure(device: &Device, amps: f64, sole_feed: bool) -> Result<Device
     };
     let mut extra = String::new();
     let mut assumed = false;
+    let mut reasons = Vec::new();
     if let Some((band_assumed, note)) = point_note {
         assumed |= band_assumed;
         extra.push(' ');
         extra.push_str(&note);
+        if band_assumed { reasons = curves::point_curve_reasons(&device.curve, amps); }
     }
+    let basis = if device.curve_includes_clearing() { "total_clearing_curve" } else { "trip_curve_plus_interrupting_time" };
     Ok(DeviceExposure {
         seconds: raw,
         assumed,
         extra,
         effective_arc_ka: None,
         what: what_at("total clearing time"),
+        basis,
+        reasons,
     })
 }
 
@@ -1414,7 +1545,7 @@ const QUARTER_CYCLE_S: f64 = 1.0 / 240.0;
 /// total-clearing time already faster than one half-cycle and drawn below
 /// 0.01 s is kept. A melting time is not kept. Annex H incident-energy
 /// equations are not applied.
-fn let_through_table(device: &Device, limit: &crate::model::CurrentLimiting, amps: f64) -> (f64, bool, String) {
+fn let_through_table(device: &Device, limit: &crate::model::CurrentLimiting, amps: f64) -> (f64, bool, String, bool) {
     let twice = 2.0 * limit.threshold_a;
     let annex = " Annex H incident-energy equations are not applied. Energy uses the IEEE 1584-2018 model at this duration.";
     let ignored = if limit.clearing_s > 0.0 {
@@ -1435,7 +1566,7 @@ fn let_through_table(device: &Device, limit: &crate::model::CurrentLimiting, amp
                     extra.push(' ');
                     extra.push_str(&note);
                 }
-                return (stored, assumed, extra);
+                return (stored, assumed, extra, true);
             }
         }
     }
@@ -1445,7 +1576,7 @@ fn let_through_table(device: &Device, limit: &crate::model::CurrentLimiting, amp
         (QUARTER_CYCLE_S, format!("at or above {twice:.0} A, twice the {:.0} A threshold. The 60 Hz quarter-cycle time {QUARTER_CYCLE_S:.6} s is used.", limit.threshold_a))
     };
     let extra = format!(" Current-limiting let-through at {amps:.0} A is {band} Clause 6.9.2 is not applied in this range.{ignored}{annex}");
-    (seconds, true, extra)
+    (seconds, true, extra, false)
 }
 
 fn device_clearing(project: &Project, device: &Device, amps: f64, sole_feed: bool) -> Result<Clearing, String> {
@@ -1454,6 +1585,8 @@ fn device_clearing(project: &Project, device: &Device, amps: f64, sole_feed: boo
     let mut clear = finish_clearing(exposure.seconds, project.arc_duration_cap_s, project.escape_possible, &exposure.what, not_a_label);
     clear.assumed |= exposure.assumed;
     clear.effective_arc_ka = exposure.effective_arc_ka;
+    clear.basis = exposure.basis;
+    for code in exposure.reasons { clear.reason(code); }
     clear.note.push_str(&exposure.extra);
     Ok(clear)
 }
@@ -1529,6 +1662,8 @@ fn finish_clearing(raw: f64, cap: f64, escape: bool, what: &str, not_a_label: &s
             capped: true,
             assumed: true,
             effective_arc_ka: None,
+            basis: "",
+            reasons: vec!["duration_capped"],
             note: format!("Arc duration is the {cap:.1} s cap. IEEE 1584-2018 Clause 6.9.1 allows this limit only when a person can move away. The {what} exceeds the cap. {not_a_label}"),
         }
     } else if !escape && raw > cap {
@@ -1537,10 +1672,12 @@ fn finish_clearing(raw: f64, cap: f64, escape: bool, what: &str, not_a_label: &s
             capped: false,
             assumed: false,
             effective_arc_ka: None,
+            basis: "",
+            reasons: Vec::new(),
             note: format!("Arc duration {raw:.3} s is the {what}. The {cap:.1} s cap was not applied because escape is not assumed possible (IEEE 1584-2018 Clause 6.9.1)."),
         }
     } else {
-        Clearing { seconds: raw, capped: false, assumed: false, effective_arc_ka: None, note: format!("Arc duration {raw:.3} s is the {what}.") }
+        Clearing { seconds: raw, capped: false, assumed: false, effective_arc_ka: None, basis: "", reasons: Vec::new(), note: format!("Arc duration {raw:.3} s is the {what}.") }
     }
 }
 
@@ -1595,10 +1732,12 @@ fn stage_one_current(project: &Project, case: &ArcEquipment, fault: &crate::faul
     let mut events = Vec::new();
     let mut extras = Vec::new();
     let mut assumed = true;
+    let mut reasons: Vec<&'static str> = vec!["staged_clearing_assumed"];
     for device in devices {
         let amps = device_current(project, device, fault, fraction).ok_or_else(|| missing_arc_flash_message(&case.bus, &format!("the current through protected branch '{}' of {} [{}]", device.protected_branch.as_deref().unwrap_or(""), device.name, device.id)))?;
         let exposure = device_exposure(device, amps, false).map_err(|gap| missing_arc_flash_message(&case.bus, &gap))?;
         assumed |= exposure.assumed;
+        for code in exposure.reasons { if !reasons.contains(&code) { reasons.push(code); } }
         if !exposure.extra.is_empty() { extras.push(exposure.extra); }
         events.push(StageEvent { time_s: exposure.seconds, branch: device.protected_branch.clone(), motors: Vec::new() });
     }
@@ -1647,6 +1786,8 @@ fn stage_one_current(project: &Project, case: &ArcEquipment, fault: &crate::faul
         truncate_segments(&mut segments, clear.seconds);
     }
     clear.assumed = assumed;
+    clear.basis = "staged_multi_device";
+    for code in reasons { clear.reason(code); }
     let mut note = format!(" Arc duration is staged until the last source clears (IEEE 1584-2018 Clause 6.9). Each device is timed at the initial arcing current through its own protected terminal. Later current changes are not fed back into the trip time.");
     if !decay_ids.is_empty() {
         decay_ids.sort();
@@ -2651,12 +2792,18 @@ pub fn text_report(project: &Project, out: &StudyOutput) -> String {
                     lines.push("    Arc flash  no IEEE 1584-2018 result for this bus.".into());
                 } else {
                     for failure in reasons {
-                        lines.push(format!("    Arc flash FAILED: {}", failure.error));
+                        lines.push(format!("    Arc flash FAILED: {} Clearing basis unresolved. Not label-ready.", failure.error));
                     }
                 }
             }
             for row in mine {
                 lines.push(format!("    {}", row.duration_note));
+                let basis = if row.clearing_basis == row.clearing_basis_reduced { row.clearing_basis.clone() } else { format!("{} (reduced: {})", row.clearing_basis, row.clearing_basis_reduced) };
+                if row.label_ready {
+                    lines.push(format!("    Clearing basis {basis}. Label-ready on its data basis (not an engineering review)."));
+                } else {
+                    lines.push(format!("    Clearing basis {basis}. Not label-ready: {}.", row.label_reasons.join(", ")));
+                }
                 if row.decrement_applied {
                     lines.push(format!("    Source-current decrement integrated for: {}", row.decrement_source_ids.join(", ")));
                 }
@@ -2754,12 +2901,33 @@ mod audit_regression {
     }
 
     #[test]
+    fn sample_rows_carry_a_clearing_basis_and_label_readiness() {
+        let out = run(&Project::sample(), arc_only()).unwrap();
+        let rows = out.arc_flash.as_ref().unwrap();
+        assert!(!rows.is_empty());
+        let known: Vec<&str> = LABEL_REASONS.iter().map(|(code, _)| *code).collect();
+        for r in rows {
+            assert!(!r.clearing_basis.is_empty() && !r.clearing_basis_reduced.is_empty(), "{}", r.equipment_id);
+            assert_eq!(r.label_ready, r.label_reasons.is_empty());
+            assert!(!(r.assumed && r.label_ready), "{}", r.equipment_id);
+            assert!(r.label_reasons.iter().all(|code| known.contains(&code.as_str())), "{:?}", r.label_reasons);
+        }
+        let staged = rows.iter().find(|r| r.clearing_basis == "staged_multi_device").expect("staged sample row");
+        assert!(staged.label_reasons.iter().any(|r| r == "staged_clearing_assumed"));
+        assert!(rows.iter().any(|r| r.clearing_basis == "trip_curve_plus_interrupting_time" && r.label_ready));
+        for f in &out.arc_flash_failures { assert_eq!(f.clearing_basis, "unresolved"); assert!(!f.label_ready); }
+        let report = text_report(&Project::sample(), &out);
+        assert!(report.contains("Not label-ready: staged_clearing_assumed") && report.contains("Label-ready on its data basis"), "{report}");
+    }
+
+    #[test]
     fn assumed_enclosure_reports_maximum_over_equipment_classes() {
         let mut p = Project::sample();
         p.equipment.retain(|e| e.id != "af-pnl");
         let out = run(&p, arc_only()).unwrap();
         let assumed = row(&out, "assumed:pnl").clone();
         assert!(assumed.assumed && assumed.enclosure_assumed);
+        assert!(!assumed.label_ready && assumed.label_reasons.iter().any(|r| r == "assumed_equipment"), "{:?}", assumed.label_reasons);
 
         let classes = classes_for_assumed_bus(p.bus("pnl").unwrap());
         assert!(classes.len() >= 2, "{classes:?}");
@@ -2811,12 +2979,15 @@ mod audit_regression {
         let capped_out = run(&p, arc_only()).unwrap();
         let capped = row(&capped_out, "af-mcc");
         assert!(capped.duration_capped && capped.assumed);
+        assert!(!capped.label_ready && capped.label_reasons.iter().any(|r| r == "duration_capped"), "{:?}", capped.label_reasons);
         assert!((capped.time_s - 2.0).abs() < 1e-12, "{}", capped.time_s);
         assert!(capped.duration_note.contains("6.9.1") && capped.duration_note.contains("move away"), "{}", capped.duration_note);
         p.escape_possible = false;
         let open_out = run(&p, arc_only()).unwrap();
         let open = row(&open_out, "af-mcc");
         assert!(!open.duration_capped && !open.assumed);
+        assert!(open.label_ready && open.label_reasons.is_empty(), "{:?}", open.label_reasons);
+        assert!(!open.clearing_basis.is_empty());
         assert!((open.time_s - 3.05).abs() < 1e-12, "{}", open.time_s);
         assert!(open.duration_note.contains("not assumed possible"), "{}", open.duration_note);
     }
@@ -2834,6 +3005,7 @@ mod audit_regression {
         assert!((limited.time_s - 0.02).abs() < 1e-12 && (limited.time_min_s - 0.02).abs() < 1e-12);
         assert!((limited.arcing_ka - 8.0).abs() < 1e-9 && (limited.arcing_min_ka - 8.0).abs() < 1e-9);
         assert!(limited.duration_note.contains("current-limiting") && limited.duration_note.contains("variation factor"), "{}", limited.duration_note);
+        assert_eq!(limited.clearing_basis, "current_limiting_manufacturer_time");
         let expected = arcflash::calculate(&IeeeInput {
             voc_kv: 0.48, ibf_ka: limited.bolted_ka, gap_mm: p.equipment[0].gap_mm,
             distance_mm: p.equipment[0].distance_mm, height_mm: p.equipment[0].height_mm,
@@ -2933,6 +3105,8 @@ mod audit_regression {
         assert!((limited.arcing_ka - 8.0).abs() < 1e-9 && (limited.arcing_min_ka - 8.0).abs() < 1e-9);
         assert!(limited.assumed && !limited.decrement_applied);
         assert!(limited.duration_note.contains("quarter-cycle") && limited.duration_note.contains("Annex H"), "{}", limited.duration_note);
+        assert_eq!(limited.clearing_basis, "current_limiting_fixed_table");
+        assert!(!limited.label_ready && limited.label_reasons.iter().any(|r| r == "current_limiting_fixed_table"), "{:?}", limited.label_reasons);
         assert!(limited.duration_note.contains("was not applied") && limited.duration_note.contains("variation factor"), "{}", limited.duration_note);
         let expected = arcflash::calculate(&IeeeInput {
             voc_kv: 0.48, ibf_ka: limited.bolted_ka, gap_mm: p.equipment[0].gap_mm,
