@@ -48,6 +48,23 @@ pub struct Project {
     pub motor_contribution_s: f64,
     #[serde(default)]
     pub prefault: Prefault,
+    /// Staged arc flash: incident energy accumulates in trip order until the
+    /// devices that have operated have cleared this fraction of the total bus
+    /// arcing current. The arc is then taken as extinguished. Default 0.80.
+    #[serde(default = "default_cleared_fraction")]
+    pub cleared_fault_fraction: f64,
+    /// Optional step-down of generator and synchronous-motor contribution
+    /// during an arc. None (the default) keeps their initial contribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_step_down: Option<MachineStepDown>,
+    /// Re-time each device on its reduced current after motors drop out,
+    /// machines step down, or a source decrement falls. Default false: each
+    /// device is timed once at its initial arcing current.
+    #[serde(default)]
+    pub retime_on_reduced_current: bool,
+    /// The single per-unit prefault voltage for `prefault: flat`. Default 1.0.
+    #[serde(default = "default_one")]
+    pub prefault_pu: f64,
     /// Low-voltage IEC 60909-0 voltage factor. False uses cmax = 1.05
     /// (nominal-voltage tolerance of +6%). True uses cmax = 1.10 (+10%).
     /// cmin stays 0.95 at or below 1 kV. Above 1 kV the factor is 1.10 / 1.00
@@ -113,9 +130,18 @@ pub struct Assumption {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Prefault {
+    /// One per-unit prefault voltage for every bus, `Project::prefault_pu`
+    /// (default 1.0).
     #[default]
     Flat,
+    /// Converged load-flow bus voltages. A load flow with an error or a
+    /// warning switches the whole study to `NoLoadTap`, and that is reported.
     Loadflow,
+    /// No-load voltages from each source's entered voltage through
+    /// transformer ratios and taps.
+    NoLoadTap,
+    /// An entered per-unit prefault voltage on every bus, `Bus::prefault_pu`.
+    PerBus,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -141,6 +167,10 @@ pub struct Bus {
     /// class at this voltage is evaluated and the governing result is kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub equipment_class: Option<EquipmentClass>,
+    /// Entered per-unit prefault voltage, used when the study prefault is
+    /// `per_bus`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefault_pu: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -883,6 +913,20 @@ fn default_motor_contribution() -> f64 {
 fn default_vpu() -> f64 {
     1.0
 }
+fn default_cleared_fraction() -> f64 {
+    0.80
+}
+
+/// Generator and synchronous-motor contribution after `after_cycles` (60 Hz
+/// cycles) becomes `percent_of_rated` percent of the machine's rated current.
+/// `after_cycles` must exceed the induction-motor window.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachineStepDown {
+    pub percent_of_rated: f64,
+    pub after_cycles: f64,
+}
+
 fn default_one() -> f64 {
     1.0
 }
@@ -921,6 +965,10 @@ impl Default for Project {
             escape_possible: default_true(),
             motor_contribution_s: default_motor_contribution(),
             prefault: Prefault::Flat,
+            prefault_pu: 1.0,
+            cleared_fault_fraction: 0.80,
+            machine_step_down: None,
+            retime_on_reduced_current: false,
             low_voltage_tolerance_plus_10: false,
             assumptions: Vec::new(),
             neutral_grounding: Vec::new(),
@@ -937,6 +985,10 @@ impl Project {
             escape_possible: true,
             motor_contribution_s: default_motor_contribution(),
             prefault: Prefault::Flat,
+            prefault_pu: 1.0,
+            cleared_fault_fraction: 0.80,
+            machine_step_down: None,
+            retime_on_reduced_current: false,
             low_voltage_tolerance_plus_10: false,
             assumptions: Vec::new(),
             switches: Vec::new(),
@@ -944,9 +996,9 @@ impl Project {
             operating_cases: Vec::new(),
             neutral_grounding: Vec::new(),
             buses: vec![
-                Bus { id: "util".into(), name: "Utility".into(), kv: 12.47, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None },
-                Bus { id: "mcc".into(), name: "MCC-1".into(), kv: 0.48, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None },
-                Bus { id: "pnl".into(), name: "Panel A".into(), kv: 0.48, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None },
+                Bus { id: "util".into(), name: "Utility".into(), kv: 12.47, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None, prefault_pu: None },
+                Bus { id: "mcc".into(), name: "MCC-1".into(), kv: 0.48, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None, prefault_pu: None },
+                Bus { id: "pnl".into(), name: "Panel A".into(), kv: 0.48, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None, prefault_pu: None },
             ],
             branches: vec![
                 Branch {
@@ -1214,6 +1266,27 @@ impl Project {
         }
         if self.arc_duration_cap_s <= 0.0 {
             errors.push("arc_duration_cap_s must be positive".into());
+        }
+        if !(self.cleared_fault_fraction.is_finite() && self.cleared_fault_fraction > 0.0 && self.cleared_fault_fraction <= 1.0) {
+            errors.push("cleared_fault_fraction must be above 0 and at most 1".into());
+        }
+        if let Some(step) = &self.machine_step_down {
+            if !(step.percent_of_rated.is_finite() && step.percent_of_rated >= 0.0) {
+                errors.push("machine_step_down percent_of_rated must be zero or positive".into());
+            }
+            if !(step.after_cycles.is_finite() && step.after_cycles / 60.0 > self.motor_contribution_s) {
+                errors.push(format!("machine_step_down after_cycles must be greater than the induction-motor window of {:.2} cycles", self.motor_contribution_s * 60.0));
+            }
+        }
+        if !(self.prefault_pu.is_finite() && self.prefault_pu > 0.0) {
+            errors.push("prefault_pu must be positive".into());
+        }
+        if self.prefault == Prefault::PerBus {
+            for bus in &self.buses {
+                if !bus.prefault_pu.is_some_and(|v| v.is_finite() && v > 0.0) {
+                    errors.push(format!("bus '{}' needs a positive prefault_pu because the study prefault is per_bus", bus.id));
+                }
+            }
         }
         if !(self.motor_contribution_s.is_finite() && self.motor_contribution_s > 0.0) {
             errors.push("motor_contribution_s must be positive".into());

@@ -46,8 +46,8 @@ fn source_decrement_is_integrated_across_motor_backfeed() {
         .expect("motor contribution is calculated while source decrement is integrated between openings");
     let steady_row = steady.arc_flash.as_ref().unwrap().iter().find(|row| row.equipment_id == "af-mcc").unwrap();
     assert!(row.assumed && row.decrement_applied, "{}", row.duration_note);
-    assert!(row.duration_note.contains("decaying arcing current"), "{}", row.duration_note);
-    assert_eq!(row.clearing_basis, "staged_decaying_current");
+    assert!(row.duration_note.contains("one fault solution"), "{}", row.duration_note);
+    assert_eq!(row.clearing_basis, "staged_multi_device");
     assert!(row.duration_note.contains("m1"), "{}", row.duration_note);
     assert!(row.decrement_source_ids.iter().any(|id| id == "grid"), "{:?}", row.decrement_source_ids);
     let final_bolted = row.final_bolted_ka.expect("last decrement slice");
@@ -63,8 +63,7 @@ fn motor_feeder_breaker_only_removes_backfeed_when_its_contact_is_open() {
     project.devices[0].breaker_interrupting_s = Some(0.04);
     project.buses.push(Bus {
         id: "motor-bus".into(), name: "Motor feeder load end".into(), kv: 0.48,
-        shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None,
-    });
+        shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None, prefault_pu: None });
     project.branches.push(Branch {
         id: "motor-feeder".into(), name: "Motor feeder".into(),
         from: "mcc".into(), to: "motor-bus".into(),
@@ -99,9 +98,12 @@ fn motor_feeder_breaker_only_removes_backfeed_when_its_contact_is_open() {
         electrode: project.equipment[0].electrode, time_s: 0.09, time_min_s: 0.09,
         arc_ka_override: None, arc_min_ka_override: None,
     }).unwrap();
+    // The induction motor drops out after its 5-cycle window, just before
+    // both breakers open at 0.09 s, so energy is slightly below the
+    // full-current value for 0.09 s.
     for (got, want) in [(closed_row.energy_cal_cm2, closed_expected.energy_cal_cm2),
         (closed_row.governing_cal_cm2, closed_expected.governing_cal_cm2), (closed_row.afb_mm, closed_expected.afb_mm)] {
-        assert!((got - want).abs() < 1e-9 * want, "got {got}, expected {want}");
+        assert!(got < want && got > 0.99 * want, "got {got}, expected just below {want}");
     }
 
     project.switches[0].closed = false;

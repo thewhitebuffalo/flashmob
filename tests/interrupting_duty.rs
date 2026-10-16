@@ -29,8 +29,7 @@ fn one_bus(source_xr: f64, bracing_ka: Option<f64>, bracing_test_xr: Option<f64>
         bracing_ka,
         main_rating_a: None,
         bracing_test_xr,
-        equipment_class: None,
-    });
+        equipment_class: None, prefault_pu: None });
     project.sources.push(Source { generator: None, machine_kind: None, transient_mva_sc: None,
         id: "src".into(),
         name: "Source".into(),
@@ -189,13 +188,15 @@ fn arc_flash_only_keeps_interrupting_duty_after_dropping_the_fault() {
 }
 
 #[test]
-fn invalid_fault_produces_no_interrupting_rows() {
+fn unusable_load_flow_prefault_switches_duty_to_no_load_tap() {
     let mut project = one_bus(8.0, Some(1.0), Some(8.0), rating(5.0, 8.0, 480.0));
     project.prefault = Prefault::Loadflow;
     project.sources[0].is_slack = false;
     let out = study::run(&project, fault_only()).unwrap();
-    assert!(!out.fault.as_ref().unwrap().valid);
-    assert!(out.interrupting.is_empty());
+    let fault = out.fault.as_ref().unwrap();
+    assert!(fault.valid);
+    assert_eq!(fault.prefault, "no_load_tap");
+    assert!(!out.interrupting.is_empty());
 }
 
 #[test]
@@ -203,8 +204,7 @@ fn protected_branch_uses_the_terminal_current() {
     let mut project = one_bus(8.0, None, None, rating(100.0, 8.0, 480.0));
     project.buses.push(Bus {
         id: "load".into(), name: "Load".into(), kv: 0.48, shunt_kvar: 0.0,
-        bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None,
-    });
+        bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None, prefault_pu: None });
     project.branches.push(Branch {
         id: "feeder".into(), name: "Feeder".into(), from: "bus".into(), to: "load".into(),
         kind: BranchKind::Line {
@@ -618,7 +618,7 @@ fn machine_fields_load_from_json_and_exec() {
 /// at bus "bus" differ.
 fn mixed_xr_project() -> (Project, f64) {
     let mut project = one_bus(20.0, Some(1.0), Some(15.0), rating(0.5, 15.0, 480.0));
-    project.buses.push(Bus { id: "far".into(), name: "Far".into(), kv: 0.48, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None });
+    project.buses.push(Bus { id: "far".into(), name: "Far".into(), kv: 0.48, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None, prefault_pu: None });
     let mut far = project.sources[0].clone();
     far.id = "far_src".into();
     far.bus = "far".into();

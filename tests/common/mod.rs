@@ -3,7 +3,7 @@
 use flashmob::model::*;
 
 pub fn bus(id: &str, kv: f64) -> Bus {
-    Bus { id: id.into(), name: id.into(), kv, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None }
+    Bus { id: id.into(), name: id.into(), kv, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None, prefault_pu: None }
 }
 
 pub fn line(id: &str, from: &str, to: &str, r: f64, x: f64) -> Branch {

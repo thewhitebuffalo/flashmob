@@ -488,11 +488,14 @@ fn missing_prefault_invalidates_fault_and_preserves_failed_arc_cases() {
     let mut p = Project::sample(); p.prefault = Prefault::Loadflow;
     let f = fault::solve(&p, None).unwrap(); assert!(!f.valid); assert_eq!(f.prefault, "none"); assert_eq!(f.prefault_requested, "loadflow");
     assert!(f.buses.iter().all(|b| b.three_phase.is_none()));
+    // A load flow that cannot be used switches the whole study to the
+    // no-load-with-tap prefault and says so; it never silently uses flat.
     p.sources[0].is_slack = false;
     let out = study::run(&p, Studies::all()).unwrap();
-    assert!(!out.fault.as_ref().unwrap().valid); assert!(out.arc_flash.as_ref().unwrap().is_empty());
-    assert_eq!(out.arc_flash_failures.len(), 3);
-    assert!(study::text_report(&p, &out).contains("method used: none"));
+    let fault = out.fault.as_ref().unwrap();
+    assert!(fault.valid); assert_eq!(fault.prefault, "no_load_tap");
+    assert!(out.warnings.iter().any(|w| w.contains("no-load-with-tap prefault")), "{:?}", out.warnings);
+    assert!(!out.arc_flash.as_ref().unwrap().is_empty());
 }
 #[test]
 fn unknown_curves_return_status_and_no_unbounded_decade_loop() {

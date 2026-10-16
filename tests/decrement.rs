@@ -107,6 +107,7 @@ fn decrement_uses_device_trip_plus_breaker_interruption_without_manual_duration(
     let mut project = Project::sample();
     project.motors.clear();
     project.equipment.truncate(1);
+    project.retime_on_reduced_current = true;
     project.devices[0].curve = CurveSpec::Definite { pickup_a: 1.0, time_s: 0.05 };
     project.devices[0].breaker_interrupting_s = Some(0.04);
     project.sources[0].decrement_curve = curve(0.3);
@@ -125,6 +126,7 @@ fn declining_current_delays_inverse_relay_and_reduced_arcing_path() {
     let mut project = Project::sample();
     project.motors.clear();
     project.equipment.truncate(1);
+    project.retime_on_reduced_current = true;
     project.devices[0].curve = CurveSpec::Iec {
         kind: IecKind::Si, pickup_a: 500.0, tms: 0.1,
         inst_a: None, inst_s: None,
@@ -160,6 +162,7 @@ fn decrement_without_relay_operation_has_explicit_failure() {
     let mut project = Project::sample();
     project.motors.clear();
     project.equipment.truncate(1);
+    project.retime_on_reduced_current = true;
     project.sources[0].decrement_curve = curve(0.3);
     project.devices[0].curve = CurveSpec::Definite { pickup_a: 1_000_000.0, time_s: 0.05 };
     let output = run_arc(&project);
@@ -206,6 +209,7 @@ fn slow_device_with_flat_decrement_is_capped_like_constant_current() {
     let mut project = Project::sample();
     project.motors.clear();
     project.equipment.truncate(1);
+    project.retime_on_reduced_current = true;
     project.devices[0].curve = CurveSpec::Definite { pickup_a: 1.0, time_s: 3.0 };
     project.devices[0].breaker_interrupting_s = Some(0.04);
     let static_row = arc(&run_arc(&project), "af-mcc").clone();
@@ -222,14 +226,17 @@ fn fuse_total_clearing_curve_does_not_masquerade_as_dynamic_relay() {
     let mut project = Project::sample();
     project.motors.clear();
     project.equipment.truncate(1);
+    project.retime_on_reduced_current = true;
     project.sources[0].decrement_curve = curve(0.3);
     project.devices[0].curve = CurveSpec::Definite { pickup_a: 1.0, time_s: 0.05 };
     project.devices[0].fuse_total_clearing = true;
     project.devices[0].breaker_interrupting_s = None;
+    // A total-clearing curve is read once at the initial arcing current and
+    // reported; it is not treated as clearing that follows the reduced current.
     let output = run_arc(&project);
-    let failure = output.arc_flash_failures.iter()
-        .find(|failure| failure.equipment_id == "af-mcc").unwrap();
-    assert!(failure.error.contains("fuse total clearing"), "{}", failure.error);
+    let row = arc(&output, "af-mcc");
+    assert!(row.label_reasons.iter().any(|r| r == "static_device_timing"), "{:?}", row.label_reasons);
+    assert!(row.duration_note.contains("does not by itself establish clearing"), "{}", row.duration_note);
 }
 
 #[test]
@@ -237,6 +244,7 @@ fn short_initial_pickup_does_not_claim_a_trip_after_current_decays() {
     let mut project = Project::sample();
     project.motors.clear();
     project.equipment.truncate(1);
+    project.retime_on_reduced_current = true;
     project.sources[0].mva_sc = 20.0;
     project.arc_duration_cap_s = 0.5;
     project.devices[0].curve = CurveSpec::Definite { pickup_a: 1.0, time_s: 0.05 };
@@ -327,7 +335,7 @@ fn disconnected_curved_source_does_not_change_static_island_clearing() {
 
 fn bus(id: &str) -> Bus {
     Bus { id: id.into(), name: id.into(), kv: 0.48, shunt_kvar: 0.0,
-        bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None }
+        bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None, prefault_pu: None }
 }
 
 fn line(id: &str, from: &str, to: &str) -> Branch {
@@ -490,7 +498,7 @@ fn low_voltage_two_step_decrement_matches_hand_summed_slice_energies() {
 fn medium_voltage_two_step_decrement_matches_hand_summed_slice_energies() {
     let mut project = manual_source_project();
     project.buses = vec![Bus { id: "swgr".into(), name: "4.16 kV switchgear".into(), kv: 4.16,
-        shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None }];
+        shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None, prefault_pu: None }];
     project.branches.clear();
     project.sources[0].bus = "swgr".into();
     project.sources[0].mva_sc = 150.0;

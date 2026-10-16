@@ -146,6 +146,8 @@ pub(crate) struct Infeed {
     pub remote: bool,
     /// Set for a source. Absent for a motor.
     pub source_id: Option<String>,
+    /// Set for a motor.
+    pub motor_id: Option<String>,
 }
 
 pub fn build(project: &Project) -> Result<SystemModel, String> {
@@ -263,6 +265,7 @@ pub(crate) fn build_part(project: &Project, part: Part) -> Result<SystemModel, S
             y: y1,
             remote: source.decrement_curve.is_empty(),
             source_id: Some(source.id.clone()),
+            motor_id: None,
         });
         pos.shunt(i, y1);
         neg.shunt(i, y1);
@@ -289,7 +292,7 @@ pub(crate) fn build_part(project: &Project, part: Part) -> Result<SystemModel, S
         let x = motor.x_subtransient_pu * (project.s_base_mva / (kva / 1000.0)) * (motor.kv / index.kv[i]).powi(2);
         let r = x / motor.xr;
         let y = part.admit(Cplx::new(r, x)).ok_or_else(|| format!("motor '{}' has zero impedance", motor.id))?;
-        infeeds.push(Infeed { bus: i, y, remote: false, source_id: None });
+        infeeds.push(Infeed { bus: i, y, remote: false, source_id: None, motor_id: Some(motor.id.clone()) });
         pos.shunt(i, y);
         neg.shunt(i, y);
     }

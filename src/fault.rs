@@ -47,6 +47,21 @@ pub struct BusFault {
     /// Machines that make up `nacd`. Empty when the ratio is omitted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub infeeds: Vec<ThreePhaseInfeed>,
+    /// Every machine's three-phase fault current phasor from this one
+    /// solution, per unit on the study base. Used to scale contributions in a
+    /// staged arc without re-solving the network. Not serialized.
+    #[serde(skip)]
+    pub machine_currents: Vec<MachineCurrent>,
+}
+
+/// One machine's share of the three-phase fault current in one solution.
+#[derive(Clone, Debug, Default)]
+pub struct MachineCurrent {
+    pub source_id: Option<String>,
+    pub motor_id: Option<String>,
+    pub bus_id: String,
+    /// Rectangular per-unit current, [real, imaginary].
+    pub current_pu: [f64; 2],
 }
 
 /// One machine's symmetrical contribution to the three-phase fault.
@@ -238,7 +253,12 @@ fn solve_core(project: &Project, loadflow: Option<&LoadflowResult>, model: &netw
     let mut neg = AdmittanceSolver::new(&z2);
     let mut zero = AdmittanceSolver::new(&z0);
 
-    let requested = if project.prefault == Prefault::Loadflow { "loadflow" } else { "flat_1.0_pu" };
+    let requested = match project.prefault {
+        Prefault::Loadflow => "loadflow".to_string(),
+        Prefault::Flat => format!("flat_{:?}_pu", project.prefault_pu),
+        Prefault::NoLoadTap => "no_load_tap".to_string(),
+        Prefault::PerBus => "per_bus".to_string(),
+    };
     let lf_valid = loadflow.map_or(false, |lf| lf.converged && model.index.id_of.iter().enumerate().all(|(i, id)|
         lf.buses.iter().any(|b| b.id == *id && b.angle_deg.is_finite() && if model.energized[i] {
             b.v_pu.is_finite() && b.v_pu > 0.0
@@ -247,8 +267,18 @@ fn solve_core(project: &Project, loadflow: Option<&LoadflowResult>, model: &netw
         })));
     let valid = project.prefault != Prefault::Loadflow || lf_valid;
     let error = if valid { None } else { Some("requested loadflow prefault unavailable or unconverged; method used: none; fault and arc-flash results invalid".to_string()) };
-    let mut prefault_v = vec![Cplx::real(1.0); n];
-    let mut label = "flat_1.0_pu".to_string();
+    let mut prefault_v = vec![Cplx::real(project.prefault_pu); n];
+    let mut label = requested.clone();
+    if project.prefault == Prefault::NoLoadTap {
+        prefault_v = no_load_tap_voltages(project, model).into_iter().map(Cplx::real).collect();
+    }
+    if project.prefault == Prefault::PerBus {
+        for bus in &project.buses {
+            if let (Ok(i), Some(v)) = (model.index.of(&bus.id), bus.prefault_pu) {
+                prefault_v[i] = Cplx::real(v);
+            }
+        }
+    }
     if project.prefault == Prefault::Loadflow {
         if let Some(lf) = loadflow.filter(|_| lf_valid) {
             for bus in &lf.buses {
@@ -273,6 +303,7 @@ fn solve_core(project: &Project, loadflow: Option<&LoadflowResult>, model: &netw
                 error: None,
                 nacd: None,
                 infeeds: Vec::new(),
+                machine_currents: Vec::new(),
             });
             continue;
         }
@@ -293,6 +324,7 @@ fn solve_core(project: &Project, loadflow: Option<&LoadflowResult>, model: &netw
                 error: Some(err),
                 nacd: None,
                 infeeds: Vec::new(),
+                machine_currents: Vec::new(),
             },
         };
         buses.push(bus);
@@ -303,7 +335,45 @@ fn solve_core(project: &Project, loadflow: Option<&LoadflowResult>, model: &netw
             set_peak(point, model.index.kv[i], basis[i]);
         }
     }
-    Ok(FaultResult { prefault: label, prefault_requested: requested.into(), valid, error, buses, iec_corrections: Vec::new(), iec_warnings: Vec::new() })
+    Ok(FaultResult { prefault: label, prefault_requested: requested, valid, error, buses, iec_corrections: Vec::new(), iec_warnings: Vec::new() })
+}
+
+/// No-load prefault magnitudes: each in-service source bus takes the source's
+/// entered voltage, and closed branches carry it outward. A line keeps the
+/// per-unit voltage. A transformer scales it by its rated voltage ratio, the
+/// HV tap, and the bus nominal voltages. A bus reached from no source keeps
+/// 1.0 pu; it is unenergized and has no fault current.
+pub fn no_load_tap_voltages(project: &Project, model: &network::SystemModel) -> Vec<f64> {
+    let n = model.index.n;
+    let mut v: Vec<Option<f64>> = vec![None; n];
+    let mut queue = std::collections::VecDeque::new();
+    for source in project.sources.iter().filter(|s| s.in_service) {
+        if let Ok(i) = model.index.of(&source.bus) {
+            if v[i].is_none() { v[i] = Some(source.v_pu); queue.push_back(i); }
+        }
+    }
+    while let Some(i) = queue.pop_front() {
+        let vi = v[i].unwrap_or(1.0);
+        for (branch, stamp) in project.branches.iter().zip(&model.branches) {
+            if !stamp.active { continue; }
+            let (here, there) = if stamp.from == i { (stamp.from, stamp.to) } else if stamp.to == i { (stamp.to, stamp.from) } else { continue };
+            if v[there].is_some() { continue; }
+            let next = match &branch.kind {
+                crate::model::BranchKind::Transformer { hv_kv, lv_kv, tap_percent, .. } => {
+                    let tap = 1.0 + tap_percent / 100.0;
+                    let (kv_here, kv_there) = (model.index.kv[here], model.index.kv[there]);
+                    // The side whose nominal voltage is nearer hv_kv is the HV side.
+                    let here_is_hv = (kv_here - hv_kv).abs() / hv_kv <= (kv_there - hv_kv).abs() / hv_kv;
+                    let ratio = if here_is_hv { lv_kv / (hv_kv * tap) } else { hv_kv * tap / lv_kv };
+                    vi * kv_here * ratio / kv_there
+                }
+                _ => vi,
+            };
+            v[there] = Some(next);
+            queue.push_back(there);
+        }
+    }
+    v.into_iter().map(|value| value.unwrap_or(1.0)).collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -356,11 +426,22 @@ fn bus_fault(
     let mut terminal_currents = Vec::new();
     let mut nacd = None;
     let mut infeeds = Vec::new();
+    let mut machine_currents = Vec::new();
     if let (Some(mut drop), Some(z)) = (column1, zz1) {
         // Y^-1 (e_k * I_fault) = (Y^-1 e_k) * I_fault is the voltage drop.
         let current = v / z;
         for value in &mut drop { *value = *value * current; }
         (nacd, infeeds) = three_phase_split(model, map1, &drop, current);
+        for infeed in &model.infeeds {
+            let Some(index) = map1.get(infeed.bus).copied().flatten() else { continue };
+            let current = infeed.y * drop[index];
+            machine_currents.push(MachineCurrent {
+                source_id: infeed.source_id.clone(),
+                motor_id: infeed.motor_id.clone(),
+                bus_id: model.index.id_of[infeed.bus].clone(),
+                current_pu: [current.re, current.im],
+            });
+        }
         if drop.iter().any(|v| !v.re.is_finite() || !v.im.is_finite()) {
             return Err("non-finite linear solution".into());
         }
@@ -399,6 +480,7 @@ fn bus_fault(
         terminal_currents,
         nacd,
         infeeds,
+        machine_currents,
     })
 }
 
@@ -671,7 +753,7 @@ mod tests {
     #[test]
     fn utility_fault_matches_short_circuit_mva() {
         let project = Project {
-            buses: vec![Bus { id: "a".into(), name: "A".into(), kv: 13.8, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None }],
+            buses: vec![Bus { id: "a".into(), name: "A".into(), kv: 13.8, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None, prefault_pu: None }],
             sources: vec![Source { generator: None, machine_kind: None, transient_mva_sc: None,
                 id: "s".into(),
                 name: "grid".into(),
@@ -713,7 +795,7 @@ mod tests {
     #[test]
     fn nacd_drops_when_a_motor_or_a_decrement_curve_is_local() {
         let mut project = Project {
-            buses: vec![Bus { id: "a".into(), name: "A".into(), kv: 13.8, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None }],
+            buses: vec![Bus { id: "a".into(), name: "A".into(), kv: 13.8, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None, prefault_pu: None }],
             sources: vec![Source { generator: None, machine_kind: None, transient_mva_sc: None,
                 id: "s".into(), name: "grid".into(), bus: "a".into(), in_service: true,
                 decrement_curve: Vec::new(), v_pu: 1.0, angle_deg: 0.0, mva_sc: 500.0, xr: 15.0,
@@ -761,8 +843,8 @@ mod tests {
         let project = Project {
             s_base_mva: 100.0,
             buses: vec![
-                Bus { id: "hv".into(), name: "HV".into(), kv: 12.47, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None },
-                Bus { id: "lv".into(), name: "LV".into(), kv: 0.48, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None },
+                Bus { id: "hv".into(), name: "HV".into(), kv: 12.47, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None, prefault_pu: None },
+                Bus { id: "lv".into(), name: "LV".into(), kv: 0.48, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None, prefault_pu: None },
             ],
             branches: vec![Branch {
                 id: "t".into(),

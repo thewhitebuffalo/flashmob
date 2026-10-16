@@ -666,7 +666,7 @@ mod tests {
         let mut p = Project::default();
         for i in 0..41 {
             p.buses.push(crate::model::Bus { id: format!("b{i}"), name: format!("Bus {i}"), kv: 0.48,
-                shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None });
+                shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None, prefault_pu: None });
             if i > 0 {
                 p.branches.push(crate::model::Branch { id: format!("f{i}"), name: format!("Feeder {i}"),
                     from: "b0".into(), to: format!("b{i}"),
@@ -746,7 +746,7 @@ mod tests {
         let mut project = Project::sample();
         project.devices[1].fuse_total_clearing = true;
         project.devices[1].breaker_interrupting_s = None;
-        project.buses.push(Bus { id: "gen_bus".into(), name: "Gen bus".into(), kv: 12.47, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None });
+        project.buses.push(Bus { id: "gen_bus".into(), name: "Gen bus".into(), kv: 12.47, shunt_kvar: 0.0, bracing_ka: None, main_rating_a: None, bracing_test_xr: None, equipment_class: None, prefault_pu: None });
         project.branches.push(Branch { id: "gen_tie".into(), name: "Gen tie".into(), from: "gen_bus".into(), to: "util".into(),
             kind: BranchKind::Line { r_ohm: 0.01, x_ohm: 0.02, b_siemens: 0.0, r0_ohm: 0.03, x0_ohm: 0.06, ampacity_a: None } });
         project.switches.push(Switch { id: "gen_sw".into(), name: "Gen breaker".into(), branch_id: "gen_tie".into(), kind: SwitchKind::Breaker, closed: false });

@@ -139,6 +139,7 @@ fn decrement_path_integrates_max_band_and_reports_assumptions() {
         DecrementPoint { time_s: 0.1, current_ratio: 0.8 },
         DecrementPoint { time_s: 0.5, current_ratio: 0.8 },
     ];
+    p.retime_on_reduced_current = true;
     let arc_only = Studies { loadflow: false, fault: false, arcflash: true, coordination: false };
     let out = study::run(&p, arc_only).unwrap();
     let row = arc(&out);
@@ -293,11 +294,14 @@ fn curve_is_total_clearing_conflicts_with_breaker_time_and_decrement() {
         DecrementPoint { time_s: 0.0, current_ratio: 1.0 },
         DecrementPoint { time_s: 0.5, current_ratio: 0.8 },
     ];
+    // With retiming on, a total-clearing curve is still read once at the
+    // initial arcing current, and that is reported rather than treated as
+    // clearing that follows the reduced current.
+    p.retime_on_reduced_current = true;
     let out = study::run(&p, Studies { loadflow: false, fault: false, arcflash: true, coordination: false }).unwrap();
-    let failure = out.arc_flash_failures.iter().find(|f| f.equipment_id == "af-mcc").unwrap();
-    assert!(failure.error.contains("Arc flash cannot be calculated for bus mcc"), "{}", failure.error);
-    assert!(failure.error.contains("Missing: a trip-only curve and breaker_interrupting_s"), "{}", failure.error);
-    assert!(failure.error.contains("curve_is_total_clearing"), "{}", failure.error);
+    let row = arc(&out);
+    assert!(row.label_reasons.iter().any(|r| r == "static_device_timing"), "{:?}", row.label_reasons);
+    assert!(!row.label_ready);
 }
 
 #[test]
@@ -465,8 +469,13 @@ fn source_decrement_does_not_use_the_single_current_melt_estimate() {
         DecrementPoint { time_s: 0.0, current_ratio: 1.0 },
         DecrementPoint { time_s: 0.2, current_ratio: 0.5 },
     ];
+    // Retiming off (default): the melt estimate is read once at the initial
+    // arcing current and is still flagged as an assumed estimate.
     let out = run(&p);
-    assert!(out.arc_flash.as_ref().unwrap().iter().all(|row| row.equipment_id != "af-mcc"));
-    let failure = out.arc_flash_failures.iter().find(|f| f.equipment_id == "af-mcc").unwrap();
-    assert!(failure.error.contains("decaying fault current") && failure.error.contains("IEEE 1584-2018"), "{}", failure.error);
+    let row = arc(&out);
+    assert!(row.label_reasons.iter().any(|r| r == "fuse_melt_estimate"), "{:?}", row.label_reasons);
+    p.retime_on_reduced_current = true;
+    let out = run(&p);
+    let row = arc(&out);
+    assert!(row.label_reasons.iter().any(|r| r == "static_device_timing"), "{:?}", row.label_reasons);
 }
