@@ -789,7 +789,7 @@ impl App {
             edited |= edit_breaker_time(ui, device, &mut refusal);
             edited |= edit_clearing_flags(ui, device, &mut refusal);
             edited |= labeled_text(ui, "Basis", &mut device.basis);
-            edited |= edit_interrupting(ui, device);
+            edited |= edit_interrupting(ui, device, &mut refusal);
             ui.separator();
             let curve_id = device.id.clone();
             edited |= edit_curve(ui, &curve_id, &mut device.curve);
@@ -1285,7 +1285,19 @@ fn toggle_clearing_flag(ui: &mut egui::Ui, device: &mut Device, fuse: bool, labe
     true
 }
 
-fn edit_interrupting(ui: &mut egui::Ui, device: &mut Device) -> bool {
+/// Set or clear the contact parting time from the editor. The value must be
+/// one the interrupting-duty calculation accepts (finite, at least 1 cycle);
+/// otherwise the rating is unchanged and the reason is returned.
+fn set_contact_parting(rating: &mut flashmob::model::InterruptingRating, cycles: Option<f64>) -> Result<bool, String> {
+    if let Some(value) = cycles {
+        flashmob::duty::asymmetry_capability(value)?;
+    }
+    let changed = rating.contact_parting_cycles != cycles;
+    rating.contact_parting_cycles = cycles;
+    Ok(changed)
+}
+
+fn edit_interrupting(ui: &mut egui::Ui, device: &mut Device, refusal: &mut Option<String>) -> bool {
     let Some((symmetrical_ka, test_xr, voltage_v)) = device.interrupting.as_ref().map(|rating| {
         (rating.symmetrical_ka, rating.test_xr, rating.voltage_v)
     }) else {
@@ -1301,6 +1313,16 @@ fn edit_interrupting(ui: &mut egui::Ui, device: &mut Device) -> bool {
         edited |= optional_f64(ui, (device.id.as_str(), "voltage-range-factor"), "Voltage range factor K", &mut rating.voltage_range_factor);
     }
     ui.label(RichText::new("Empty K means 1. Above 1 kV, closing and latching capability is 1.6 times K times this symmetrical rating.").color(color("#94A3B8")));
+    if let Some(rating) = device.interrupting.as_mut() {
+        let mut entered = rating.contact_parting_cycles;
+        if optional_f64(ui, (device.id.as_str(), "contact-parting"), "Contact parting (cycles)", &mut entered) {
+            match set_contact_parting(rating, entered) {
+                Ok(changed) => edited |= changed,
+                Err(err) => *refusal = Some(err),
+            }
+        }
+    }
+    ui.label(RichText::new("Empty means no remote multiplier; the half-cycle comparison alone is used. At least 1 cycle at 60 Hz. Used only above 1 kV.").color(color("#94A3B8")));
     // Shown only when a rating is already on the device. The editor does not invent one.
     if ui.button("Clear interrupting rating").clicked() {
         device.interrupting = None;
@@ -1795,6 +1817,58 @@ fn write_status(path: &std::path::Path, text: &str) -> Result<String, String> {
     match std::fs::write(path, text) {
         Ok(()) => Ok(format!("Wrote {}", path.display())),
         Err(err) => Err(format!("could not write {}: {err}", path.display())),
+    }
+}
+
+#[cfg(test)]
+mod contact_parting_tests {
+    use super::*;
+    use flashmob::model::InterruptingRating;
+
+    fn rating() -> InterruptingRating {
+        InterruptingRating { symmetrical_ka: 25.0, test_xr: 17.0, voltage_v: 13800.0, contact_parting_cycles: None, voltage_range_factor: None }
+    }
+
+    #[test]
+    fn editor_sets_clears_and_refuses_contact_parting() {
+        let mut r = rating();
+        assert_eq!(set_contact_parting(&mut r, Some(3.0)), Ok(true));
+        assert_eq!(r.contact_parting_cycles, Some(3.0));
+        assert_eq!(set_contact_parting(&mut r, Some(3.0)), Ok(false));
+        for bad in [0.5, 0.0, -2.0, f64::NAN, f64::INFINITY] {
+            assert!(set_contact_parting(&mut r, Some(bad)).is_err(), "{bad}");
+            assert_eq!(r.contact_parting_cycles, Some(3.0));
+        }
+        assert_eq!(set_contact_parting(&mut r, None), Ok(true));
+        assert_eq!(r.contact_parting_cycles, None);
+    }
+
+    #[test]
+    fn edited_contact_parting_matches_the_project_file_value() {
+        let build = |cycles: Option<f64>| {
+            let mut p = Project::sample();
+            p.buses[0].bracing_ka = None;
+            let mut device = p.devices[0].clone();
+            device.id = "hv".into();
+            device.bus = "util".into();
+            device.protected_branch = None;
+            device.interrupting = Some(InterruptingRating { contact_parting_cycles: cycles, ..rating() });
+            p.devices.push(device);
+            p
+        };
+        let from_file: Project = serde_json::from_str(&serde_json::to_string(&build(Some(3.0))).unwrap()).unwrap();
+        let mut edited = build(None);
+        let r = edited.devices.last_mut().unwrap().interrupting.as_mut().unwrap();
+        assert_eq!(set_contact_parting(r, Some(3.0)), Ok(true));
+        let studies = flashmob::study::Studies { loadflow: false, fault: true, arcflash: false, coordination: false };
+        let a = flashmob::study::run(&from_file, studies).unwrap();
+        let b = flashmob::study::run(&edited, studies).unwrap();
+        let row = |out: &flashmob::study::StudyOutput| out.interrupting.iter().find(|r| r.id == "hv").cloned().unwrap();
+        let (a, b) = (row(&a), row(&b));
+        assert!(a.remote_multiplying_factor.is_some());
+        assert_eq!(a.remote_multiplying_factor, b.remote_multiplying_factor);
+        assert_eq!(a.multiplied_symmetrical_ka, b.multiplied_symmetrical_ka);
+        assert_eq!(a.contact_parting_cycles, Some(3.0));
     }
 }
 
