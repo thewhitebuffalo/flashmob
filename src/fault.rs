@@ -720,7 +720,7 @@ mod tests {
                 x0_over_x1: 1.0, r0_over_r1: 1.0, is_slack: true, p_mw: 0.0,
                 qmin_mvar: None, qmax_mvar: None, defaulted: Vec::new(),
             }],
-            motors: vec![Motor { machine_kind: None, synchronous_rpm: None, phases: None,
+            motors: vec![Motor { machine_kind: None, synchronous_rpm: None, phases: None, decay_time_constant_s: None,
                 id: "m".into(), name: "M".into(), bus: "a".into(), hp: 1000.0, kv: 13.8,
                 pf: 0.85, efficiency: 0.94, x_subtransient_pu: 0.17, xr: 6.0, defaulted: Vec::new(),
             }],

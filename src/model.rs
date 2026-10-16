@@ -507,6 +507,10 @@ pub struct Motor {
     pub synchronous_rpm: Option<f64>,
     /// 1 or 3. None is treated as three-phase, the existing network model.
     pub phases: Option<u8>,
+    /// Exponential decay time constant of this motor's arc-flash
+    /// contribution, in seconds. None keeps the full contribution for the
+    /// fixed motor contribution window.
+    pub decay_time_constant_s: Option<f64>,
     /// Names of fields omitted from the input and filled with defaults; see `Source::defaulted`.
     pub defaulted: Vec<String>,
 }
@@ -533,6 +537,8 @@ struct MotorWire {
     synchronous_rpm: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     phases: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decay_time_constant_s: Option<f64>,
 }
 
 impl From<MotorWire> for Motor {
@@ -544,7 +550,7 @@ impl From<MotorWire> for Motor {
         let xr = entered_or(w.xr, "xr", default_mxr(), &mut defaulted);
         Self {
             id: w.id, name: w.name, bus: w.bus, hp: w.hp, kv: w.kv, pf, efficiency, x_subtransient_pu, xr,
-            machine_kind: w.machine_kind, synchronous_rpm: w.synchronous_rpm, phases: w.phases, defaulted,
+            machine_kind: w.machine_kind, synchronous_rpm: w.synchronous_rpm, phases: w.phases, decay_time_constant_s: w.decay_time_constant_s, defaulted,
         }
     }
 }
@@ -556,7 +562,7 @@ impl From<Motor> for MotorWire {
             efficiency: unless_default(m.efficiency, "efficiency", default_eff(), &m.defaulted),
             x_subtransient_pu: unless_default(m.x_subtransient_pu, "x_subtransient_pu", default_xd(), &m.defaulted),
             xr: unless_default(m.xr, "xr", default_mxr(), &m.defaulted),
-            machine_kind: m.machine_kind, synchronous_rpm: m.synchronous_rpm, phases: m.phases,
+            machine_kind: m.machine_kind, synchronous_rpm: m.synchronous_rpm, phases: m.phases, decay_time_constant_s: m.decay_time_constant_s,
             id: m.id, name: m.name, bus: m.bus, hp: m.hp, kv: m.kv,
         }
     }
@@ -998,7 +1004,7 @@ impl Project {
                 qmax_mvar: None,
                 defaulted: Vec::new(),
             }],
-            motors: vec![Motor { machine_kind: None, synchronous_rpm: None, phases: None,
+            motors: vec![Motor { machine_kind: None, synchronous_rpm: None, phases: None, decay_time_constant_s: None,
                 id: "m1".into(),
                 name: "M1".into(),
                 bus: "mcc".into(),
@@ -1512,6 +1518,7 @@ impl Project {
             check([m.hp, m.kv, m.pf, m.efficiency, m.x_subtransient_pu, m.xr].into_iter().all(positive)
                 && m.pf <= 1.0 && m.efficiency <= 1.0, &m.id, "motor ratings, reactance, or X/R");
             check(m.synchronous_rpm.map_or(true, positive) && m.phases.map_or(true, |n| n == 1 || n == 3), &m.id, "motor synchronous_rpm or phases (1 or 3)");
+            check(m.decay_time_constant_s.map_or(true, positive), &m.id, "motor decay_time_constant_s");
             // Allow customary nameplate/nominal differences (e.g. 460 V on 480 V).
             check(self.bus(&m.bus).map_or(false, |b| (m.kv / b.kv - 1.0).abs() <= 0.10), &m.id, "motor voltage (must be within 10% of bus voltage)");
         }

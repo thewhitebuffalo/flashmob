@@ -46,9 +46,8 @@ fn source_decrement_is_integrated_across_motor_backfeed() {
         .expect("motor contribution is calculated while source decrement is integrated between openings");
     let steady_row = steady.arc_flash.as_ref().unwrap().iter().find(|row| row.equipment_id == "af-mcc").unwrap();
     assert!(row.assumed && row.decrement_applied, "{}", row.duration_note);
-    assert!(row.duration_note.contains("integrated"), "{}", row.duration_note);
-    assert!(!row.duration_note.contains("was not integrated"), "{}", row.duration_note);
-    assert!(row.duration_note.contains("initial arcing current"), "{}", row.duration_note);
+    assert!(row.duration_note.contains("decaying arcing current"), "{}", row.duration_note);
+    assert_eq!(row.clearing_basis, "staged_decaying_current");
     assert!(row.duration_note.contains("m1"), "{}", row.duration_note);
     assert!(row.decrement_source_ids.iter().any(|id| id == "grid"), "{:?}", row.decrement_source_ids);
     let final_bolted = row.final_bolted_ka.expect("last decrement slice");

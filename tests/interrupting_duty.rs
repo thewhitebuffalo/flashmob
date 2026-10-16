@@ -389,7 +389,7 @@ fn motor_contribution_does_not_reduce_the_remote_multiplier() {
     high.contact_parting_cycles = Some(3.0);
     let mut project = one_bus(80.0, None, None, high);
     project.buses[0].kv = 13.8;
-    project.motors.push(Motor { machine_kind: None, synchronous_rpm: None, phases: None,
+    project.motors.push(Motor { machine_kind: None, synchronous_rpm: None, phases: None, decay_time_constant_s: None,
         id: "m".into(),
         name: "M".into(),
         bus: "bus".into(),
@@ -508,6 +508,7 @@ fn medium_voltage_motor_bus(kind: Option<MotorKind>, hp: f64, rpm: Option<f64>, 
         machine_kind: kind,
         synchronous_rpm: rpm,
         phases,
+        decay_time_constant_s: None,
         defaulted: Vec::new(),
     });
     assert!(project.validate().is_empty(), "{:?}", project.validate());

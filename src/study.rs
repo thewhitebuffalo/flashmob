@@ -233,6 +233,9 @@ pub const LABEL_REASONS: &[(&str, &str)] = &[
     ("point_curve_tail_held", "the current is beyond the point curve's last point and its last time is held"),
     ("relay_reset_assumed", "relay reset was assumed immediate and changed the result"),
     ("staged_clearing_assumed", "more than one clearing event; each device is timed at the initial arcing current"),
+    ("staged_decaying_current", "more than one clearing event; relays are timed on quasi-steady samples of the decaying arcing current"),
+    ("static_device_timing", "in a decaying staged arc, a fuse, total-clearing curve, or current-limiting time is read once at the initial arcing current"),
+    ("motor_decay_assumed", "a motor contribution decays with an entered, assumed time constant"),
     ("assumed_equipment", "equipment class, gap, working distance, or electrode was not collected"),
     ("bolted_out_of_range", "bolted current is outside the IEEE 1584-2018 model range"),
     ("model_range_exceeded", "an IEEE 1584-2018 model input is outside its range"),
@@ -440,7 +443,7 @@ fn run_one(project: &Project, studies: Studies) -> Result<StudyOutput, String> {
         methods: Methods {
             load_flow: "Newton-Raphson positive-sequence power flow".into(),
             short_circuit: "Symmetrical components. Peak current uses the IEC 60909 factor. IEC peak current is kappa times sqrt(2) times the maximum initial symmetrical current (cmax and, where applied, the impedance correction factors), with kappa from the faulted-bus R/X (IEC 60909-0 clause 8.1). C37 half-cycle and duty values stay on the uncorrected symmetrical current. A bus whose closed, energized branch graph contains a loop is meshed and uses method B, kappa times 1.15 limited to 1.8 at or below 1 kV and 2.0 above, unless every branch in that loop group has R/X below 0.3. A radial bus uses kappa without 1.15; several radial infeeds are combined through the Thevenin R/X, not a sum of partial peak currents. Each fault point reports peak_basis. Half-cycle rms is the first-half-cycle asymmetrical value. Minimum and maximum symmetrical currents apply IEC 60909-0 Table 1 voltage factor c to that current. The maximum symmetrical current uses a network with IEC 60909-0 impedance correction factors: K_T on network transformers (clause 6.3.3), K_G on generators with an entered generator rating (clause 6.6.1), and K_S or K_SO on a generator and its unit transformer when generator.unit is entered (clause 6.7). Each is evaluated in closed form from entered data, and the corrected impedance is the entered impedance times the factor. The minimum current is uncorrected. A rotating-machine source without a generator rating is not corrected and is reported. A breaker above 1 kV with contact_parting_cycles reports an IEEE C37.010 multiplier: asymmetrical rms at that parting time divided by the breaker asymmetry capability, and not below 1. NACD is reported. When NACD is below 1 and a local source has an entered decrement curve, that multiplier blends the remote DC-decrement factor with the local factor from the curve at 60 Hz. Motor contribution without a decrement curve is not reduced. A source with no decrement curve stays remote. Above 1 kV, closing and latching duty is 1.6 times that symmetrical current, and capability is 1.6 times K times the rated symmetrical current. Omitted K is 1. Duty rows use IEEE C37.010 5.4.1 machine reactance multipliers for classified motors and generators: the half-cycle comparison, bracing, and closing and latching use the first-cycle network, and the interrupting multiplier uses the interrupting network. Unclassified machines keep their entered reactance for both duties. Duty X/R comes from separate networks: the faulted-bus Thevenin reactance of a reactance-only network over the Thevenin resistance of a resistance-only network, each with that duty's machine multipliers and without shunt capacitance. Duty symmetrical current stays from the complex network. The fault study table keeps the complex-network X/R.".into(),
-            arc_flash: "IEEE 1584-2018 Each arc-flash row reports clearing_basis and clearing_basis_reduced (manual_duration, assumed_exposure_duration, total_clearing_curve, trip_curve_plus_interrupting_time, fuse_melt_estimate, current_limiting_manufacturer_time, current_limiting_fixed_table, current_limiting_stored_curve, staged_multi_device), label_ready, and label_reasons (duration_capped, assumed_exposure_duration, fuse_melt_estimate, current_limiting_fixed_table, assumed_curve_band, point_curve_tail_held, relay_reset_assumed, staged_clearing_assumed, assumed_equipment, bolted_out_of_range, model_range_exceeded, assumed_clearing). label_ready is true only when no reason applies to either arcing-current case; it is a data-basis screen, not an engineering review. Arc-flash failures report clearing_basis unresolved, label_ready false, and label_reasons [unresolved]. Times and energies are unchanged by this classification.".into(),
+            arc_flash: "IEEE 1584-2018 Each arc-flash row reports clearing_basis and clearing_basis_reduced (manual_duration, assumed_exposure_duration, total_clearing_curve, trip_curve_plus_interrupting_time, fuse_melt_estimate, current_limiting_manufacturer_time, current_limiting_fixed_table, current_limiting_stored_curve, staged_multi_device, staged_decaying_current), label_ready, and label_reasons (duration_capped, assumed_exposure_duration, fuse_melt_estimate, current_limiting_fixed_table, assumed_curve_band, point_curve_tail_held, relay_reset_assumed, staged_clearing_assumed, staged_decaying_current, static_device_timing, motor_decay_assumed, assumed_equipment, bolted_out_of_range, model_range_exceeded, assumed_clearing). label_ready is true only when no reason applies to either arcing-current case; it is a data-basis screen, not an engineering review. Arc-flash failures report clearing_basis unresolved, label_ready false, and label_reasons [unresolved]. Times and energies are unchanged by this classification.".into(),
             coordination: "IEC 60255, IEEE C37.112, definite time, and a simplified thermal-magnetic breaker".into(),
         },
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
@@ -727,7 +730,7 @@ fn evaluate_equipment(project: &Project, loadflow: Option<&LoadflowResult>, faul
         };
         (full_clear, min_clear, None)
     } else {
-        let staged = staged_exposure(project, loadflow, case, bus_fault, bolted, preview.i_arc_ka, preview.i_arc_min_ka, protection, &decrement_source_ids)?;
+        let staged = staged_exposure(project, loadflow, case, bus_fault, bolted, preview.i_arc_ka, preview.i_arc_min_ka, protection, &decrement_source_ids, &template)?;
         (staged.full.clone(), staged.reduced.clone(), Some(staged))
     };
     let mut full_clear = full_clear;
@@ -749,7 +752,10 @@ fn evaluate_equipment(project: &Project, loadflow: Option<&LoadflowResult>, faul
         let full = arcflash::integrate_profile(&input, &staged.full_segments, false)?;
         let reduced = arcflash::integrate_profile(&input, &staged.reduced_segments, true)?;
         apply_profile(&mut out, full, reduced);
-        let last = if staged.decrement_integrated {
+        let last = if staged.dynamic_timing {
+            out.warnings.push("The staged arcing current was followed through clearing events with repeated quasi-steady three-phase network solves, and each relay accumulated trip progress on its sampled terminal current. Source X/R was held constant.".into());
+            Some(staged_final_slice(&input, &staged.full_segments, &staged.reduced_segments)?)
+        } else if staged.decrement_integrated {
             out.warnings.push("Source-current decrement was integrated across clearing events with repeated quasi-steady three-phase network solves. Each device is still timed at the initial arcing current. Source X/R was held constant.".into());
             Some(staged_final_slice(&input, &staged.full_segments, &staged.reduced_segments)?)
         } else {
@@ -1688,6 +1694,8 @@ struct StagedExposure {
     reduced_segments: Vec<EnergySegment>,
     /// True when source decrement was integrated into the energy segments.
     decrement_integrated: bool,
+    /// True when relays were timed on the decaying staged current.
+    dynamic_timing: bool,
 }
 
 struct Infeed {
@@ -1710,8 +1718,24 @@ struct StageEvent {
 /// bolted current. A motor with no feeder device is removed after
 /// `motor_contribution_s`. When a decrement curve reaches the bus, each
 /// interval is subdivided and the source strength follows that curve.
-fn staged_exposure(project: &Project, _loadflow: Option<&LoadflowResult>, case: &ArcEquipment, fault: &crate::fault::BusFault, bolted_ka: f64, i_arc_ka: f64, i_arc_min_ka: f64, protection: &crate::protection::Protection, decrement_source_ids: &[String]) -> Result<StagedExposure, String> {
+fn staged_exposure(project: &Project, _loadflow: Option<&LoadflowResult>, case: &ArcEquipment, fault: &crate::fault::BusFault, bolted_ka: f64, i_arc_ka: f64, i_arc_min_ka: f64, protection: &crate::protection::Protection, decrement_source_ids: &[String], template: &IeeeInput) -> Result<StagedExposure, String> {
     let devices = select_stage_devices(project, case, protection)?;
+    if staged_time_varying(project, case, decrement_source_ids) {
+        let full = stage_dynamic(project, case, fault, bolted_ka, template, false, &devices, decrement_source_ids)?;
+        let reduced = if (i_arc_ka - i_arc_min_ka).abs() < 1e-12 {
+            full.clone()
+        } else {
+            stage_dynamic(project, case, fault, bolted_ka, template, true, &devices, decrement_source_ids)?
+        };
+        return Ok(StagedExposure {
+            full: full.0,
+            reduced: reduced.0,
+            full_segments: full.1,
+            reduced_segments: reduced.1,
+            decrement_integrated: true,
+            dynamic_timing: true,
+        });
+    }
     let full = stage_one_current(project, case, fault, bolted_ka, i_arc_ka, &devices, decrement_source_ids)?;
     let reduced = if (i_arc_ka - i_arc_min_ka).abs() < 1e-12 {
         full.clone()
@@ -1724,6 +1748,7 @@ fn staged_exposure(project: &Project, _loadflow: Option<&LoadflowResult>, case: 
         full_segments: full.1,
         reduced_segments: reduced.1,
         decrement_integrated: !decrement_source_ids.is_empty(),
+        dynamic_timing: false,
     })
 }
 
@@ -1800,6 +1825,234 @@ fn stage_one_current(project: &Project, case: &ArcEquipment, fault: &crate::faul
     if !decrement_source_ids.is_empty() {
         note.push_str(" Source decrement was integrated across clearing events. Source strength follows the entered decrement curve. Source X/R was held constant.");
     }
+    clear.note.push_str(&note);
+    Ok((clear, segments))
+}
+
+/// True when a staged arc must follow a time-varying current: an entered
+/// source decrement reaches the bus, or a reachable motor has
+/// `decay_time_constant_s`. Otherwise the initial-current staging is kept.
+fn staged_time_varying(project: &Project, case: &ArcEquipment, decrement_source_ids: &[String]) -> bool {
+    if !decrement_source_ids.is_empty() {
+        return true;
+    }
+    let reachable = reachable_buses(project, &case.bus);
+    project.motors.iter().any(|motor| motor.decay_time_constant_s.is_some() && reachable.contains(&motor.bus))
+}
+
+/// One quasi-steady network solve at `time_s`: open branches removed, dropped
+/// motors removed, decrement sources scaled, and each motor with a decay time
+/// constant scaled so its current falls as exp(-t / tau).
+fn staged_sample(project: &Project, bus_id: &str, opened: &[String], dropped: &[String], time_s: f64) -> Result<(f64, Vec<crate::fault::TerminalCurrent>), String> {
+    let mut snapshot = project.clone();
+    for branch_id in opened {
+        open_branch(&mut snapshot, branch_id);
+    }
+    snapshot.motors.retain(|motor| !dropped.iter().any(|id| id == &motor.id));
+    // Beyond 50 time constants the contribution is below 2e-22 of its start.
+    snapshot.motors.retain(|motor| motor.decay_time_constant_s.map_or(true, |tau| time_s / tau <= 50.0));
+    for motor in snapshot.motors.iter_mut() {
+        if let Some(tau) = motor.decay_time_constant_s {
+            motor.x_subtransient_pu *= (time_s / tau).exp();
+        }
+    }
+    for source in snapshot.sources.iter_mut().filter(|source| source.in_service && !source.decrement_curve.is_empty()) {
+        let ratio = source.decrement_ratio_at(time_s);
+        source.mva_sc *= ratio;
+    }
+    let fault = solve_staged_fault(&mut snapshot)?;
+    let bus = fault.buses.into_iter().find(|bus| bus.id == bus_id)
+        .ok_or_else(|| format!("no fault result at bus '{bus_id}' during a decaying staged arc"))?;
+    let ka = bus.three_phase.as_ref().map(|point| point.symmetrical_ka)
+        .filter(|ka| ka.is_finite() && *ka > 0.0)
+        .ok_or_else(|| format!("no three-phase fault current at bus '{bus_id}' during a decaying staged arc"))?;
+    Ok((ka, bus.terminal_currents))
+}
+
+struct PendingRelay<'a> {
+    device: &'a Device,
+    relay: curves::DynamicRelay,
+    interrupting_s: f64,
+    prior_amps: f64,
+}
+
+/// Staged arc on a time-varying current. The network is re-solved every
+/// 10 ms (and at decrement knots and clearing events) with the branches
+/// already open, the motors already removed, the source decrement applied,
+/// and motor decay applied. Each relay that has a trip-only curve and an
+/// entered breaker_interrupting_s accumulates trip progress on its own
+/// sampled terminal current at the sampled arcing current, then opens after
+/// its interrupting time. A fuse, a total-clearing curve, or a
+/// current-limiting device in its let-through range keeps one time read at
+/// the initial arcing current and is reported. Incident energy integrates
+/// the sampled bolted current slice by slice.
+fn stage_dynamic(project: &Project, case: &ArcEquipment, fault: &crate::fault::BusFault, bolted_ka: f64, template: &IeeeInput, reduced: bool, devices: &[&Device], decrement_source_ids: &[String]) -> Result<(Clearing, Vec<EnergySegment>), String> {
+    let gap = |detail: String| missing_arc_flash_message(&case.bus, &detail);
+    let arcing_of = |ibf_ka: f64| -> Result<f64, String> {
+        let out = arcflash::calculate(&IeeeInput { ibf_ka, ..template.clone() })?;
+        Ok(if reduced { out.i_arc_min_ka } else { out.i_arc_ka })
+    };
+    let current_case = if reduced { "reduced" } else { "full" };
+    let fraction0 = arcing_of(bolted_ka)? / bolted_ka;
+    let mut pending: Vec<PendingRelay> = Vec::new();
+    let mut events: Vec<StageEvent> = Vec::new();
+    let mut extras = Vec::new();
+    let mut reasons: Vec<&'static str> = vec!["staged_decaying_current"];
+    let mut static_names = Vec::new();
+    for device in devices {
+        let amps = device_current(project, device, fault, fraction0).ok_or_else(|| gap(format!("the current through protected branch '{}' of {} [{}]", device.protected_branch.as_deref().unwrap_or(""), device.name, device.id)))?;
+        let limiting = device.current_limiting.as_ref().is_some_and(|limit| amps >= limit.threshold_a);
+        let follows = !device.fuse_total_clearing && !device.curve_is_total_clearing && !curves::average_melt_fuse(device) && !limiting;
+        let relay = if follows { curves::DynamicRelay::new(&device.curve).ok() } else { None };
+        match (relay, device.breaker_interrupting_s) {
+            (Some(relay), Some(interrupting_s)) => pending.push(PendingRelay { device, relay, interrupting_s, prior_amps: amps }),
+            _ => {
+                let exposure = device_exposure(device, amps, false).map_err(|detail| gap(detail))?;
+                for code in exposure.reasons { if !reasons.contains(&code) { reasons.push(code); } }
+                if !exposure.extra.is_empty() { extras.push(exposure.extra); }
+                static_names.push(format!("{} [{}]", device.name, device.id));
+                events.push(StageEvent { time_s: exposure.seconds, branch: device.protected_branch.clone(), motors: Vec::new() });
+            }
+        }
+    }
+    if !static_names.is_empty() { reasons.push("static_device_timing"); }
+    let reachable = reachable_buses(project, &case.bus);
+    let mut window_ids = Vec::new();
+    let mut decay_ids = Vec::new();
+    for motor in project.motors.iter().filter(|motor| reachable.contains(&motor.bus)) {
+        if motor.decay_time_constant_s.is_some() { decay_ids.push(motor.id.clone()); }
+        let covered = devices.iter().any(|device| device_disconnects(project, device, &case.bus, &motor.bus));
+        if !covered {
+            window_ids.push(motor.id.clone());
+            events.push(StageEvent { time_s: project.motor_contribution_s, branch: None, motors: vec![motor.id.clone()] });
+        }
+    }
+    if !decay_ids.is_empty() { reasons.push("motor_decay_assumed"); }
+    if events.is_empty() && pending.is_empty() {
+        return Err(gap("an upstream device that isolates this bus".into()));
+    }
+    for event in &events {
+        if !event.time_s.is_finite() || event.time_s <= 0.0 {
+            return Err(format!("staged clearing time at bus '{}' is not a positive finite duration", case.bus));
+        }
+    }
+    let cap = project.arc_duration_cap_s;
+    let limit_s = exposure_limit_s(project, decrement_source_ids);
+    let mut segments = Vec::new();
+    let mut opened: Vec<String> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
+    let mut trips: Vec<String> = Vec::new();
+    let mut reset_matters = false;
+    let mut point_notes: Vec<(bool, String)> = Vec::new();
+    let mut applied = vec![false; events.len()];
+    let mut t = 0.0;
+    let mut prior_sample_s = 0.0;
+    let mut stopped_at_cap = false;
+    loop {
+        for (index, event) in events.iter().enumerate() {
+            if applied[index] || event.time_s > t + 1e-9 { continue; }
+            applied[index] = true;
+            if let Some(branch) = &event.branch {
+                if !opened.iter().any(|id| id == branch) { opened.push(branch.clone()); }
+            }
+            for motor in &event.motors {
+                if !dropped.iter().any(|id| id == motor) { dropped.push(motor.clone()); }
+            }
+        }
+        // A relay whose own branch was opened by another device stops timing.
+        pending.retain(|p| !p.device.protected_branch.as_ref().is_some_and(|b| opened.contains(b)));
+        let next_event = events.iter().enumerate().filter(|(i, _)| !applied[*i]).map(|(_, e)| e.time_s).fold(f64::INFINITY, f64::min);
+        if pending.is_empty() && !next_event.is_finite() { break; }
+        if project.escape_possible && t >= cap - 1e-12 { stopped_at_cap = true; break; }
+        if segments.len() >= 10_000 {
+            return Err("decaying staged arc exceeds 10,000 slices; reduce the arc duration or provide a shorter exposure limit".into());
+        }
+        let horizon = if project.escape_possible { next_event.min(cap) } else { next_event };
+        let end = next_decrement_end(project, decrement_source_ids, t, horizon);
+        if end <= t {
+            return Err("decaying staged arc slice did not advance".into());
+        }
+        let width = end - t;
+        let midpoint = t + width / 2.0;
+        let (ibf_ka, terminals) = staged_sample(project, &case.bus, &opened, &dropped, midpoint)?;
+        let fraction = arcing_of(ibf_ka)? / ibf_ka;
+        let mut index = 0;
+        while index < pending.len() {
+            let p = &mut pending[index];
+            let amps = device_current_from_terminals(project, p.device, &terminals, fraction).unwrap_or(0.0);
+            let step = advance_relay_over_ramp(&mut p.relay, p.prior_amps, amps, midpoint - prior_sample_s)
+                .map_err(|error| gap(format!("a trip time for {} [{}] on the sampled decaying current. {error}", p.device.name, p.device.id)))?;
+            p.prior_amps = amps;
+            if let Some(within_s) = step {
+                let trip_s = prior_sample_s + within_s;
+                // A slice already in progress keeps its topology; an opening
+                // is never placed earlier than the end of that slice.
+                let open_s = (trip_s + p.interrupting_s).max(end);
+                trips.push(format!("{} [{}] trip at {trip_s:.3} s plus entered breaker interruption of {:.3} s", p.device.name, p.device.id, p.interrupting_s));
+                reset_matters |= p.relay.reset_affects_result();
+                if let Some(note) = p.relay.point_note() { point_notes.push(note); }
+                events.push(StageEvent { time_s: open_s, branch: p.device.protected_branch.clone(), motors: Vec::new() });
+                applied.push(false);
+                pending.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+        segments.push(EnergySegment { ibf_ka, duration_s: width });
+        prior_sample_s = midpoint;
+        t = end;
+        if t >= limit_s - 1e-12 && events.iter().enumerate().all(|(i, e)| applied[i] || e.time_s <= t + 1e-9) {
+            for p in &pending {
+                let timing = p.relay.timing_at(p.prior_amps).map_err(|error| gap(format!("a trip time for {} [{}]. {error}", p.device.name, p.device.id)))?;
+                if !timing && decay_ids.is_empty() {
+                    return Err(gap(format!("a trip of {} [{}] under the sampled {current_case} decaying arcing current. It is below every entered pickup at {:.0} A after {t:.3} s, so staged clearing is unresolved", p.device.name, p.device.id, p.prior_amps)));
+                }
+                if !timing && p.prior_amps <= 0.0 {
+                    return Err(gap(format!("a trip of {} [{}]; its sampled current fell to zero before it operated", p.device.name, p.device.id)));
+                }
+            }
+        }
+    }
+    if segments.is_empty() {
+        return Err(format!("staged arc at bus '{}' produced no current interval", case.bus));
+    }
+    let not_a_label = "This cap is not a field trip setting and is not for an arc-flash label.";
+    let mut clear = if stopped_at_cap {
+        finish_clearing(f64::INFINITY, cap, true, "staged clearing still in progress on the decaying current", not_a_label)
+    } else {
+        finish_clearing(t, cap, project.escape_possible, &format!("staged clearing time of {t:.3} s on the decaying arcing current"), not_a_label)
+    };
+    if clear.capped {
+        truncate_segments(&mut segments, clear.seconds);
+    }
+    clear.assumed = true;
+    clear.basis = "staged_decaying_current";
+    for code in reasons { clear.reason(code); }
+    if reset_matters { clear.reason("relay_reset_assumed"); }
+    for (assumed, note) in &point_notes {
+        if *assumed { for code in point_note_reasons(note) { clear.reason(code); } }
+    }
+    let mut note = format!(" Arc duration is staged until the last source clears (IEEE 1584-2018 Clause 6.9). The {current_case} arcing current is re-solved through each clearing event, and each relay accumulates trip progress on its own sampled terminal current.");
+    if !trips.is_empty() { note.push_str(&format!(" {}.", trips.join("; "))); }
+    if !static_names.is_empty() {
+        note.push_str(&format!(" {} keep one time read at the initial arcing current: a fuse, a total-clearing curve, or a current-limiting let-through time does not by itself establish clearing on a decaying current.", static_names.join(", ")));
+    }
+    if reset_matters {
+        note.push_str(" Relay progress was reset immediately when sampled current fell below pickup, and an element holding its progress would have operated earlier; verify the device reset setting.");
+    }
+    if !window_ids.is_empty() {
+        window_ids.sort();
+        note.push_str(&format!(" Motor(s) {} have no feeder device and are removed after {:.3} s.", window_ids.join(", "), project.motor_contribution_s));
+    }
+    if !decay_ids.is_empty() {
+        decay_ids.sort();
+        note.push_str(&format!(" Motor(s) {} decay as exp(-t / decay_time_constant_s). The time constant is entered and is assumed.", decay_ids.join(", ")));
+    }
+    if !decrement_source_ids.is_empty() {
+        note.push_str(" Source strength follows the entered decrement curve. Source X/R was held constant.");
+    }
+    for extra in extras { note.push_str(&extra); }
+    for (_, point) in point_notes { note.push(' '); note.push_str(&point); }
     clear.note.push_str(&note);
     Ok((clear, segments))
 }
