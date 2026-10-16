@@ -89,6 +89,7 @@ pub struct FaultPoint {
     pub ig_ka: f64,
     /// None denotes the purely inductive limit (infinite X/R).
     pub x_over_r: Option<f64>,
+    /// IEC 60909 peak: kappa (peak_basis) times sqrt(2) times symmetrical_max_ka.
     pub iec_peak_ka: f64,
     pub half_cycle_rms_ka: f64,
     /// IEC 60909-0 Table 1 voltage factor c at this bus nominal voltage.
@@ -146,6 +147,8 @@ pub(crate) fn solve_with_model(project: &Project, loadflow: Option<&LoadflowResu
             if prefault <= 1e-12 { continue; }
             let max = fixed.symmetrical_ka * point.c_max / prefault;
             if !max.is_finite() { return Err("non-finite corrected maximum current".into()); }
+            // Same kappa; the peak follows the corrected maximum.
+            if point.symmetrical_max_ka > 0.0 { point.iec_peak_ka *= max / point.symmetrical_max_ka; }
             point.symmetrical_max_ka = max;
             point.iec_max_corrected = true;
         }
@@ -214,13 +217,15 @@ pub fn peak_basis(project: &Project, model: &network::SystemModel) -> Vec<PeakBa
 
 fn set_peak(point: &mut FaultPoint, kv: f64, basis: PeakBasis) {
     point.peak_basis = basis.as_str().into();
-    let r_over_x = match point.x_over_r {
-        None => 0.0,
-        Some(xr) if xr > 0.0 => 1.0 / xr,
-        // Purely resistive or zero current: no DC component, already set.
-        Some(_) => return,
+    // IEC peak is kappa times sqrt(2) times the maximum initial symmetrical
+    // current (voltage factor cmax, and the impedance correction factors once
+    // they are applied). Purely resistive or zero current has kappa 1.
+    let kappa = match point.x_over_r {
+        None => iec_kappa(0.0, kv, basis == PeakBasis::Meshed),
+        Some(xr) if xr > 0.0 => iec_kappa(1.0 / xr, kv, basis == PeakBasis::Meshed),
+        Some(_) => 1.0,
     };
-    point.iec_peak_ka = iec_kappa(r_over_x, kv, basis == PeakBasis::Meshed) * std::f64::consts::SQRT_2 * point.symmetrical_ka;
+    point.iec_peak_ka = kappa * std::f64::consts::SQRT_2 * point.symmetrical_max_ka;
 }
 
 fn solve_core(project: &Project, loadflow: Option<&LoadflowResult>, model: &network::SystemModel) -> Result<FaultResult, String> {

@@ -52,7 +52,7 @@ fn network_transformer_factor_corrects_only_the_maximum() {
 
 fn expected_peak(p: &fault::FaultPoint, kv: f64, meshed: bool) -> f64 {
     let rx = p.x_over_r.map_or(0.0, |xr| 1.0 / xr);
-    iec_kappa(rx, kv, meshed) * std::f64::consts::SQRT_2 * p.symmetrical_ka
+    iec_kappa(rx, kv, meshed) * std::f64::consts::SQRT_2 * p.symmetrical_max_ka
 }
 
 #[test]

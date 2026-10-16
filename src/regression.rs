@@ -350,7 +350,7 @@ fn resistive_source_has_no_dc_offset() {
     let mut p = transformer(); p.buses.truncate(1); p.branches.clear();
     let f = fault::solve(&p, None).unwrap(); let f = f.buses[0].three_phase.as_ref().unwrap();
     let i = 250.0 / (3.0_f64.sqrt()*11.0);
-    near(f.symmetrical_ka, i, 1e-8); near(f.iec_peak_ka, 2.0_f64.sqrt()*i, 1e-8);
+    near(f.symmetrical_ka, i, 1e-8); near(f.iec_peak_ka, 2.0_f64.sqrt()*f.symmetrical_max_ka, 1e-8); near(f.symmetrical_max_ka, 1.1*i, 1e-8);
     near(f.half_cycle_rms_ka, i, 1e-8); assert_eq!(f.x_over_r, Some(0.0));
 }
 #[test]
