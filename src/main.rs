@@ -109,6 +109,20 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Import a zipped record-format project (.dez) into a Flashmob project JSON file.
+    /// Prints a JSON summary with every warning. Existing output is never replaced without --force.
+    ImportDez {
+        /// Project archive, or its extracted model text.
+        input: PathBuf,
+        /// Project JSON to write.
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Device library used to link breakers. Defaults to the installed or bundled library.
+        #[arg(long)]
+        library: Option<PathBuf>,
+        #[arg(long)]
+        force: bool,
+    },
     /// Convert a binary manufacturer device library into a Flashmob library JSON file.
     /// Prints a JSON summary. Existing output is never replaced without --force.
     ImportLibrary {
@@ -315,6 +329,7 @@ fn main() -> ExitCode {
             }
             Err(err) => fail(&err),
         },
+        Command::ImportDez { input, output, library, force } => import_dez(&input, &output, library, force),
         Command::ImportLibrary { input, output, compact, force, redact } => import_library(&input, &output, compact, force, &redact),
         Command::Library { terms, limit } => {
             let (library, label, terms) = match resolve_library_search(terms) {
@@ -455,6 +470,48 @@ fn apply_library_project(project_path: &std::path::Path, library_path: &str, req
         Ok(value) => write_json(output, &value, false),
         Err(err) => fail(&err.to_string()),
     }
+}
+
+fn import_dez(input: &std::path::Path, output: &std::path::Path, library: Option<PathBuf>, force: bool) -> ExitCode {
+    if output.exists() && !force {
+        return fail(&format!("{} exists; use --force to replace it", output.display()));
+    }
+    let bytes = match std::fs::read(input) {
+        Ok(bytes) => bytes,
+        Err(err) => return fail(&format!("could not read {}: {err}", input.display())),
+    };
+    let stem = input.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Imported".into());
+    let net = match flashmob::import_dez::read(&bytes, &stem) {
+        Ok(net) => net,
+        Err(err) => return fail(&err),
+    };
+    let lib = match library {
+        Some(path) => flashmob::library::library_from_path(&path).map(|l| (l, path.display().to_string())),
+        None => flashmob::library::open_default_library(),
+    };
+    let mut warnings = Vec::new();
+    let lib = match lib {
+        Ok(lib) => Some(lib),
+        Err(err) => {
+            warnings.push(flashmob::import_common::ImportWarning::new("library_unavailable", "", err));
+            None
+        }
+    };
+    let result = flashmob::import_common::build_project(&net, lib.as_ref().map(|(l, n)| (l, n.as_str())));
+    warnings.extend(result.warnings);
+    let text = match serde_json::to_string_pretty(&result.project) {
+        Ok(text) => text,
+        Err(err) => return fail(&err.to_string()),
+    };
+    if let Err(err) = std::fs::write(output, format!("{text}\n")) {
+        return fail(&format!("could not write {}: {err}", output.display()));
+    }
+    let p = &result.project;
+    emit(&serde_json::json!({
+        "ok": true, "output": output.display().to_string(),
+        "counts": {"buses": p.buses.len(), "branches": p.branches.len(), "sources": p.sources.len(), "motors": p.motors.len(), "devices": p.devices.len(), "equipment": p.equipment.len()},
+        "warnings": warnings, "validation": p.validate(),
+    }), false)
 }
 
 fn import_library(input: &std::path::Path, output: &std::path::Path, compact: bool, force: bool, redact: &[String]) -> ExitCode {

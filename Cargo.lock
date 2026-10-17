@@ -1455,6 +1455,7 @@ dependencies = [
  "clap",
  "eframe",
  "faer",
+ "miniz_oxide 0.8.9",
  "rfd",
  "serde",
  "serde_json",
