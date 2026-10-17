@@ -185,6 +185,30 @@ pub fn integrate_profile(
         model_range_exceeded: model_range_exceeded(template) })
 }
 
+/// Standard label for rows computed with [`lee`].
+pub const LEE_STANDARD: &str = "Lee 1982 theoretical (arc current = bolted current)";
+
+/// Incident energy at 1.2 cal/cm² that defines the arc-flash boundary, J/cm².
+const BOUNDARY_J_CM2: f64 = 1.2 * 4.184;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LeeOutput {
+    pub energy_j_cm2: f64,
+    pub energy_cal_cm2: f64,
+    /// Distance where the energy falls to 1.2 cal/cm², mm.
+    pub boundary_mm: f64,
+}
+
+/// Lee (1982) maximum-power arc: the arc is taken to dissipate the full
+/// bolted-fault power, radiating spherically. With V in kV, I in kA, t in s
+/// and D in mm, E = 2.142e6 · V · I · t / D² in J/cm² (no enclosure factor),
+/// and the boundary is the D where E equals 1.2 cal/cm².
+pub fn lee(kv: f64, bolted_ka: f64, time_s: f64, distance_mm: f64) -> LeeOutput {
+    let k = 2.142e6 * kv * bolted_ka * time_s;
+    let energy_j_cm2 = k / (distance_mm * distance_mm);
+    LeeOutput { energy_j_cm2, energy_cal_cm2: energy_j_cm2 / 4.184, boundary_mm: (k / BOUNDARY_J_CM2).sqrt() }
+}
+
 pub fn calculate(input: &IeeeInput) -> Result<IeeeOutput, String> {
     let mut warnings = Vec::new();
     if [input.voc_kv, input.ibf_ka, input.gap_mm, input.distance_mm, input.height_mm, input.width_mm, input.depth_mm, input.time_s, input.time_min_s].into_iter().any(|v| !v.is_finite() || v <= 0.0) {

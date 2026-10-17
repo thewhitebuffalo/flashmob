@@ -248,6 +248,7 @@ pub const LABEL_REASONS: &[(&str, &str)] = &[
     ("bolted_out_of_range", "bolted current is outside the IEEE 1584-2018 model range"),
     ("model_range_exceeded", "an IEEE 1584-2018 model input is outside its range"),
     ("assumed_clearing", "the clearing result is marked assumed for another reason given in the duration note"),
+    ("lee_method", "the bus is above 15 kV, so the conservative Lee (1982) theoretical model with arc current equal to bolted current is used instead of IEEE 1584-2018"),
     ("unresolved", "no arc duration was established (arc-flash failure rows)"),
 ];
 
@@ -798,7 +799,10 @@ fn evaluate_equipment(project: &Project, fault: &FaultResult,
             format!("bus '{}' fault current is zero ({})", case.bus, bus_fault.note.clone().unwrap_or_else(|| "no source".into()))
         });
     };
-    if !(0.208..=15.0).contains(&bus.kv) {
+    if bus.kv > 15.0 {
+        return lee_equipment(project, case, bus, bus_fault, bolted, protection, assumed);
+    }
+    if bus.kv < 0.208 {
         return Err(format!("{:.2} kV is outside the IEEE 1584-2018 range of 208 V to 15 kV", bus.kv));
     }
     let template = preview_input(case, bus.kv, bolted);
@@ -912,6 +916,86 @@ fn evaluate_equipment(project: &Project, fault: &FaultResult,
     row.label_reasons = label_reasons(assumed, &full_clear, &min_clear, out.bolted_out_of_range, out.model_range_exceeded, row.assumed);
     row.label_ready = row.label_reasons.is_empty();
     Ok((row, ieee_warnings))
+}
+
+/// Buses above the IEEE 1584-2018 voltage range fall back to the Lee (1982)
+/// theoretical maximum-power arc model. The arc is taken to carry the full
+/// bolted current, so the device is timed at the bolted current and the reduced
+/// arcing-current case equals the full case. Staged multiple-device clearing is
+/// not applied: one upstream device (or an entered duration) sets the time.
+fn lee_equipment(project: &Project, case: &ArcEquipment, bus: &crate::model::Bus, bus_fault: &crate::fault::BusFault,
+    bolted: f64, protection: &[crate::protection::Protection], assumed: bool) -> Result<(ArcRow, Vec<String>), String> {
+    let protection = protection.iter().find(|p| p.bus_id == case.bus).expect("validated bus has protection status");
+    if !(case.distance_mm.is_finite() && case.distance_mm > 0.0) {
+        return Err("working distance must be positive".into());
+    }
+    // Induction motors drop out at the motor window, as in staged clearing, so
+    // a device that clears after the window is not blocked by motor backfeed.
+    let mut motor_note = None;
+    let clear = match duration(project, case, bus_fault, bolted, protection) {
+        Ok(clear) => clear,
+        Err(err) => {
+            let mut without = project.clone();
+            without.motors.retain(|m| m.machine_kind == Some(crate::model::MotorKind::Synchronous));
+            if without.motors.len() == project.motors.len() {
+                return Err(err);
+            }
+            let clear = duration(&without, case, bus_fault, bolted, protection)?;
+            if clear.seconds + 1e-12 < project.motor_contribution_s {
+                return Err(err);
+            }
+            motor_note = Some(format!("Induction motors still connected after the device opens drop out at the {:.3} s motor window, before the {:.3} s clearing time, so they do not extend the arc.", project.motor_contribution_s, clear.seconds));
+            clear
+        }
+    };
+    let lee = arcflash::lee(bus.kv, bolted, clear.seconds, case.distance_mm);
+    let mut warnings = vec![format!(
+        "{:.2} kV is above the IEEE 1584-2018 range of 208 V to 15 kV; incident energy and boundary use the Lee (1982) theoretical model with the arc carrying the full bolted current. The device is timed at the bolted current and staged multiple-device clearing is not applied. Lee is conservative for most medium-voltage equipment; compare against an open-air medium-voltage method where one applies.",
+        bus.kv)];
+    if clear.assumed && !warnings.contains(&clear.note) { warnings.push(clear.note.clone()); }
+    if let Some(note) = motor_note { warnings.push(note); }
+    let reasons_clear = clear.clone();
+    let mut row = ArcRow {
+        equipment_id: case.id.clone(),
+        name: case.name.clone(),
+        bus_id: bus.id.clone(),
+        bus_name: bus.name.clone(),
+        assumed: assumed || clear.assumed,
+        enclosure_assumed: assumed,
+        electrode: case.electrode.as_str().into(),
+        bolted_ka: bolted,
+        arcing_ka: bolted,
+        arcing_min_ka: bolted,
+        time_s: clear.seconds,
+        time_min_s: clear.seconds,
+        energy_cal_cm2: lee.energy_cal_cm2,
+        energy_min_cal_cm2: lee.energy_cal_cm2,
+        governing_cal_cm2: lee.energy_cal_cm2,
+        afb_full_mm: lee.boundary_mm,
+        afb_reduced_mm: lee.boundary_mm,
+        afb_in: lee.boundary_mm / 25.4,
+        afb_mm: lee.boundary_mm,
+        governing: "lee".into(),
+        duration_capped: clear.capped,
+        duration_note: clear.note.clone(),
+        upstream_device: case.upstream_device.clone(),
+        governing_device: if case.clearing_s.is_some() { None } else { case.upstream_device.clone() },
+        standard: arcflash::LEE_STANDARD.into(),
+        decrement_applied: false,
+        decrement_source_ids: Vec::new(),
+        final_bolted_ka: None,
+        final_arcing_ka: None,
+        final_arcing_min_ka: None,
+        warnings: warnings.clone(),
+        clearing_basis: clear.basis.into(),
+        clearing_basis_reduced: clear.basis.into(),
+        label_ready: false,
+        label_reasons: Vec::new(),
+    };
+    row.label_reasons = label_reasons(assumed, &clear, &reasons_clear, false, false, row.assumed);
+    row.label_reasons.push("lee_method".into());
+    row.label_ready = false;
+    Ok((row, warnings))
 }
 
 fn apply_profile(out: &mut arcflash::IeeeOutput, full: arcflash::ProfileEnergy, reduced: arcflash::ProfileEnergy) {

@@ -612,7 +612,12 @@ fn arc_failures_remain_visible_and_manual_time_can_complete_a_case() {
     let row = out.arc_flash.as_ref().unwrap().iter().find(|r| r.equipment_id == "af-mcc").unwrap(); near(row.time_s, 0.2, 1e-12);
     p.buses[0].kv = 20.0;
     let out = study::run(&p, Studies::all()).unwrap();
-    assert!(out.arc_flash_failures.iter().any(|f| f.bus_id == "util" && f.error.contains("outside")));
+    // Above 15 kV the Lee fallback replaces the out-of-range failure.
+    assert!(!out.arc_flash_failures.iter().any(|f| f.bus_id == "util" && f.error.contains("outside")));
+    if let Some(row) = out.arc_flash.as_ref().unwrap().iter().find(|r| r.bus_id == "util") {
+        assert_eq!(row.governing, "lee");
+        assert!(row.label_reasons.iter().any(|r| r == "lee_method"));
+    }
 }
 
 #[test]
