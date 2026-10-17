@@ -96,7 +96,7 @@ fn motor_feeder_breaker_only_removes_backfeed_when_its_contact_is_open() {
         distance_mm: project.equipment[0].distance_mm, height_mm: project.equipment[0].height_mm,
         width_mm: project.equipment[0].width_mm, depth_mm: project.equipment[0].depth_mm,
         electrode: project.equipment[0].electrode, time_s: 0.09, time_min_s: 0.09,
-        arc_ka_override: None, arc_min_ka_override: None,
+        arc_ka_override: None, arc_min_ka_override: None, lee: false,
     }).unwrap();
     // The induction motor drops out after its 5-cycle window, just before
     // both breakers open at 0.09 s, so energy is slightly below the
@@ -129,7 +129,7 @@ fn motor_feeder_breaker_only_removes_backfeed_when_its_contact_is_open() {
         distance_mm: equipment.distance_mm, height_mm: equipment.height_mm,
         width_mm: equipment.width_mm, depth_mm: equipment.depth_mm,
         electrode: equipment.electrode, time_s: 0.09, time_min_s: 0.09,
-        arc_ka_override: None, arc_min_ka_override: None,
+        arc_ka_override: None, arc_min_ka_override: None, lee: false,
     }).unwrap();
     for (got, want) in [(row.energy_cal_cm2, expected.energy_cal_cm2),
         (row.energy_min_cal_cm2, expected.energy_min_cal_cm2),

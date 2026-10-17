@@ -37,6 +37,10 @@ pub struct IeeeInput {
     pub arc_ka_override: Option<f64>,
     /// Replaces the calculated reduced arcing current. The variation factor is not applied again.
     pub arc_min_ka_override: Option<f64>,
+    /// Use the Lee (1982) theoretical model instead of the IEEE 1584-2018
+    /// equations: the arc carries the full bolted current, no enclosure or
+    /// variation factor. Set by the study when an input is outside the IEEE range.
+    pub lee: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -119,6 +123,19 @@ pub fn integrate_profile(
     if segments.is_empty() {
         return Err("arc-flash current profile has no segments".into());
     }
+    if template.lee {
+        // Lee energy is linear in current and time, so the profile is a sum.
+        let mut k = 0.0;
+        for (index, segment) in segments.iter().enumerate() {
+            if !segment.ibf_ka.is_finite() || segment.ibf_ka <= 0.0 || !segment.duration_s.is_finite() || segment.duration_s <= 0.0 {
+                return Err(format!("arc-flash current profile segment {} requires finite positive current and duration", index + 1));
+            }
+            k += LEE_K * template.voc_kv * segment.ibf_ka * segment.duration_s;
+        }
+        let energy_j = k / (template.distance_mm * template.distance_mm);
+        return Ok(ProfileEnergy { energy_cal_cm2: energy_j / J_PER_CAL, boundary_mm: (k / AFB_ENERGY_J).sqrt(),
+            warnings: Vec::new(), bolted_out_of_range: false, model_range_exceeded: false });
+    }
     let mut energy_j = 0.0;
     let mut reference_energy_j = [0.0; 3];
     let mut warnings = Vec::new();
@@ -188,8 +205,31 @@ pub fn integrate_profile(
 /// Standard label for rows computed with [`lee`].
 pub const LEE_STANDARD: &str = "Lee 1982 theoretical (arc current = bolted current)";
 
-/// Incident energy at 1.2 cal/cm² that defines the arc-flash boundary, J/cm².
-const BOUNDARY_J_CM2: f64 = 1.2 * 4.184;
+/// Lee constant for E in J/cm² with V in kV, I in kA, t in s, D in mm.
+const LEE_K: f64 = 2.142e6;
+
+/// The full [`IeeeOutput`] for a Lee case, so staging and reporting treat it
+/// like any other arc-flash result. Both arcing-current cases carry the bolted
+/// current (or an entered effective arc current).
+fn lee_output(input: &IeeeInput) -> IeeeOutput {
+    let i_arc = input.arc_ka_override.unwrap_or(input.ibf_ka);
+    let i_min = input.arc_min_ka_override.unwrap_or(input.ibf_ka);
+    let full = lee(input.voc_kv, i_arc, input.time_s, input.distance_mm);
+    let reduced = lee(input.voc_kv, i_min, input.time_min_s, input.distance_mm);
+    // The full case governs: both cases carry the bolted current unless an
+    // effective arc current was entered for one of them.
+    let (governing, gov) = ("lee", full);
+    let afb_mm = full.boundary_mm.max(reduced.boundary_mm);
+    IeeeOutput {
+        standard: LEE_STANDARD, ibf_ka: input.ibf_ka, i_arc_ka: i_arc, i_arc_min_ka: i_min, var_cf: 0.0, cf: 1.0,
+        enclosure: "none", time_s: input.time_s, time_min_s: input.time_min_s,
+        energy_j_cm2: full.energy_j_cm2, energy_min_j_cm2: reduced.energy_j_cm2,
+        energy_cal_cm2: full.energy_cal_cm2, energy_min_cal_cm2: reduced.energy_cal_cm2,
+        governing, governing_j_cm2: gov.energy_j_cm2, governing_cal_cm2: gov.energy_cal_cm2,
+        afb_full_mm: full.boundary_mm, afb_reduced_mm: reduced.boundary_mm, afb_mm, afb_in: afb_mm / 25.4,
+        warnings: Vec::new(), bolted_out_of_range: false, model_range_exceeded: false,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LeeOutput {
@@ -204,15 +244,18 @@ pub struct LeeOutput {
 /// and D in mm, E = 2.142e6 · V · I · t / D² in J/cm² (no enclosure factor),
 /// and the boundary is the D where E equals 1.2 cal/cm².
 pub fn lee(kv: f64, bolted_ka: f64, time_s: f64, distance_mm: f64) -> LeeOutput {
-    let k = 2.142e6 * kv * bolted_ka * time_s;
+    let k = LEE_K * kv * bolted_ka * time_s;
     let energy_j_cm2 = k / (distance_mm * distance_mm);
-    LeeOutput { energy_j_cm2, energy_cal_cm2: energy_j_cm2 / 4.184, boundary_mm: (k / BOUNDARY_J_CM2).sqrt() }
+    LeeOutput { energy_j_cm2, energy_cal_cm2: energy_j_cm2 / J_PER_CAL, boundary_mm: (k / AFB_ENERGY_J).sqrt() }
 }
 
 pub fn calculate(input: &IeeeInput) -> Result<IeeeOutput, String> {
     let mut warnings = Vec::new();
     if [input.voc_kv, input.ibf_ka, input.gap_mm, input.distance_mm, input.height_mm, input.width_mm, input.depth_mm, input.time_s, input.time_min_s].into_iter().any(|v| !v.is_finite() || v <= 0.0) {
         return Err("all arc-flash inputs must be finite and positive".into());
+    }
+    if input.lee {
+        return Ok(lee_output(input));
     }
     if !(0.208..=15.0).contains(&input.voc_kv) {
         return Err(format!(
@@ -617,7 +660,7 @@ mod tests {
             time_s: 0.197,
             time_min_s: 0.223,
             arc_ka_override: None,
-            arc_min_ka_override: None,
+            arc_min_ka_override: None, lee: false,
         })
         .unwrap();
         close(full.i_arc_ka, 12.979, 0.0015);
@@ -644,7 +687,7 @@ mod tests {
             time_s: 0.0613,
             time_min_s: 0.319,
             arc_ka_override: None,
-            arc_min_ka_override: None,
+            arc_min_ka_override: None, lee: false,
         })
         .unwrap();
         close(out.i_arc_ka, 28.793, 0.002);
@@ -673,7 +716,7 @@ mod boundary_regression {
         let out = calculate(&IeeeInput { voc_kv: 0.48, ibf_ka: 45.0, gap_mm: 32.0,
             distance_mm: 609.6, height_mm: 610.0, width_mm: 610.0, depth_mm: 254.0,
             electrode: Electrode::VCB, time_s: 0.0613, time_min_s: 0.319,
-            arc_ka_override: None, arc_min_ka_override: None }).unwrap();
+            arc_ka_override: None, arc_min_ka_override: None, lee: false }).unwrap();
         // D.2 energies in J/cm2, with VCB distance exponent -1.598 and 1.2 cal/cm2 boundary.
         let full = 609.6 * (11.585_f64 / (1.2*4.184)).powf(1.0/1.598);
         let reduced = 609.6 * (53.156_f64 / (1.2*4.184)).powf(1.0/1.598);
@@ -700,7 +743,7 @@ mod profile_regression {
             time_s: 0.3,
             time_min_s: 0.3,
             arc_ka_override: None,
-            arc_min_ka_override: None,
+            arc_min_ka_override: None, lee: false,
         }
     }
 

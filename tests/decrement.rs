@@ -463,7 +463,7 @@ fn hand_integrated(project: &Project, duration_s: f64) -> (f64, f64) {
             distance_mm: equipment.distance_mm, height_mm: equipment.height_mm,
             width_mm: equipment.width_mm, depth_mm: equipment.depth_mm,
             electrode: equipment.electrode, time_s: seconds, time_min_s: seconds,
-            arc_ka_override: None, arc_min_ka_override: None,
+            arc_ka_override: None, arc_min_ka_override: None, lee: false,
         }).unwrap();
         full += slice.energy_cal_cm2;
         reduced += slice.energy_min_cal_cm2;

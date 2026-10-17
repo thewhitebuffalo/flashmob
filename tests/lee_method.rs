@@ -66,10 +66,40 @@ fn bus_above_fifteen_kv_uses_lee_with_bolted_current_and_a_label_reason() {
     assert_eq!(row.arcing_ka, row.bolted_ka);
     assert!((row.time_s - 0.25).abs() < 1e-9, "{}", row.time_s);
     let lee = arcflash::lee(24.94, row.bolted_ka, 0.25, 914.4);
-    assert!((row.governing_cal_cm2 - lee.energy_cal_cm2).abs() < 1e-9);
-    assert!((row.afb_mm - lee.boundary_mm).abs() < 1e-6);
+    // Item-7 staging on the Lee path: the motor feeds for its 5-cycle window,
+    // then the source-only current runs until the relay clears.
+    assert_eq!(row.clearing_basis, "staged_multi_device");
+    let mut no_motor = p.clone();
+    no_motor.motors.clear();
+    let without = study::run(&no_motor, Studies { loadflow: false, fault: true, arcflash: true, coordination: false }).unwrap();
+    let source_ka = without.arc_flash.as_ref().unwrap()[0].bolted_ka;
+    assert!(source_ka < row.bolted_ka);
+    let window = 5.0 / 60.0;
+    let expected = arcflash::lee(24.94, row.bolted_ka, window, 914.4).energy_cal_cm2
+        + arcflash::lee(24.94, source_ka, 0.25 - window, 914.4).energy_cal_cm2;
+    assert!((row.governing_cal_cm2 - expected).abs() < 1e-6, "{} vs {}", row.governing_cal_cm2, expected);
+    assert!(row.governing_cal_cm2 < lee.energy_cal_cm2);
     assert!(row.label_reasons.iter().any(|r| r == "lee_method"), "{:?}", row.label_reasons);
     assert!(!row.label_ready);
-    assert!(row.warnings.iter().any(|w| w.contains("motor window")), "{:?}", row.warnings);
     assert!(LABEL_REASONS.iter().any(|(code, _)| *code == "lee_method"));
+}
+
+/// A primary device that clears in 17 ms, inside the motor window, leaves the
+/// backfeeding motor connected. The bus is staged instead of rejected.
+#[test]
+fn lee_bus_with_a_fast_primary_device_and_a_backfeeding_motor_is_staged() {
+    let mut p = above_range();
+    p.devices[0].curve = CurveSpec::Definite { pickup_a: 1.0, time_s: 0.001 };
+    p.devices[0].breaker_interrupting_s = Some(0.016);
+    let out = study::run(&p, Studies { loadflow: false, fault: true, arcflash: true, coordination: false }).expect("valid study");
+    let row = out.arc_flash.as_ref().unwrap().iter().find(|r| r.equipment_id == "af-util")
+        .unwrap_or_else(|| panic!("af-util failed: {:?}", out.arc_flash_failures));
+    assert_eq!(row.governing, "lee");
+    assert_eq!(row.clearing_basis, "staged_multi_device");
+    // The motor carries about 1% of the bolted current, so the 80% cleared-fault
+    // threshold ends the arc when the device opens and the motor tail is excluded.
+    assert!((row.time_s - 0.017).abs() < 1e-9, "{}", row.time_s);
+    let lee = arcflash::lee(24.94, row.bolted_ka, 0.017, 914.4);
+    assert!((row.governing_cal_cm2 - lee.energy_cal_cm2).abs() < 1e-9);
+    assert!(row.warnings.iter().any(|w| w.contains("threshold") && w.contains("excluded")), "{:?}", row.warnings);
 }
