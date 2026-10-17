@@ -1906,7 +1906,13 @@ fn assign_stream_devices<'a>(project: &'a Project, case: &ArcEquipment, fault: &
         let near = if let Some((_, _, device)) = scored.first().copied() {
             device
         } else {
-            let mut by_hop: Vec<&Device> = located.iter().copied().filter(|d| device_disconnects(project, d, &case.bus, far)).collect();
+            // A motor-only path drops out with the motor window, so a device
+            // with no curve is not forced onto it.
+            let has_source = stream.has_source;
+            let mut by_hop: Vec<&Device> = located.iter().copied()
+                .filter(|d| device_disconnects(project, d, &case.bus, far))
+                .filter(|d| has_source || !matches!(d.curve, crate::model::CurveSpec::SettingsNotCollected { .. }))
+                .collect();
             by_hop.sort_by(|a, b| device_hops(project, &case.bus, a).cmp(&device_hops(project, &case.bus, b)).then(a.id.cmp(&b.id)));
             let Some(device) = by_hop.first().copied() else { continue };
             device
@@ -2363,9 +2369,25 @@ fn located_devices(project: &Project) -> Vec<&Device> {
     }).collect()
 }
 
+/// True when opening `device` stops the path from `target_bus` feeding the
+/// fault: either the target bus itself is cut off, or every in-service source
+/// and motor bus beyond it is. The second case is a device further out on the
+/// path, such as a primary fuse feeding a transformer whose secondary is faulted.
 fn device_disconnects(project: &Project, device: &Device, fault_bus: &str, target_bus: &str) -> bool {
     let before = reachable_buses(project, fault_bus);
-    before.contains(target_bus) && !buses_after_device_opens(project, device, fault_bus).contains(target_bus)
+    if !before.contains(target_bus) {
+        return false;
+    }
+    let after = buses_after_device_opens(project, device, fault_bus);
+    if !after.contains(target_bus) {
+        return true;
+    }
+    let beyond = component_beyond(project, fault_bus, target_bus);
+    let feeding: Vec<&str> = project.sources.iter().filter(|s| s.in_service).map(|s| s.bus.as_str())
+        .chain(project.motors.iter().map(|m| m.bus.as_str()))
+        .filter(|bus| *bus != fault_bus && beyond.contains(*bus))
+        .collect();
+    !feeding.is_empty() && feeding.iter().all(|bus| !after.contains(*bus))
 }
 
 fn device_hops(project: &Project, fault_bus: &str, device: &Device) -> usize {
