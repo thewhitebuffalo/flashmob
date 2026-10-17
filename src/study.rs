@@ -248,7 +248,10 @@ pub const LABEL_REASONS: &[(&str, &str)] = &[
     ("bolted_out_of_range", "bolted current is outside the IEEE 1584-2018 model range"),
     ("model_range_exceeded", "an IEEE 1584-2018 model input is outside its range"),
     ("assumed_clearing", "the clearing result is marked assumed for another reason given in the duration note"),
-    ("lee_method", "the bus is above 15 kV, so the conservative Lee (1982) theoretical model with arc current equal to bolted current is used instead of IEEE 1584-2018"),
+    ("lee_voltage", "the voltage is outside 0.208 to 15 kV, so the Lee (1982) model with arc current equal to bolted current is used instead of IEEE 1584-2018"),
+    ("lee_bolted_current", "the bolted current is outside the IEEE 1584-2018 band for the voltage, so the Lee (1982) model is used"),
+    ("lee_gap", "the gap is outside the IEEE 1584-2018 band for the voltage, so the Lee (1982) model is used"),
+    ("lee_box", "the enclosure is no wider than four gaps, outside the IEEE 1584-2018 box range, so the Lee (1982) model is used"),
     ("unresolved", "no arc duration was established (arc-flash failure rows)"),
 ];
 
@@ -799,9 +802,6 @@ fn evaluate_equipment(project: &Project, fault: &FaultResult,
             format!("bus '{}' fault current is zero ({})", case.bus, bus_fault.note.clone().unwrap_or_else(|| "no source".into()))
         });
     };
-    if bus.kv < 0.208 {
-        return Err(format!("{:.2} kV is outside the IEEE 1584-2018 range of 208 V to 15 kV", bus.kv));
-    }
     let template = preview_input(case, bus.kv, bolted);
     let preview = arcflash::calculate(&template)?;
     let protection = protection.iter().find(|p| p.bus_id == case.bus).expect("validated bus has protection status");
@@ -873,7 +873,7 @@ fn evaluate_equipment(project: &Project, fault: &FaultResult,
         name: case.name.clone(),
         bus_id: bus.id.clone(),
         bus_name: bus.name.clone(),
-        assumed: assumed || full_clear.assumed || min_clear.assumed || out.bolted_out_of_range || out.model_range_exceeded,
+        assumed: assumed || full_clear.assumed || min_clear.assumed || out.bolted_out_of_range || out.model_range_exceeded || template.lee,
         enclosure_assumed: assumed,
         electrode: case.electrode.as_str().into(),
         bolted_ka: bolted,
@@ -910,12 +910,15 @@ fn evaluate_equipment(project: &Project, fault: &FaultResult,
         label_reasons: Vec::new(),
     };
     let mut row = row;
-    row.label_reasons = label_reasons(assumed, &full_clear, &min_clear, out.bolted_out_of_range, out.model_range_exceeded, row.assumed);
+    // A Lee row is assumed through its own cause codes, not "assumed_clearing".
+    let clearing_assumed = assumed || full_clear.assumed || min_clear.assumed || out.bolted_out_of_range || out.model_range_exceeded;
+    row.label_reasons = label_reasons(assumed, &full_clear, &min_clear, out.bolted_out_of_range, out.model_range_exceeded, clearing_assumed);
     if template.lee {
-        row.label_reasons.push("lee_method".into());
-        row.warnings.insert(0, format!(
-            "{:.2} kV is above the IEEE 1584-2018 range of 208 V to 15 kV; incident energy and boundary use the Lee (1982) theoretical model with the arc carrying the full bolted current. Device timing, staging, and the cleared-fault threshold use that current. Lee is conservative for most medium-voltage equipment; compare against an open-air medium-voltage method where one applies.",
-            bus.kv));
+        let causes = lee_causes(case, bus.kv, bolted);
+        for (index, cause) in causes.iter().enumerate() {
+            row.label_reasons.push((*cause).into());
+            row.warnings.insert(index, lee_footnote(cause, case, bus.kv, bolted));
+        }
     }
     row.label_ready = row.label_reasons.is_empty();
     Ok((row, ieee_warnings))
@@ -1064,6 +1067,47 @@ fn next_decrement_end(project: &Project, decrement_source_ids: &[String], time_s
     end_s
 }
 
+/// Tolerance on every IEEE 1584-2018 range bound below.
+const RANGE_TOL: f64 = 1e-4;
+
+/// Why an arc-flash case falls outside the IEEE 1584-2018 model and goes to the
+/// Lee (1982) model, as label reason codes in a fixed order: voltage, then bolted
+/// current (only checked when the voltage is in range, since its band depends on
+/// the voltage), then gap, then box. The box check is width no more than four
+/// gaps; open-air cases have no box. Working distance is not a trigger.
+pub fn lee_causes(case: &ArcEquipment, kv: f64, bolted_ka: f64) -> Vec<&'static str> {
+    let mut causes = Vec::new();
+    let low = kv < 0.601;
+    if kv < 0.208 - RANGE_TOL || kv > 15.0 + RANGE_TOL {
+        causes.push("lee_voltage");
+    } else if (low && !(bolted_ka > 0.5 - RANGE_TOL && bolted_ka <= 106.0 + RANGE_TOL))
+        || (!low && !(bolted_ka >= 0.2 - RANGE_TOL && bolted_ka <= 65.0 + RANGE_TOL)) {
+        causes.push("lee_bolted_current");
+    }
+    let (gap_low, gap_high) = if low { (6.35, 76.2) } else { (19.05, 254.0) };
+    if case.gap_mm < gap_low - RANGE_TOL || case.gap_mm > gap_high + RANGE_TOL {
+        causes.push("lee_gap");
+    }
+    let open_air = matches!(case.electrode, crate::model::Electrode::VOA | crate::model::Electrode::HOA);
+    if !open_air && case.width_mm <= 4.0 * case.gap_mm {
+        causes.push("lee_box");
+    }
+    causes
+}
+
+/// The note for one Lee cause, in the order [`lee_causes`] returns them.
+fn lee_footnote(cause: &str, case: &ArcEquipment, kv: f64, bolted_ka: f64) -> String {
+    let tail = "incident energy and boundary use the Lee (1982) theoretical model with the arc carrying the full bolted current; compare against an open-air medium-voltage method where one applies.";
+    match cause {
+        "lee_voltage" => format!("Voltage {kv:.3} kV is outside the IEEE 1584-2018 range of 0.208 to 15 kV; {tail}"),
+        "lee_bolted_current" => format!("Bolted current {bolted_ka:.3} kA is outside the IEEE 1584-2018 range for this voltage ({}); {tail}",
+            if kv < 0.601 { "above 0.5 to 106 kA at 0.6 kV and below" } else { "0.2 to 65 kA above 0.6 kV" }),
+        "lee_gap" => format!("Gap {:.1} mm is outside the IEEE 1584-2018 range for this voltage ({}); {tail}", case.gap_mm,
+            if kv < 0.601 { "6.35 to 76.2 mm at 0.6 kV and below" } else { "19.05 to 254 mm above 0.6 kV" }),
+        _ => format!("Enclosure width {:.1} mm is not more than four times the {:.1} mm gap, outside the IEEE 1584-2018 box range; {tail}", case.width_mm, case.gap_mm),
+    }
+}
+
 fn preview_input(case: &ArcEquipment, kv: f64, bolted: f64) -> IeeeInput {
     IeeeInput {
         voc_kv: kv,
@@ -1078,7 +1122,7 @@ fn preview_input(case: &ArcEquipment, kv: f64, bolted: f64) -> IeeeInput {
         time_min_s: 0.1,
         arc_ka_override: None,
         arc_min_ka_override: None,
-        lee: kv > 15.0,
+        lee: !lee_causes(case, kv, bolted).is_empty(),
     }
 }
 
@@ -3385,7 +3429,7 @@ mod audit_regression {
     }
 
     #[test]
-    fn gap_below_the_model_minimum_is_still_calculated_and_marked_assumed() {
+    fn gap_below_the_model_minimum_falls_back_to_lee_and_is_marked_assumed() {
         let mut p = Project::sample();
         p.motors.clear();
         p.equipment.truncate(1);
@@ -3395,7 +3439,9 @@ mod audit_regression {
         let out = run(&p, arc_only()).unwrap();
         let row = row(&out, "af-mcc");
         assert!(row.assumed && !row.enclosure_assumed);
-        assert!(row.warnings.iter().any(|w| w.contains("gap") && w.contains("assumed")), "{:?}", row.warnings);
+        assert_eq!(row.governing, "lee");
+        assert_eq!(row.label_reasons, vec!["lee_gap".to_string()]);
+        assert!(row.warnings[0].starts_with("Gap 3.0 mm is outside"), "{:?}", row.warnings);
         assert!(row.governing_cal_cm2.is_finite() && row.governing_cal_cm2 > 0.0);
     }
 
