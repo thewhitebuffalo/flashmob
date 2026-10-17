@@ -1,6 +1,6 @@
 //! Zipped record-format project import. The fixture is synthetic and written here.
 
-use flashmob::import_common::{build_project, match_library, ImportDevice, ImportDeviceKind};
+use flashmob::import_common::{build_project, match_library, ImportDevice, ImportDeviceKind, STYLE_ALIASES};
 use flashmob::import_dez::{decode_number, model_text, network_from_text, parse_records};
 use flashmob::library::{Library, LibraryDevice, TripUnit, FORMAT, VERSION};
 use flashmob::model::{BranchKind, CurveSpec, XfmrConn};
@@ -160,7 +160,33 @@ fn library_match_needs_style_and_trip_rating() {
         manufacturer: "Acme Electric".into(), device_type: String::new(), style: style.into(), frame: String::new(),
         rating_a: Some(a), interrupting_ka: None,
     };
-    assert_eq!(match_library(&lib, &entered("ZZ 3P", 100.0)), Ok(1));
+    assert_eq!(match_library(&lib, &entered("ZZ 3P", 100.0)).map(|m| m.device_id), Ok(1));
+    assert_eq!(match_library(&lib, &entered("ZZ", 100.0)).unwrap().alias, None);
     assert!(match_library(&lib, &entered("ZZ", 70.0)).is_err());
     assert!(match_library(&lib, &entered("Z", 100.0)).is_err());
+}
+
+#[test]
+fn style_alias_links_to_the_aliased_family_and_is_marked_assumed() {
+    let unit = |a: f64| TripUnit { rating_a: a, ..Default::default() };
+    let dev = |id: u32, style: &str, units: Vec<TripUnit>| LibraryDevice {
+        id, manufacturer: "SQUARE D".into(), style: style.into(), trip_units: units, ..Default::default()
+    };
+    let lib = Library { format: FORMAT.into(), version: VERSION, devices: vec![dev(5, "EG", vec![unit(20.0), unit(50.0)]), dev(6, "GJL", vec![unit(100.0)])], ..Default::default() };
+    let entered = |style: &str, a: f64| ImportDevice {
+        key: "1".into(), name: "B".into(), kind: ImportDeviceKind::Breaker, bus: None, branch: None,
+        manufacturer: "SQD".into(), device_type: String::new(), style: style.into(), frame: String::new(),
+        rating_a: Some(a), interrupting_ka: None,
+    };
+    let eg = match_library(&lib, &entered("EGB", 50.0)).unwrap();
+    assert_eq!(eg.device_id, 5);
+    assert_eq!(eg.alias.map(|a| (a.0, a.1)), Some(("EGB", "EG")));
+    let jl = match_library(&lib, &entered("JL", 100.0)).unwrap();
+    assert_eq!((jl.device_id, jl.alias.map(|a| a.1)), (6, Some("GJL")));
+    // The alias does not invent a rating the aliased family lacks.
+    let err = match_library(&lib, &entered("JL", 175.0)).unwrap_err();
+    assert!(err.contains("GJL") && err.contains("assumed alias") && err.contains("175"), "{err}");
+    // Styles without an alias stay unmatched.
+    assert!(match_library(&lib, &entered("QBL", 100.0)).is_err());
+    assert!(STYLE_ALIASES.iter().all(|(_, e, l, why)| e != l && !why.is_empty()));
 }

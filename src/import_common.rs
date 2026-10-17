@@ -166,30 +166,61 @@ fn manufacturer_matches(entered: &str, library: &str) -> bool {
     l == alias || l.starts_with(alias)
 }
 
+/// Entered breaker styles that the device library stores under another style
+/// name. Each entry is an assumption, not a manufacturer cross-reference: a
+/// match through it is reported as an assumed alias in the import warnings and
+/// in the project assumptions, so the result never reads as an exact match.
+///
+/// Columns: manufacturer (normalized as in [`manufacturer_matches`]), entered
+/// style, library style, reason.
+pub const STYLE_ALIASES: &[(&str, &str, &str, &str)] = &[
+    ("squared", "JL", "GJL", "JL entered; library curves for the GJL family are used"),
+    ("squared", "EGB", "EG", "EGB (bolt-on EG) entered; library curves for the EG family are used"),
+];
+
+/// Library match for one entered device.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LibraryMatch {
+    pub device_id: u32,
+    /// Set when the match went through [`STYLE_ALIASES`]: (entered, library, reason).
+    pub alias: Option<(&'static str, &'static str, &'static str)>,
+}
+
+fn alias_for(manufacturer: &str, style: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    STYLE_ALIASES.iter()
+        .find(|(m, entered, _, _)| manufacturer_matches(manufacturer, m) && entered.eq_ignore_ascii_case(style))
+        .map(|(_, entered, library, why)| (*entered, *library, *why))
+}
+
 /// The library device that matches the entered manufacturer and style exactly
 /// and has a trip unit at the entered rating. The entered style is compared on
-/// its first word (a pole-count suffix such as "3P" is ignored). Only a single
-/// exact match is accepted; anything else is reported, never guessed.
-pub fn match_library(library: &Library, device: &ImportDevice) -> Result<u32, String> {
-    let style = device.style.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
-    if style.is_empty() {
+/// its first word (a pole-count suffix such as "3P" is ignored). When the style
+/// has an entry in [`STYLE_ALIASES`], the aliased library style is used and the
+/// match says so. Only a single match is accepted; anything else is reported,
+/// never guessed.
+pub fn match_library(library: &Library, device: &ImportDevice) -> Result<LibraryMatch, String> {
+    let entered = device.style.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+    if entered.is_empty() {
         return Err("no style entered".into());
     }
     let rating = device.rating_a.ok_or("no trip rating entered")?;
+    let alias = alias_for(&device.manufacturer, &entered);
+    let style = alias.map(|(_, library, _)| library.to_string()).unwrap_or_else(|| entered.clone());
+    let via = alias.map(|(e, l, _)| format!(" (assumed alias {e} -> {l})")).unwrap_or_default();
     let candidates: Vec<_> = library.devices.iter()
         .filter(|d| manufacturer_matches(&device.manufacturer, &d.manufacturer))
         .filter(|d| d.style.trim().to_ascii_uppercase() == style)
         .collect();
     if candidates.is_empty() {
-        return Err(format!("no library style {style} for manufacturer {}", device.manufacturer));
+        return Err(format!("no library style {style}{via} for manufacturer {}", device.manufacturer));
     }
     let rated: Vec<_> = candidates.iter()
         .filter(|d| d.trip_units.iter().any(|u| (u.rating_a - rating).abs() <= 1e-6 * rating.max(1.0)))
         .collect();
     match rated.len() {
-        1 => Ok(rated[0].id),
-        0 => Err(format!("library style {style} has no {rating} A trip unit")),
-        n => Err(format!("{n} library devices match style {style} at {rating} A")),
+        1 => Ok(LibraryMatch { device_id: rated[0].id, alias }),
+        0 => Err(format!("library style {style}{via} has no {} A trip unit", round4(rating))),
+        n => Err(format!("{n} library devices match style {style}{via} at {} A", round4(rating))),
     }
 }
 
@@ -397,7 +428,7 @@ pub fn build_project(net: &ImportedNetwork, library: Option<(&Library, &str)>) -
                         warnings.push(ImportWarning::new("device_unmatched", &d.name, format!("{} {} {} ({}): {why}", d.manufacturer, d.device_type, d.style, d.frame)));
                         unresolved(format!("{} {} {}: {why}", d.manufacturer, d.style, d.frame))
                     }
-                    Ok(device_id) => {
+                    Ok(LibraryMatch { device_id, alias }) => {
                         let request = ApplyDevice {
                             device_id, id: id.clone(), name: d.name.clone(), bus: bus.clone(), protected_branch: Some(branch.clone()),
                             rating_a: d.rating_a, current_base_a: None, voltage_v: None, function_name: None,
@@ -419,7 +450,18 @@ pub fn build_project(net: &ImportedNetwork, library: Option<(&Library, &str)>) -
                                     note = "; slower band taken as total clearing".into();
                                 }
                                 dev.basis = "assumed".into();
-                                warnings.push(ImportWarning::new("device_library_match", &d.name, format!("linked to library device {device_id} at {} A{note}", round4(d.rating_a.unwrap_or(0.0)))));
+                                if let Some((entered, library_style, why)) = alias {
+                                    warnings.push(ImportWarning::new("device_library_alias", &d.name, format!("linked to library device {device_id} at {} A through the assumed alias {entered} -> {library_style}: {why}{note}", round4(d.rating_a.unwrap_or(0.0)))));
+                                    project.assumptions.push(Assumption {
+                                        id: format!("import-alias-{}", project.assumptions.len() + 1),
+                                        statement: format!("{}: library style {library_style} used for entered style {entered} (assumed alias, not a verified cross-reference)", d.name),
+                                    });
+                                    if let Some(link) = dev.library.as_mut() {
+                                        link.unsupported_elements.push(format!("assumed style alias {entered} -> {library_style}"));
+                                    }
+                                } else {
+                                    warnings.push(ImportWarning::new("device_library_match", &d.name, format!("linked to library device {device_id} at {} A{note}", round4(d.rating_a.unwrap_or(0.0)))));
+                                }
                                 dev
                               }
                             },
